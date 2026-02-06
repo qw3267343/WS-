@@ -1,0 +1,24 @@
+﻿# node
+**/node_modules/
+**/dist/
+**/.vite/
+**/.cache/
+
+# logs/runtime
+**/logs/
+**/*.log
+
+# whatsapp-web.js auth/cache (非常重要：不要上传登录态)
+**/.wwebjs_auth/
+**/.wwebjs_cache/
+
+# local runtime data (可按你项目调整)
+**/data/
+**/*.sqlite
+**/*.db
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,19 @@
+﻿/* 顶部 Tabs：白色 + 放大 */
+.topTabs .ant-tabs-nav::before { border-bottom: 0; }
+
+.topTabs .ant-tabs-tab { padding: 12px 22px; }
+
+.topTabs .ant-tabs-tab-btn{
+  color: #fff !important;
+  font-size: 18px;
+  font-weight: 800;
+  opacity: 0.9;
+}
+
+.topTabs .ant-tabs-tab:hover .ant-tabs-tab-btn{ opacity: 1; }
+.topTabs .ant-tabs-tab.ant-tabs-tab-active .ant-tabs-tab-btn{ opacity: 1; }
+
+.topTabs .ant-tabs-ink-bar{
+  background: #1677ff;
+  height: 3px;
+}
