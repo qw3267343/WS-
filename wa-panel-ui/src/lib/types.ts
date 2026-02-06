@@ -9,6 +9,7 @@ export type GroupTarget = {
   id: string;        // 12345@g.us
   name: string;      // 群名（可变）
   enabled: boolean;  // 启用/禁用
+  link?: string;
   note?: string;
   tags?: string[];
 };

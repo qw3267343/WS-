@@ -25,6 +25,46 @@ const clients = new Map();     // slot -> Client
 const statuses = new Map();    // slot -> { status, lastQr }
 const profiles = new Map(); // slot -> { pushname: string|null }
 
+const ADMIN_SLOT = process.env.ADMIN_SLOT || 'acc001';
+const FALLBACK_SLOT = process.env.FALLBACK_SLOT || 'acc002';
+
+function extractInviteCode(link) {
+  if (!link) return null;
+  const text = String(link).trim();
+  const match = text.match(
+    /(?:https?:\/\/)?(?:chat\.whatsapp\.com|whatsapp\.com\/invite)\/([A-Za-z0-9]+)/i
+  );
+  return match ? match[1] : null;
+}
+
+function findGroupId(value, visited = new Set()) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    return value.endsWith('@g.us') ? value : null;
+  }
+  if (typeof value !== 'object') return null;
+  if (visited.has(value)) return null;
+  visited.add(value);
+
+  if (typeof value._serialized === 'string' && value._serialized.endsWith('@g.us')) {
+    return value._serialized;
+  }
+
+  for (const key of Object.keys(value)) {
+    const found = findGroupId(value[key], visited);
+    if (found) return found;
+  }
+  return null;
+}
+
+function selectReadySlot() {
+  const adminStatus = statuses.get(ADMIN_SLOT)?.status;
+  if (adminStatus === 'READY') return ADMIN_SLOT;
+  const fallbackStatus = statuses.get(FALLBACK_SLOT)?.status;
+  if (fallbackStatus === 'READY') return FALLBACK_SLOT;
+  return null;
+}
+
 function ensureClient(slot) {
   if (clients.has(slot)) return clients.get(slot);
 
@@ -103,6 +143,70 @@ app.get('/api/accounts', (req, res) => {
     ok: true,
     data: slots.map(slot => ({ slot, ...(statuses.get(slot) || { status: 'NEW', lastQr: null }) })),
   });
+});
+
+app.post('/api/groups/resolve', async (req, res) => {
+  const link = req.body?.link;
+  const join = Boolean(req.body?.join);
+  const code = extractInviteCode(link);
+
+  if (!code) {
+    return res.status(400).json({ ok: false, error: '无效的邀请链接' });
+  }
+
+  const slot = selectReadySlot();
+  if (!slot) {
+    return res.json({ ok: false, error: 'admin 未上线，请先扫码' });
+  }
+
+  const client = clients.get(slot);
+  if (!client) {
+    return res.status(500).json({ ok: false, error: 'client 未初始化' });
+  }
+
+  try {
+    const info = await client.getInviteInfo(code);
+    const name = info?.name || info?.subject || info?.groupName || '';
+    let id =
+      info?.id ||
+      info?.gid ||
+      info?.groupId ||
+      info?.id?._serialized ||
+      info?.gid?._serialized ||
+      info?._serialized ||
+      null;
+
+    if (typeof id === 'object' && id?._serialized) {
+      id = id._serialized;
+    }
+
+    if (!id) {
+      id = findGroupId(info);
+    }
+
+    if (!id && join) {
+      try {
+        const joined = await client.acceptInvite(code);
+        if (typeof joined === 'string') {
+          id = joined;
+        } else if (joined?.id) {
+          id = joined.id;
+        } else if (joined?._serialized) {
+          id = joined._serialized;
+        }
+      } catch (e) {
+        // acceptInvite 可能因已在群里等报错，继续兜底
+      }
+    }
+
+    if (!id) {
+      return res.json({ ok: false, error: '解析不到 @g.us，请稍后同步群列表' });
+    }
+
+    return res.json({ ok: true, data: { slot, id, name } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 app.post('/api/accounts/:slot/connect', async (req, res) => {
