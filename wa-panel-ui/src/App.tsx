@@ -5,6 +5,7 @@ import TasksPage from "./pages/TasksPage";
 import GroupsPage from "./pages/GroupsPage";
 import AccountsPage from "./pages/AccountsPage";
 import SettingsPage from "./pages/SettingsPage";
+import MasterPage from "./pages/MasterPage";
 import { getSocket } from "./lib/socket";
 import "./topTabs.css";
 
@@ -14,6 +15,10 @@ export default function App() {
   const nav = useNavigate();
   const loc = useLocation();
   const [socketOk, setSocketOk] = useState(false);
+  const wsId = useMemo(() => {
+    const params = new URLSearchParams(loc.search);
+    return (params.get("ws") || "").trim();
+  }, [loc.search]);
 
   const active = useMemo(() => {
     if (loc.pathname.startsWith("/groups")) return "groups";
@@ -23,6 +28,7 @@ export default function App() {
   }, [loc.pathname]);
 
   useEffect(() => {
+    if (!wsId) return;
     const s = getSocket();
     const onC = () => setSocketOk(true);
     const onD = () => setSocketOk(false);
@@ -33,7 +39,11 @@ export default function App() {
       s.off("connect", onC);
       s.off("disconnect", onD);
     };
-  }, []);
+  }, [wsId]);
+
+  if (!wsId) {
+    return <MasterPage />;
+  }
 
   return (
     <Layout style={{ minHeight: "100vh" }}>
@@ -75,6 +85,4 @@ export default function App() {
     </Layout>
   );
 }
-
-
 
