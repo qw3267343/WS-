@@ -27,6 +27,8 @@ const upload = multer({
 const DATA_DIR = path.join(__dirname, 'data');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
 const AUTH_DIR = path.join(DATA_DIR, 'wwebjs_auth'); // LocalAuth dataPath
+const WORKSPACES_DIR = path.join(DATA_DIR, 'workspaces');
+const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 // ① 新增一个计数文件常量
 const UID_COUNTER_FILE = path.join(DATA_DIR, 'uid_counter.txt'); // 只记录最后一次使用的uid数字
 const UID_START = 100001;
@@ -35,12 +37,61 @@ const UID_START = 100001;
 function ensureDataFiles() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+  if (!fs.existsSync(WORKSPACES_DIR)) fs.mkdirSync(WORKSPACES_DIR, { recursive: true });
   if (!fs.existsSync(ACCOUNTS_FILE)) fs.writeFileSync(ACCOUNTS_FILE, '[]', 'utf-8');
+  if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, '[]', 'utf-8');
 
   // 从 100000 起步（下一次分配会变成 100001）
   if (!fs.existsSync(UID_COUNTER_FILE)) fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), 'utf-8');
 }
 ensureDataFiles();
+
+// ===== JSON helpers (atomic) =====
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return fallback; }
+}
+function writeJson(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
+  fs.renameSync(tmp, file);
+}
+function safeId(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  return s.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+function nowIso() { return new Date().toISOString(); }
+
+function loadProjects() {
+  const data = readJson(PROJECTS_FILE, []);
+  return Array.isArray(data) ? data : [];
+}
+function saveProjects(list) {
+  writeJson(PROJECTS_FILE, list);
+}
+function ensureWorkspaceDir(id) {
+  fs.mkdirSync(path.join(WORKSPACES_DIR, id), { recursive: true });
+}
+function getCountsForWorkspace(id) {
+  const accounts = readJson(path.join(WORKSPACES_DIR, id, 'accounts.json'), []);
+  const groups = readJson(path.join(WORKSPACES_DIR, id, 'groups.json'), []);
+  return {
+    accountsCount: Array.isArray(accounts) ? accounts.length : 0,
+    groupsCount: Array.isArray(groups) ? groups.length : 0,
+  };
+}
+function generateProjectId(name, list) {
+  const base = safeId(name) || 'project';
+  const existing = new Set((list || []).map(item => item.id));
+  let candidate = base;
+  let i = 1;
+  while (existing.has(candidate)) {
+    candidate = `${base}-${i}`;
+    i += 1;
+  }
+  return candidate;
+}
 
 function loadAccounts() {
   try {
@@ -261,6 +312,95 @@ function ensureClient(slot) {
 }
 
 // ---------- APIs ----------
+
+// Projects CRUD
+app.get('/api/projects', (req, res) => {
+  try {
+    const list = loadProjects().map(project => ({
+      ...project,
+      ...getCountsForWorkspace(project.id),
+    }));
+    return res.json({ ok: true, data: list });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/projects', (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    const note = String(req.body?.note || '').trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'name required' });
+
+    const list = loadProjects();
+    const id = generateProjectId(name, list);
+    const now = nowIso();
+    const project = { id, name, note, createdAt: now, updatedAt: now };
+    list.push(project);
+    saveProjects(list);
+    ensureWorkspaceDir(id);
+    return res.json({ ok: true, data: { id } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeId(req.params.id);
+    const project = loadProjects().find(item => item.id === id);
+    if (!project) return res.status(404).json({ ok: false, error: 'project not found' });
+    return res.json({ ok: true, data: project });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.put('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeId(req.params.id);
+    const list = loadProjects();
+    const idx = list.findIndex(item => item.id === id);
+    if (idx < 0) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    const name = req.body?.name != null ? String(req.body?.name || '').trim() : null;
+    const note = req.body?.note != null ? String(req.body?.note || '').trim() : null;
+    if (name !== null && !name) return res.status(400).json({ ok: false, error: 'name required' });
+
+    const current = list[idx];
+    const updated = {
+      ...current,
+      name: name !== null ? name : current.name,
+      note: note !== null ? note : current.note,
+      updatedAt: nowIso(),
+    };
+    list[idx] = updated;
+    saveProjects(list);
+    return res.json({ ok: true, data: updated });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.delete('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeId(req.params.id);
+    const list = loadProjects();
+    const idx = list.findIndex(item => item.id === id);
+    if (idx < 0) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    list.splice(idx, 1);
+    saveProjects(list);
+
+    const workspaceDir = path.join(WORKSPACES_DIR, id);
+    if (fs.existsSync(workspaceDir)) {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+    return res.json({ ok: true, data: { id } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
 // ✅ 新增账号（只建坑位，不会弹浏览器，不会 initialize）
 // body 可选：{ slot: "A1" }；不传就自动生成下一个 A{n}
