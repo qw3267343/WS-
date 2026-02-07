@@ -23,10 +23,10 @@ const upload = multer({
   limits: { fileSize: 64 * 1024 * 1024 } // 64MB
 });
 
-// ---------- 持久化：accounts.json（slot -> uid） ----------
+// ---------- 持久化 ----------
 const DATA_DIR = path.join(__dirname, 'data');
-const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
-const AUTH_DIR = path.join(DATA_DIR, 'wwebjs_auth'); // LocalAuth dataPath
+const WORKSPACES_DIR = path.join(DATA_DIR, 'workspaces');
+const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 // ① 新增一个计数文件常量
 const UID_COUNTER_FILE = path.join(DATA_DIR, 'uid_counter.txt'); // 只记录最后一次使用的uid数字
 const UID_START = 100001;
@@ -34,25 +34,92 @@ const UID_START = 100001;
 // ② 覆盖 ensureDataFiles()（让它创建 uid_counter.txt）
 function ensureDataFiles() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-  if (!fs.existsSync(ACCOUNTS_FILE)) fs.writeFileSync(ACCOUNTS_FILE, '[]', 'utf-8');
+  if (!fs.existsSync(WORKSPACES_DIR)) fs.mkdirSync(WORKSPACES_DIR, { recursive: true });
+  if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, '[]', 'utf-8');
 
   // 从 100000 起步（下一次分配会变成 100001）
   if (!fs.existsSync(UID_COUNTER_FILE)) fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), 'utf-8');
 }
 ensureDataFiles();
 
-function loadAccounts() {
-  try {
-    const raw = fs.readFileSync(ACCOUNTS_FILE, 'utf-8');
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+// ===== JSON helpers (atomic) =====
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return fallback; }
 }
-function saveAccounts(list) {
-  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+function writeJson(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
+  fs.renameSync(tmp, file);
+}
+function safeId(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  return s.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+function nowIso() { return new Date().toISOString(); }
+
+function getWs(req) {
+  const raw = req.query?.ws || req.headers['x-ws'] || 'default';
+  const ws = safeId(raw);
+  return ws || 'default';
+}
+
+function getWorkspaceDir(ws) {
+  return path.join(WORKSPACES_DIR, ws);
+}
+function getWorkspaceAccountsFile(ws) {
+  return path.join(getWorkspaceDir(ws), 'accounts.json');
+}
+function getWorkspaceGroupsFile(ws) {
+  return path.join(getWorkspaceDir(ws), 'groups.json');
+}
+function getWorkspaceAuthDir(ws) {
+  return path.join(getWorkspaceDir(ws), 'wwebjs_auth');
+}
+function ensureWorkspace(ws) {
+  const dir = getWorkspaceDir(ws);
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function loadProjects() {
+  const data = readJson(PROJECTS_FILE, []);
+  return Array.isArray(data) ? data : [];
+}
+function saveProjects(list) {
+  writeJson(PROJECTS_FILE, list);
+}
+function ensureWorkspaceDir(id) {
+  fs.mkdirSync(path.join(WORKSPACES_DIR, id), { recursive: true });
+}
+function getCountsForWorkspace(id) {
+  const accounts = readJson(path.join(WORKSPACES_DIR, id, 'accounts.json'), []);
+  const groups = readJson(path.join(WORKSPACES_DIR, id, 'groups.json'), []);
+  return {
+    accountsCount: Array.isArray(accounts) ? accounts.length : 0,
+    groupsCount: Array.isArray(groups) ? groups.length : 0,
+  };
+}
+function generateProjectId(name, list) {
+  const base = safeId(name) || 'project';
+  const existing = new Set((list || []).map(item => item.id));
+  let candidate = base;
+  let i = 1;
+  while (existing.has(candidate)) {
+    candidate = `${base}-${i}`;
+    i += 1;
+  }
+  return candidate;
+}
+
+function loadAccounts(ws) {
+  const file = getWorkspaceAccountsFile(ws);
+  const data = readJson(file, []);
+  return Array.isArray(data) ? data : [];
+}
+function saveAccounts(ws, list) {
+  const file = getWorkspaceAccountsFile(ws);
+  writeJson(file, list);
 }
 function normalizeSlot(s) {
   return String(s || '').trim();
@@ -60,8 +127,8 @@ function normalizeSlot(s) {
 function isValidSlot(slot) {
   return /^A\d+$/i.test(String(slot || '').trim());
 }
-function getAccountBySlot(slot) {
-  const list = loadAccounts();
+function getAccountBySlot(ws, slot) {
+  const list = loadAccounts(ws);
   return list.find(x => x.slot === slot) || null;
 }
 
@@ -101,24 +168,25 @@ function allocateNextUid(currentAccountsList) {
   return String(next); // uid 一律用字符串更稳
 }
 
-function ensureAccount(slot) {
+function ensureAccount(ws, slot) {
   slot = normalizeSlot(slot);
   if (!slot) throw new Error('slot empty');
   if (!isValidSlot(slot)) throw new Error('slot format must be A1/A2/...');
 
-  const list = loadAccounts();
+  ensureWorkspace(ws);
+  const list = loadAccounts(ws);
   let acc = list.find(x => x.slot === slot);
   if (!acc) {
     // ④A) 改 ensureAccount(slot) 里新建账号时：把 randomUUID() 换成 allocateNextUid(list)
     const uid = allocateNextUid(list);
     acc = { slot, uid, createdAt: Date.now() };
     list.push(acc);
-    saveAccounts(list);
+    saveAccounts(ws, list);
   }
   return acc;
 }
-function listAccountsSorted() {
-  const list = loadAccounts();
+function listAccountsSorted(ws) {
+  const list = loadAccounts(ws);
   return list.slice().sort((a, b) => String(a.slot).localeCompare(String(b.slot), 'en', { numeric: true }));
 }
 function nextSlotLabel(list) {
@@ -130,10 +198,19 @@ function nextSlotLabel(list) {
   return `A${max + 1}`;
 }
 
-// ---------- 运行态：按 slot 作为 key（方便 API） ----------
-const clients = new Map();   // slot -> Client
-const statuses = new Map();  // slot -> { status, lastQr }
-const profiles = new Map();  // slot -> { phone, nickname }
+// ---------- 运行态：按 ws 分桶 ----------
+const contexts = new Map(); // ws -> { clients, statuses, profiles }
+function ctx(ws) {
+  const key = safeId(ws) || 'default';
+  if (!contexts.has(key)) {
+    contexts.set(key, {
+      clients: new Map(),
+      statuses: new Map(),
+      profiles: new Map(),
+    });
+  }
+  return contexts.get(key);
+}
 
 // admin / fallback（默认 A1 / A2，可 env 覆盖）
 const ADMIN_SLOT = process.env.ADMIN_SLOT || 'A1';
@@ -178,7 +255,8 @@ function findGroupId(value, visited = new Set()) {
   return null;
 }
 
-function selectReadySlot() {
+function selectReadySlot(ws) {
+  const { statuses } = ctx(ws);
   const adminStatus = statuses.get(ADMIN_SLOT)?.status;
   if (adminStatus === 'READY') return ADMIN_SLOT;
 
@@ -192,16 +270,21 @@ function selectReadySlot() {
 }
 
 // slot -> 用 uid 建 LocalAuth（session-<uid>）
-function ensureClient(slot) {
+function ensureClient(ws, slot) {
+  const { clients, statuses, profiles } = ctx(ws);
   if (clients.has(slot)) return clients.get(slot);
 
-  const acc = ensureAccount(slot); // 确保 slot->uid 存在
+  const acc = ensureAccount(ws, slot); // 确保 slot->uid 存在
   const uid = acc.uid;
+
+  ensureWorkspace(ws);
+  const authDir = getWorkspaceAuthDir(ws);
+  fs.mkdirSync(authDir, { recursive: true });
 
   const client = new Client({
     authStrategy: new LocalAuth({
       clientId: uid,      // ✅ 唯一身份
-      dataPath: AUTH_DIR  // ✅ 统一存到 data/wwebjs_auth
+      dataPath: authDir   // ✅ 统一存到 data/workspaces/<ws>/wwebjs_auth
     }),
     puppeteer: {
       headless: false, // 如果你不想弹浏览器，把这里改 true
@@ -221,12 +304,13 @@ function ensureClient(slot) {
     },
   });
 
+  client.__ws = ws;
   statuses.set(slot, { status: 'INIT', lastQr: null });
 
   client.on('qr', (qr) => {
     statuses.set(slot, { status: 'QR', lastQr: qr });
-    io.emit('wa:qr', { slot, uid, qr });
-    io.emit('wa:status', { slot, uid, status: 'QR' });
+    io.to(ws).emit('wa:qr', { slot, uid, qr });
+    io.to(ws).emit('wa:status', { slot, uid, status: 'QR' });
   });
 
   client.on('ready', () => {
@@ -243,17 +327,17 @@ function ensureClient(slot) {
     profiles.set(slot, { phone, nickname });
 
     statuses.set(slot, { status: 'READY', lastQr: null });
-    io.emit('wa:status', { slot, uid, status: 'READY', phone, nickname });
+    io.to(ws).emit('wa:status', { slot, uid, status: 'READY', phone, nickname });
   });
 
   client.on('auth_failure', (msg) => {
     statuses.set(slot, { status: 'AUTH_FAILURE', lastQr: null });
-    io.emit('wa:status', { slot, uid, status: 'AUTH_FAILURE', msg });
+    io.to(ws).emit('wa:status', { slot, uid, status: 'AUTH_FAILURE', msg });
   });
 
   client.on('disconnected', (reason) => {
     statuses.set(slot, { status: 'DISCONNECTED', lastQr: null });
-    io.emit('wa:status', { slot, uid, status: 'DISCONNECTED', reason });
+    io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED', reason });
   });
 
   clients.set(slot, client);
@@ -262,11 +346,106 @@ function ensureClient(slot) {
 
 // ---------- APIs ----------
 
+io.on('connection', (socket) => {
+  const ws = safeId(socket.handshake.query?.ws) || 'default';
+  socket.join(ws);
+});
+
+// Projects CRUD
+app.get('/api/projects', (req, res) => {
+  try {
+    const list = loadProjects().map(project => ({
+      ...project,
+      ...getCountsForWorkspace(project.id),
+    }));
+    return res.json({ ok: true, data: list });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/projects', (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    const note = String(req.body?.note || '').trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'name required' });
+
+    const list = loadProjects();
+    const id = generateProjectId(name, list);
+    const now = nowIso();
+    const project = { id, name, note, createdAt: now, updatedAt: now };
+    list.push(project);
+    saveProjects(list);
+    ensureWorkspaceDir(id);
+    return res.json({ ok: true, data: { id } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeId(req.params.id);
+    const project = loadProjects().find(item => item.id === id);
+    if (!project) return res.status(404).json({ ok: false, error: 'project not found' });
+    return res.json({ ok: true, data: project });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.put('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeId(req.params.id);
+    const list = loadProjects();
+    const idx = list.findIndex(item => item.id === id);
+    if (idx < 0) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    const name = req.body?.name != null ? String(req.body?.name || '').trim() : null;
+    const note = req.body?.note != null ? String(req.body?.note || '').trim() : null;
+    if (name !== null && !name) return res.status(400).json({ ok: false, error: 'name required' });
+
+    const current = list[idx];
+    const updated = {
+      ...current,
+      name: name !== null ? name : current.name,
+      note: note !== null ? note : current.note,
+      updatedAt: nowIso(),
+    };
+    list[idx] = updated;
+    saveProjects(list);
+    return res.json({ ok: true, data: updated });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.delete('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeId(req.params.id);
+    const list = loadProjects();
+    const idx = list.findIndex(item => item.id === id);
+    if (idx < 0) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    list.splice(idx, 1);
+    saveProjects(list);
+
+    const workspaceDir = path.join(WORKSPACES_DIR, id);
+    if (fs.existsSync(workspaceDir)) {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+    return res.json({ ok: true, data: { id } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 // ✅ 新增账号（只建坑位，不会弹浏览器，不会 initialize）
 // body 可选：{ slot: "A1" }；不传就自动生成下一个 A{n}
 app.post('/api/accounts/create', (req, res) => {
   try {
-    const list = loadAccounts();
+    const ws = getWs(req);
+    const list = loadAccounts(ws);
     let slot = normalizeSlot(req.body?.slot);
     if (!slot) slot = nextSlotLabel(list);
     if (!isValidSlot(slot)) return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
@@ -278,7 +457,7 @@ app.post('/api/accounts/create', (req, res) => {
     const uid = allocateNextUid(list);
     const acc = { slot, uid, createdAt: Date.now() };
     list.push(acc);
-    saveAccounts(list);
+    saveAccounts(ws, list);
     return res.json({ ok: true, data: acc });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -288,7 +467,9 @@ app.post('/api/accounts/create', (req, res) => {
 // 账号列表：动态 N（只返回 accounts.json 里真实存在的账号）
 // 没创建坑位时返回 []
 app.get('/api/accounts', (req, res) => {
-  const list = listAccountsSorted();
+  const ws = getWs(req);
+  const { statuses, profiles } = ctx(ws);
+  const list = listAccountsSorted(ws);
   res.json({
     ok: true,
     data: list.map(acc => {
@@ -302,6 +483,8 @@ app.get('/api/accounts', (req, res) => {
 
 // 兼容：若你还在别处用 /api/accounts/profiles
 app.get('/api/accounts/profiles', (req, res) => {
+  const ws = getWs(req);
+  const { profiles } = ctx(ws);
   const slots = String(req.query.slots || '')
     .split(',')
     .map(s => s.trim())
@@ -316,13 +499,15 @@ app.get('/api/accounts/profiles', (req, res) => {
 
 // 群邀请链接解析（优先 A1 READY，否则 A2 READY，否则任意 READY）
 app.post('/api/groups/resolve', async (req, res) => {
+  const ws = getWs(req);
+  const { clients } = ctx(ws);
   const link = req.body?.link;
   const join = Boolean(req.body?.join);
   const code = extractInviteCode(link);
 
   if (!code) return res.status(400).json({ ok: false, error: '无效的邀请链接' });
 
-  const slot = selectReadySlot();
+  const slot = selectReadySlot(ws);
   if (!slot) return res.json({ ok: false, error: 'admin 未上线，请先扫码' });
 
   const client = clients.get(slot);
@@ -363,11 +548,12 @@ app.post('/api/groups/resolve', async (req, res) => {
 // 连接/扫码：会 initialize（此时才会弹浏览器/出二维码）
 // slot 必须先 create，也可以不先 create（这里会自动 ensureAccount）
 app.post('/api/accounts/:slot/connect', async (req, res) => {
+  const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
 
-  const acc = ensureAccount(slot);
-  const client = ensureClient(slot);
+  const acc = ensureAccount(ws, slot);
+  const client = ensureClient(ws, slot);
 
   try {
     await client.initialize();
@@ -379,11 +565,13 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
 
 // 登出：不会删掉 slot->uid（以后可重复登录同一个坑位）
 app.post('/api/accounts/:slot/logout', async (req, res) => {
+  const ws = getWs(req);
+  const { clients, profiles, statuses } = ctx(ws);
   const slot = normalizeSlot(req.params.slot);
   const client = clients.get(slot);
   if (!client) return res.json({ ok: true });
 
-  const uid = getAccountBySlot(slot)?.uid || null;
+  const uid = getAccountBySlot(ws, slot)?.uid || null;
 
   try { await client.logout(); } catch {}
   try { await client.destroy(); } catch {}
@@ -391,12 +579,14 @@ app.post('/api/accounts/:slot/logout', async (req, res) => {
   clients.delete(slot);
   profiles.delete(slot);
   statuses.set(slot, { status: 'LOGGED_OUT', lastQr: null });
-  io.emit('wa:status', { slot, uid, status: 'LOGGED_OUT' });
+  io.to(ws).emit('wa:status', { slot, uid, status: 'LOGGED_OUT' });
   res.json({ ok: true });
 });
 
 // 打开窗口（前置浏览器窗口）
 app.post('/api/accounts/:slot/open', async (req, res) => {
+  const ws = getWs(req);
+  const { clients } = ctx(ws);
   const { slot } = req.params;
   const client = clients.get(slot);
   if (!client) return res.status(400).json({ ok: false, error: 'client not initialized' });
@@ -411,6 +601,8 @@ app.post('/api/accounts/:slot/open', async (req, res) => {
 
 // 删除账号（会删除 accounts.json 的记录 + 删除 LocalAuth 缓存目录）
 app.post('/api/accounts/:slot/delete', async (req, res) => {
+  const ws = getWs(req);
+  const { clients, statuses, profiles } = ctx(ws);
   const { slot } = req.params;
 
   try {
@@ -425,18 +617,18 @@ app.post('/api/accounts/:slot/delete', async (req, res) => {
     profiles.delete(slot);
 
     // 2) 删除账号记录
-    const list = loadAccounts();
+    const list = loadAccounts(ws);
     const idx = list.findIndex(x => x.slot === slot);
     if (idx < 0) return res.json({ ok: true });
 
     const acc = list[idx];
     list.splice(idx, 1);
-    saveAccounts(list);
+    saveAccounts(ws, list);
 
     // 3) 删除 LocalAuth 会话目录（clientId = uid 时：session-<uid>）
     const uid = String(acc.uid || '').trim();
     if (uid) {
-      const dir = path.join(AUTH_DIR, `session-${uid}`);
+      const dir = path.join(getWorkspaceAuthDir(ws), `session-${uid}`);
       try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
     }
 
@@ -448,6 +640,8 @@ app.post('/api/accounts/:slot/delete', async (req, res) => {
 
 // 纯文本发送
 app.post('/api/accounts/:slot/send', async (req, res) => {
+  const ws = getWs(req);
+  const { clients } = ctx(ws);
   const slot = normalizeSlot(req.params.slot);
   const { to, text } = req.body;
   if (!to || !text) return res.status(400).json({ ok: false, error: 'to/text required' });
@@ -466,6 +660,8 @@ app.post('/api/accounts/:slot/send', async (req, res) => {
 // 媒体发送
 app.post('/api/accounts/:slot/sendMedia', upload.array('files', 10), async (req, res) => {
   try {
+    const ws = getWs(req);
+    const { clients, statuses } = ctx(ws);
     const slot = normalizeSlot(req.params.slot);
     const client = clients.get(slot);
     const st = statuses.get(slot)?.status;
