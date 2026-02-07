@@ -1,8 +1,10 @@
-﻿export type Role = {
+﻿// wa-panel-ui/src/lib/types.ts  （整文件覆盖）
+
+export type Role = {
   id: string;
   remark: string;     // 老师/助理/老手1…
   name: string;       // 显示名
-  boundSlot?: string; // acc002…
+  boundSlot?: string; // A1/A2…
 };
 
 export type GroupTarget = {
@@ -16,6 +18,11 @@ export type GroupTarget = {
 
 export type WaAccountRow = {
   slot: string;
+  uid?: string | null;
+
   status: string;
   lastQr?: string | null;
+
+  phone?: string | null;
+  nickname?: string | null;
 };
