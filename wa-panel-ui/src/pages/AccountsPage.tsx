@@ -3,7 +3,6 @@ import {
   Button,
   Card,
   Dropdown,
-  Input,
   Modal,
   Space,
   Table,
@@ -11,7 +10,8 @@ import {
   Typography,
   message
 } from "antd";
-import type { ColumnsType, TableRowSelection } from "antd/es/table";
+import type { ColumnsType } from "antd/es/table";
+import type { TableProps } from "antd/es/table";
 import type { MenuProps } from "antd";
 import { DownOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
@@ -179,7 +179,7 @@ export default function AccountsPage() {
       { type: "divider" as const },
       { key: "delete", label: "批量 删除账号", danger: true },
     ],
-    onClick: async ({ key }) => {
+    onClick: async ({ key }: { key: string }) => {
       if (key === "connect") return runBatch(selectedSlots, connect, "连接/扫码");
       if (key === "logout") return runBatch(selectedSlots, logout, "登出");
       if (key === "delete") {
@@ -202,9 +202,10 @@ export default function AccountsPage() {
     }
   };
 
-  const rowSelection: TableRowSelection<AccRow> = {
+  // 修改这里的类型定义
+  const rowSelection: TableProps<AccRow>['rowSelection'] = {
     selectedRowKeys: selectedKeys,
-    onChange: (keys) => setSelectedKeys(keys),
+    onChange: (keys: React.Key[]) => setSelectedKeys(keys),
     // 占位 A1 且没有 uid 的不允许勾选（可选）
     getCheckboxProps: (r) => ({
       disabled: r.status === "NEW" && !r.uid && r.slot === "A1" && rows.length === 1
@@ -257,7 +258,7 @@ export default function AccountsPage() {
             { key: "refresh", label: "刷新" },
             { key: "delete", label: "删除账号", danger: true },
           ],
-          onClick: async ({ key }) => {
+          onClick: async ({ key }: { key: string }) => {
             if (key === "connect") return connect(r.slot);
             if (key === "open") return openWindow(r.slot);
             if (key === "logout") return logout(r.slot);
