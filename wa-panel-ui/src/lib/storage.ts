@@ -1,38 +1,50 @@
-﻿import type { GroupTarget, Role } from "./types";
+import type { GroupTarget, Role } from "./types";
+import { getWsId, wsKey } from "./workspace";
 
-const K_ROLES  = "wa_roles_v1";
+const K_ROLES = "wa_roles_v1";
 const K_GROUPS = "wa_groups_v1";
-const K_SLOTS  = "wa_slots_v1";
+const K_SLOTS = "wa_slots_v1";
+
+function resolveKey(key: string): string {
+  const nextKey = wsKey(key);
+  if (getWsId() !== "default") return nextKey;
+  if (localStorage.getItem(nextKey) != null) return nextKey;
+  const legacyValue = localStorage.getItem(key);
+  if (legacyValue != null) {
+    localStorage.setItem(nextKey, legacyValue);
+    localStorage.removeItem(key);
+  }
+  return nextKey;
+}
 
 export function loadSlots(): string[] {
-  const raw = localStorage.getItem(K_SLOTS) || "acc001,acc002,acc003";
+  const raw = localStorage.getItem(resolveKey(K_SLOTS)) || "acc001,acc002,acc003";
   return raw.split(",").map(s => s.trim()).filter(Boolean);
 }
 export function saveSlots(raw: string) {
-  localStorage.setItem(K_SLOTS, raw);
+  localStorage.setItem(resolveKey(K_SLOTS), raw);
 }
 
 export function loadRoles(): Role[] {
   let arr: Role[] = [];
-  try { arr = JSON.parse(localStorage.getItem(K_ROLES) || "[]"); } catch { arr = []; }
+  try { arr = JSON.parse(localStorage.getItem(resolveKey(K_ROLES)) || "[]"); } catch { arr = []; }
 
-  // 自动补齐默认 33 个角色（不覆盖已有）
   const next = ensureDefaultRoles(arr);
   if (next !== arr) saveRoles(next);
   return next;
 }
 export function saveRoles(rows: Role[]) {
-  localStorage.setItem(K_ROLES, JSON.stringify(rows));
+  localStorage.setItem(resolveKey(K_ROLES), JSON.stringify(rows));
 }
 
 export function loadGroups(): GroupTarget[] {
-  try { return JSON.parse(localStorage.getItem(K_GROUPS) || "[]"); } catch { return []; }
+  try { return JSON.parse(localStorage.getItem(resolveKey(K_GROUPS)) || "[]"); } catch { return []; }
 }
 export function saveGroups(rows: GroupTarget[]) {
-  localStorage.setItem(K_GROUPS, JSON.stringify(rows));
+  localStorage.setItem(resolveKey(K_GROUPS), JSON.stringify(rows));
 }
 
-export function uid(prefix="id") {
+export function uid(prefix = "id") {
   return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`;
 }
 
