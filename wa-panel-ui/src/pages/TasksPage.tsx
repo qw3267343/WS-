@@ -71,6 +71,7 @@ type AccRow = WaAccountRow & {
 
 export default function TasksPage() {
   const PAGE_H = "calc(100vh - 64px - 32px)";
+  const BOTTOM_H = 300;
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>(() => loadRoles());
@@ -810,16 +811,16 @@ export default function TasksPage() {
                 />
               </Card>
 
-              <Row gutter={16} style={{ marginTop: 8 }}>
+              <Row gutter={16} style={{ marginTop: 8 }} align="stretch">
                 <Col span={16}>
                   <div style={{
                     border: "1px solid #d9d9d9",
                     borderRadius: 8,
                     padding: 16,
                     background: "#fafafa",
-                    height: "100%",
                     display: "flex",
                     flexDirection: "column",
+                    gap: 12,
                   }}>
                     <input
                       ref={filePickRef}
@@ -836,10 +837,9 @@ export default function TasksPage() {
                       style={{
                         border: "1px dashed #d9d9d9",
                         borderRadius: 8,
-                        padding: 16,
+                        padding: 14,
                         background: "#fff",
-                        flex: 1,
-                        height: "100%",
+                        height: 260,
                         display: "flex",
                         flexDirection: "column",
                       }}
@@ -851,17 +851,16 @@ export default function TasksPage() {
                         placeholder="输入要发送的内容…（支持 Ctrl+V 粘贴图片/视频；也可拖拽文件到此区域）"
                         style={{
                           fontSize: 14,
-                          flex: 1,
-                          height: "100%",
                           resize: "none",
                           border: "none",
                           padding: "12px",
-                          lineHeight: 1.5
+                          lineHeight: 1.5,
+                          height: "auto",
                         }}
-                        autoSize={{ minRows: 10, maxRows: 15 }}
+                        autoSize={{ minRows: 5, maxRows: 8 }}
                       />
 
-                      <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                      <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                           提示：拖拽图片/视频到这个框内即可添加附件
                         </Typography.Text>
@@ -899,9 +898,15 @@ export default function TasksPage() {
                   </div>
                 </Col>
 
-                <Col span={8}>
-                  <Space direction="vertical" style={{ width: "100%", height: "100%" }}>
-                    <Card size="small" title="当前角色" bodyStyle={{ padding: 16 }}>
+                <Col span={8} style={{ display: "flex" }}>
+                  <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
+
+                    <Card
+                      size="small"
+                      title="当前角色"
+                      style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                    >
                       <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
                         <Tag
                           color={activeRole?.boundSlot ? "blue" : "default"}
@@ -920,20 +925,16 @@ export default function TasksPage() {
                             {getAccText(activeRole.boundSlot).text}
                           </Tag>
                         )}
-                        <Button
-                          block
-                          onClick={() => {
-                            if (!activeRole) return;
-                            openBind(activeRole);
-                          }}
-                        >
-                          绑定/替换账号
-                        </Button>
                       </div>
                     </Card>
 
-                    <Card size="small" title="媒体操作" bodyStyle={{ padding: 16 }}>
-                      <Space direction="vertical" style={{ width: "100%" }}>
+                    <Card
+                      size="small"
+                      title="媒体操作"
+                      style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                    >
+                      <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
                         <Button
                           block
                           onClick={() => filePickRef.current?.click()}
@@ -950,10 +951,15 @@ export default function TasksPage() {
                         >
                           清空附件
                         </Button>
-                      </Space>
+                      </div>
                     </Card>
 
-                    <Card size="small" title="发送控制" bodyStyle={{ padding: 16 }}>
+                    <Card
+                      size="small"
+                      title="发送控制"
+                      style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                    >
                       <Button
                         type="primary"
                         block
@@ -1006,7 +1012,7 @@ export default function TasksPage() {
                         </div>
                       )}
                     </Card>
-                  </Space>
+                  </div>
                 </Col>
               </Row>
 
@@ -1014,6 +1020,7 @@ export default function TasksPage() {
           </Card>
         </Col>
       </Row>
+
 
       {/* ✅ 绑定/替换账号弹窗（任意角色都可随意换到任何 Axx） */}
       <Modal
