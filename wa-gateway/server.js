@@ -599,6 +599,45 @@ app.post('/api/accounts/:slot/open', async (req, res) => {
   return res.status(400).json({ ok: false, error: '当前版本无法获取页面对象（无法打开窗口）' });
 });
 
+// 打开聊天（bringToFront + 跳到 phone 聊天页面）
+// body: { phone: "9477xxxxxxx", text?: "hello" } 也兼容 { to, text }
+app.post('/api/accounts/:slot/openChat', async (req, res) => {
+  const ws = getWs(req);
+  const { clients, statuses } = ctx(ws);
+
+  const slot = normalizeSlot(req.params.slot);
+  const client = clients.get(slot);
+  if (!client) return res.status(400).json({ ok: false, error: 'client not initialized' });
+
+  const st = statuses.get(slot)?.status;
+  if (st !== 'READY') return res.status(400).json({ ok: false, error: `slot not READY: ${st}` });
+
+  const phoneRaw = String(req.body?.phone ?? req.body?.to ?? '').trim();
+  const text = String(req.body?.text ?? '').trim();
+
+  const phone = phoneRaw.replace(/[^\d]/g, '');
+  if (!phone) return res.status(400).json({ ok: false, error: 'phone required (digits only)' });
+
+  try {
+    const page = await getPupPage(client);
+    if (!page?.goto) return res.status(400).json({ ok: false, error: 'cannot access browser page' });
+
+    const url =
+      'https://web.whatsapp.com/send?phone=' +
+      encodeURIComponent(phone) +
+      '&text=' +
+      encodeURIComponent(text) +
+      '&app_absent=0';
+
+    try { await page.bringToFront?.(); } catch {}
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+    return res.json({ ok: true, data: { slot, phone, url } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 // 删除账号（会删除 accounts.json 的记录 + 删除 LocalAuth 缓存目录）
 app.post('/api/accounts/:slot/delete', async (req, res) => {
   const ws = getWs(req);
@@ -641,13 +680,16 @@ app.post('/api/accounts/:slot/delete', async (req, res) => {
 // 纯文本发送
 app.post('/api/accounts/:slot/send', async (req, res) => {
   const ws = getWs(req);
-  const { clients } = ctx(ws);
+  const { clients, statuses } = ctx(ws);
   const slot = normalizeSlot(req.params.slot);
   const { to, text } = req.body;
   if (!to || !text) return res.status(400).json({ ok: false, error: 'to/text required' });
 
   const client = clients.get(slot);
+  const st = statuses.get(slot)?.status;
+
   if (!client) return res.status(400).json({ ok: false, error: 'client not initialized' });
+  if (st !== 'READY') return res.status(400).json({ ok: false, error: `slot not READY: ${st}` });
 
   try {
     const msg = await client.sendMessage(to, text);
@@ -656,6 +698,7 @@ app.post('/api/accounts/:slot/send', async (req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
+
 
 // 媒体发送
 app.post('/api/accounts/:slot/sendMedia', upload.array('files', 10), async (req, res) => {

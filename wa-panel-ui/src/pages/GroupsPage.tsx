@@ -15,29 +15,13 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import type { GroupTarget } from "../lib/types";
 import { loadGroups, saveGroups } from "../lib/storage";
+import { http } from "../lib/api";
+
 
 type ResolveResp =
   | { ok: true; data: { slot?: string; id: string; name: string } }
   | { ok: false; error?: string };
 
-async function postJSON<T>(url: string, body: any): Promise<T> {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const text = await r.text();
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!r.ok) {
-    throw new Error(json?.error || json?.message || `HTTP ${r.status}`);
-  }
-  return (json ?? {}) as T;
-}
 
 function normalizeLink(s: string) {
   const v = (s || "").trim();
@@ -218,33 +202,45 @@ function AddGroupModal(props: {
     }
   }, [props.open, props.editing]);
 
-  async function onResolve() {
-    const v = link.trim();
-    if (!v) return message.error("请先粘贴群邀请链接");
-
-    setResolving(true);
-    try {
-      const r = await postJSON<ResolveResp>("/api/groups/resolve", {
-        link: v,
-        join: true,
-      });
-
-      if (!r.ok) throw new Error(r.error || "解析失败");
-
-      const gid = (r.data?.id || "").trim();
-      const gname = (r.data?.name || "").trim();
-
-      if (gid) setId(gid);
-      if (gname) setName(gname);
-
-      const slotInfo = r.data?.slot ? `（${r.data.slot}）` : "";
-      message.success(`解析成功${slotInfo}：${gname || "群名未知"}`);
-    } catch (e: any) {
-      message.error("解析失败：" + (e?.message || "unknown error"));
-    } finally {
-      setResolving(false);
-    }
+async function onResolve() {
+  const v = link.trim();
+  if (!v) {
+    message.error("请先粘贴群邀请链接");
+    return;
   }
+
+  setResolving(true);
+  try {
+    const resp = await http.post<ResolveResp>("/api/groups/resolve", {
+      link: v,
+      join: true
+    });
+
+    const r = resp.data;
+    if (!r.ok) {
+      throw new Error(r.error || "解析失败");
+    }
+
+    const gid = (r.data?.id || "").trim();
+    const gname = (r.data?.name || "").trim();
+
+    if (gid) {
+      setId(gid);
+    }
+    if (gname) {
+      setName(gname);
+    }
+
+    const slotInfo = r.data?.slot ? `（${r.data.slot}）` : "";
+    message.success(`解析成功${slotInfo}：${gname || "群名未知"}`);
+  } catch (e: any) {
+    message.error("解析失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+  } finally {
+    setResolving(false);
+  }
+}
+
+
 
   const isEdit = !!props.editing;
 

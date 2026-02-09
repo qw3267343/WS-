@@ -22,15 +22,20 @@ export const http = axios.create({
 
 http.interceptors.request.use((config) => {
   const wsId = localStorage.getItem(ACTIVE_WS_KEY);
+
   if (wsId) {
     config.headers = config.headers ?? {};
-    config.headers["x-ws"] = wsId;
+    const h: any = config.headers as any;
+    if (typeof h.set === "function") h.set("x-ws", wsId);
+    else h["x-ws"] = wsId;
   }
+
   if (config.url) {
-    config.url = withWs(config.url);
+    config.url = withWs(config.url); // 现在 withWs 会追加 ?ws=6688 且不改域名
   }
   return config;
 });
+
 
 export function setApiBase(base: string) {
   localStorage.setItem("wa_api_base", base);
