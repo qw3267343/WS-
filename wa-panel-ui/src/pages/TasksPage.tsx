@@ -96,6 +96,31 @@ export default function TasksPage() {
   const BOTTOM_H = 300;
   const BASE_INPUT_AREA_H = 240;
   const MAX_INPUT_AREA_H = 420;
+  const SEND_CONCURRENCY = 4;
+
+  function sleep(ms: number) {
+    return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function runPool<T>(
+    items: T[],
+    worker: (item: T, index: number) => Promise<boolean>,
+    concurrency: number
+  ) {
+    let idx = 0;
+    const results: boolean[] = new Array(items.length).fill(false);
+
+    const runners = Array.from({ length: Math.max(1, concurrency) }, async () => {
+      while (true) {
+        const i = idx++;
+        if (i >= items.length) break;
+        results[i] = await worker(items[i], i);
+      }
+    });
+
+    await Promise.all(runners);
+    return results;
+  }
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>(() => loadRoles());
@@ -109,6 +134,7 @@ export default function TasksPage() {
 
   const [runIdx, setRunIdx] = useState(0);
   const [batchId, setBatchId] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
   const enabledGroups = useMemo(() => groups.filter(g => g.enabled), [groups]);
   const nextGroup = enabledGroups[runIdx] || null;
 
@@ -512,6 +538,65 @@ export default function TasksPage() {
     }
   }
 
+  async function sendAllEnabledGroupsConcurrent() {
+    if (!activeRole) {
+      message.error("请先选择一个角色");
+      return;
+    }
+    if (!activeRole.boundSlot) {
+      message.error("该角色未绑定账号，请先绑定账号");
+      return;
+    }
+    if (!enabledGroups.length) {
+      message.error("没有启用的群");
+      return;
+    }
+
+    const hasContent = (text && text.trim().length > 0) || files.length > 0;
+    if (!hasContent) {
+      message.error("内容或附件至少要有一个");
+      return;
+    }
+
+    setSending(true);
+    setRunIdx(0);
+
+    const bid = newId();
+    setBatchId(bid);
+    startBatchHistory(bid, enabledGroups.length);
+
+    try {
+      const results = await runPool(
+        enabledGroups,
+        async (g) => {
+          await sleep(120);
+
+          const ok = await sendOne(g.id, { batchId: bid });
+
+          setRunIdx((n) => n + 1);
+          return ok;
+        },
+        SEND_CONCURRENCY
+      );
+
+      const allOk = results.every(Boolean);
+
+      finalizeBatchHistory(bid);
+
+      setBatchId(null);
+      setRunIdx(0);
+
+      if (allOk) {
+        setText("");
+        setFiles([]);
+      }
+
+      message[allOk ? "success" : "warning"](allOk ? "所有群发送成功" : "已发送完，但有失败（看历史 NO）");
+    } finally {
+      setSending(false);
+    }
+  }
+
   // ✅ 新绑定弹窗打开
   function openBind(role: Role) {
     setBindModal({ open: true, role });
@@ -628,11 +713,12 @@ export default function TasksPage() {
 
   const canSend = useMemo(() => {
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
+    if (sending) return false;
     if (!activeRole) return false;
     if (!hasContent) return false;
     if (mode === "enabled_groups") return enabledGroups.length > 0;
     return singleTo.trim().length > 0;
-  }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo]);
+  }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo, sending]);
   const showHint = !text.trim() && files.length === 0;
 
   // 绑定弹窗 options（来自 accounts）
@@ -882,7 +968,7 @@ export default function TasksPage() {
               {mode === "enabled_groups" && (
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                   <Tag color="blue">启用群：{enabledGroups.length} 个</Tag>
-                  <Tag>进度：{Math.min(runIdx + 1, enabledGroups.length)}/{enabledGroups.length}</Tag>
+                  <Tag>进度：{Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}</Tag>
                   {nextGroup && <Tag color="geekblue">下一群：{nextGroup.name}</Tag>}
                   <Button size="small" onClick={() => setGroups(loadGroups())}>刷新群列表</Button>
                 </div>
@@ -1169,28 +1255,7 @@ export default function TasksPage() {
                           if (!hasContent) return message.error("内容或附件至少要有一个");
 
                           if (mode === "enabled_groups") {
-                            if (!enabledGroups.length) {
-                              message.error("没有启用的群");
-                              return;
-                            }
-
-                            let idx = runIdx;
-                            if (idx >= enabledGroups.length) {
-                              idx = 0;
-                              setRunIdx(0);
-                              message.info("已完成一轮，已从头开始");
-                            }
-
-                            const to = enabledGroups[idx].id;
-                            const ok = await sendOne(to);
-
-                            setRunIdx(idx + 1);
-                            if (ok) {
-                              setText("");
-                              setFiles([]);
-                            }
-
-                            ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+                            await sendAllEnabledGroupsConcurrent();
                             return;
                           } else {
                             const ok = await sendOne(singleTo.trim());
@@ -1209,7 +1274,7 @@ export default function TasksPage() {
                       {mode === "enabled_groups" && enabledGroups.length > 0 && (
                         <div style={{ marginTop: 12, textAlign: "center" }}>
                           <Typography.Text type="secondary">
-                            进度: {Math.min(runIdx + 1, enabledGroups.length)}/{enabledGroups.length}
+                            进度: {Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}
                           </Typography.Text>
                           <div style={{ marginTop: 4 }}>
                             <div style={{
