@@ -906,7 +906,7 @@ export default function TasksPage() {
                       size="small"
                       title="当前角色"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                      bodyStyle={{ padding: 16, flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
                     >
                       <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
                         <Tag
@@ -933,7 +933,7 @@ export default function TasksPage() {
                       size="small"
                       title="媒体操作"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                      bodyStyle={{ padding: 16, flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
                     >
                       <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
                         <Button
@@ -959,7 +959,7 @@ export default function TasksPage() {
                       size="small"
                       title="发送控制"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                      bodyStyle={{ padding: 16, flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
                     >
                       <Button
                         type="primary"
