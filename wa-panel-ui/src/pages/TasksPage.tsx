@@ -900,24 +900,22 @@ export default function TasksPage() {
                 </Col>
 
                 <Col span={8} style={{ display: "flex" }}>
-                  <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12, flex: 1, height: INPUT_AREA_H }}>
 
-                    <Card
-                      size="small"
-                      title="当前角色"
-                      style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                  <Card
+                    size="small"
+                    style={{
+                      width: "100%",
+                      height: INPUT_AREA_H,
+                      display: "flex",
+                      flexDirection: "column",
+                      overflow: "hidden"
+                    }}
+                    bodyStyle={{ padding: 16, flex: 1, overflow: "hidden" }}
+                  >
+                    <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        <Typography.Text style={{ fontWeight: 600 }}>当前角色</Typography.Text>
 
-                      bodyStyle={{
-                        padding: 16,
-                        flex: 1,
-                        overflow: "hidden",
-                        display: "flex",
-                        alignItems: "stretch",
-                        justifyContent: "flex-start"
-                      }}
-
-                    >
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "stretch" }}>
                         <Tag
                           color={activeRole?.boundSlot ? "blue" : "default"}
                           style={{
@@ -939,111 +937,91 @@ export default function TasksPage() {
                           </Tag>
                         )}
                       </div>
-                    </Card>
 
-                    <Card
-                      size="small"
-                      title="媒体操作"
-                      style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                      <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 4 }} />
 
-                      bodyStyle={{
-                        padding: 16,
-                        flex: 1,
-                        overflow: "hidden",
-                        display: "flex",
-                        alignItems: "stretch",
-                        justifyContent: "flex-start"
-                      }}
-
-                    >
-                      <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
-                        <Button
-                          block
-                          onClick={() => filePickRef.current?.click()}
-                          style={{ height: 40 }}
-                        >
-                          选择媒体
-                        </Button>
-                        <Button
-                          block
-                          onClick={() => setFiles([])}
-                          disabled={!files.length}
-                          danger
-                          style={{ height: 40 }}
-                        >
-                          清空附件
-                        </Button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        <Typography.Text style={{ fontWeight: 600 }}>媒体操作</Typography.Text>
+                        <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
+                          <Button
+                            block
+                            onClick={() => filePickRef.current?.click()}
+                            style={{ height: 40 }}
+                          >
+                            选择媒体
+                          </Button>
+                          <Button
+                            block
+                            onClick={() => setFiles([])}
+                            disabled={!files.length}
+                            danger
+                            style={{ height: 40 }}
+                          >
+                            清空附件
+                          </Button>
+                        </div>
                       </div>
-                    </Card>
 
-                    <Card
-                      size="small"
-                      title="发送控制"
-                      style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                      <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 4 }} />
 
-                      bodyStyle={{
-                        padding: 16,
-                        flex: 1,
-                        overflow: "hidden",
-                        display: "flex",
-                        alignItems: "stretch",
-                        justifyContent: "flex-start"
-                      }}
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        <Typography.Text style={{ fontWeight: 600 }}>发送控制</Typography.Text>
 
-                    >
-                      <Button
-                        type="primary"
-                        block
-                        disabled={!canSend}
-                        onClick={async () => {
-                          if (!activeRole) return message.error("请先选择一个角色");
-                          const hasContent = (text && text.trim().length > 0) || files.length > 0;
-                          if (!hasContent) return message.error("内容或附件至少要有一个");
+                        <Button
+                          type="primary"
+                          block
+                          disabled={!canSend}
+                          onClick={async () => {
+                            if (!activeRole) return message.error("请先选择一个角色");
+                            const hasContent = (text && text.trim().length > 0) || files.length > 0;
+                            if (!hasContent) return message.error("内容或附件至少要有一个");
 
-                          if (mode === "enabled_groups") {
-                            if (!enabledGroups.length) return message.error("没有启用的群");
-                            if (runIdx >= enabledGroups.length) return message.error("已发送完所有启用群（可切换任务类型或刷新群）");
-                            const to = enabledGroups[runIdx].id;
-                            const ok = await sendOne(to);
-                            setRunIdx(i => i + 1);
-                            ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
-                          } else {
-                            const ok = await sendOne(singleTo.trim());
-                            ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
-                          }
-                        }}
-                        style={{ height: 50, fontSize: 16 }}
-                      >
-                        立即发送
-                      </Button>
+                            if (mode === "enabled_groups") {
+                              if (!enabledGroups.length) return message.error("没有启用的群");
+                              if (runIdx >= enabledGroups.length) return message.error("已发送完所有启用群（可切换任务类型或刷新群）");
+                              const to = enabledGroups[runIdx].id;
+                              const ok = await sendOne(to);
+                              setRunIdx(i => i + 1);
+                              ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+                            } else {
+                              const ok = await sendOne(singleTo.trim());
+                              ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+                            }
+                          }}
+                          style={{ height: 50, fontSize: 16 }}
+                        >
+                          立即发送
+                        </Button>
 
-                      {mode === "enabled_groups" && enabledGroups.length > 0 && (
-                        <div style={{ marginTop: 12, textAlign: "center" }}>
-                          <Typography.Text type="secondary">
-                            进度: {Math.min(runIdx + 1, enabledGroups.length)}/{enabledGroups.length}
-                          </Typography.Text>
-                          <div style={{ marginTop: 4 }}>
-                            <div style={{
-                              width: "100%",
-                              height: 6,
-                              backgroundColor: "#f0f0f0",
-                              borderRadius: 3,
-                              overflow: "hidden"
-                            }}>
-                              <div
-                                style={{
-                                  width: `${(runIdx / enabledGroups.length) * 100}%`,
-                                  height: "100%",
-                                  backgroundColor: "#1890ff",
-                                  transition: "width 0.3s"
-                                }}
-                              />
+                        {mode === "enabled_groups" && enabledGroups.length > 0 && (
+                          <div style={{ marginTop: 12, textAlign: "center" }}>
+                            <Typography.Text type="secondary">
+                              进度: {Math.min(runIdx + 1, enabledGroups.length)}/{enabledGroups.length}
+                            </Typography.Text>
+                            <div style={{ marginTop: 4 }}>
+                              <div style={{
+                                width: "100%",
+                                height: 6,
+                                backgroundColor: "#f0f0f0",
+                                borderRadius: 3,
+                                overflow: "hidden"
+                              }}>
+                                <div
+                                  style={{
+                                    width: `${(runIdx / enabledGroups.length) * 100}%`,
+                                    height: "100%",
+                                    backgroundColor: "#1890ff",
+                                    transition: "width 0.3s"
+                                  }}
+                                />
+                              </div>
+
                             </div>
                           </div>
-                        </div>
-                      )}
-                    </Card>
-                  </div>
+                        )}
+                      </div>
+                    </div>
+                  </Card>
                 </Col>
               </Row>
 
