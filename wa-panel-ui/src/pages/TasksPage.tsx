@@ -72,6 +72,7 @@ type AccRow = WaAccountRow & {
 export default function TasksPage() {
   const PAGE_H = "calc(100vh - 64px - 32px)";
   const BOTTOM_H = 300;
+  const INPUT_AREA_H = 240;
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>(() => loadRoles());
@@ -769,7 +770,7 @@ export default function TasksPage() {
                     清空
                   </Button>
                 }
-                style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
+                style={{ flex: "1 1 auto", overflow: "hidden", display: "flex", flexDirection: "column", minHeight: 200 }}
                 bodyStyle={{ flex: 1, overflowY: "auto" }}
               >
                 <List
@@ -811,7 +812,7 @@ export default function TasksPage() {
                 />
               </Card>
 
-              <Row gutter={16} style={{ marginTop: 8 }} align="stretch">
+              <Row gutter={16} style={{ marginTop: "auto" }} align="stretch">
                 <Col span={16}>
                   <div style={{
                     border: "1px solid #d9d9d9",
@@ -839,7 +840,7 @@ export default function TasksPage() {
                         borderRadius: 8,
                         padding: 14,
                         background: "#fff",
-                        height: 260,
+                        height: INPUT_AREA_H,
                         display: "flex",
                         flexDirection: "column",
                       }}
@@ -899,15 +900,22 @@ export default function TasksPage() {
                 </Col>
 
                 <Col span={8} style={{ display: "flex" }}>
-                  <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
+                  <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12, flex: 1, height: INPUT_AREA_H }}>
 
                     <Card
                       size="small"
                       title="当前角色"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                      bodyStyle={{
+                        padding: 16,
+                        flex: 1,
+                        overflow: "hidden",
+                        display: "flex",
+                        alignItems: "stretch",
+                        justifyContent: "flex-start"
+                      }}
                     >
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "stretch" }}>
                         <Tag
                           color={activeRole?.boundSlot ? "blue" : "default"}
                           style={{
@@ -921,7 +929,10 @@ export default function TasksPage() {
                           {activeRole ? `${activeRole.remark} - ${activeRole.name || "未知"}` : "未选择"}
                         </Tag>
                         {activeRole?.boundSlot && (
-                          <Tag color={getAccText(activeRole.boundSlot).color as any}>
+                          <Tag
+                            color={getAccText(activeRole.boundSlot).color as any}
+                            style={{ width: "100%", textAlign: "center" }}
+                          >
                             {getAccText(activeRole.boundSlot).text}
                           </Tag>
                         )}
@@ -932,7 +943,14 @@ export default function TasksPage() {
                       size="small"
                       title="媒体操作"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                      bodyStyle={{
+                        padding: 16,
+                        flex: 1,
+                        overflow: "hidden",
+                        display: "flex",
+                        alignItems: "stretch",
+                        justifyContent: "flex-start"
+                      }}
                     >
                       <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
                         <Button
@@ -958,7 +976,14 @@ export default function TasksPage() {
                       size="small"
                       title="发送控制"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "auto" }}
+                      bodyStyle={{
+                        padding: 16,
+                        flex: 1,
+                        overflow: "hidden",
+                        display: "flex",
+                        alignItems: "stretch",
+                        justifyContent: "flex-start"
+                      }}
                     >
                       <Button
                         type="primary"
