@@ -16,7 +16,7 @@ import {
   message
 } from "antd";
 import type { MenuProps } from "antd";
-import { MoreOutlined, PlusOutlined, ReloadOutlined, DeleteOutlined, DragOutlined } from "@ant-design/icons";
+import { MoreOutlined, PlusOutlined, ReloadOutlined, DeleteOutlined, DragOutlined, CloseOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
 import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
@@ -845,6 +845,18 @@ export default function TasksPage() {
                         flexDirection: "column",
                       }}
                     >
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          提示：拖拽图片/视频到这个框内即可添加附件
+                        </Typography.Text>
+                        <Space size={8} wrap>
+                          {files.length > 0 && <Tag color="purple">已选媒体 {files.length} 个</Tag>}
+                          <Button size="small" onClick={() => filePickRef.current?.click()}>
+                            选择媒体
+                          </Button>
+                        </Space>
+                      </div>
+
                       <Input.TextArea
                         value={text}
                         onChange={(e) => setText(e.target.value)}
@@ -861,17 +873,35 @@ export default function TasksPage() {
                         autoSize={{ minRows: 5, maxRows: 8 }}
                       />
 
-                      <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                          提示：拖拽图片/视频到这个框内即可添加附件
-                        </Typography.Text>
-                        {files.length > 0 && <Tag color="purple">已选媒体 {files.length} 个</Tag>}
-                      </div>
-
                       {files.length > 0 && (
                         <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
                           {previews.map((p, idx) => (
-                            <div key={p.key} style={{ width: 140, border: "1px solid #eee", borderRadius: 8, padding: 8, background: "#fff" }}>
+                            <div
+                              key={p.key}
+                              style={{
+                                width: 140,
+                                border: "1px solid #eee",
+                                borderRadius: 8,
+                                padding: 8,
+                                background: "#fff",
+                                position: "relative",
+                              }}
+                            >
+                              <Button
+                                size="small"
+                                danger
+                                icon={<CloseOutlined />}
+                                onClick={() => setFiles(prev => prev.filter((_, i) => i !== idx))}
+                                style={{
+                                  position: "absolute",
+                                  top: 4,
+                                  right: 4,
+                                  minWidth: 22,
+                                  height: 22,
+                                  paddingInline: 0,
+                                  borderRadius: "50%",
+                                }}
+                              />
                               {p.isImg ? (
                                 <img src={p.url} style={{ width: "100%", height: 80, objectFit: "cover", borderRadius: 6 }} />
                               ) : (
@@ -883,14 +913,6 @@ export default function TasksPage() {
                                 {p.file.name}
                               </div>
                               <div style={{ fontSize: 12, color: "#888" }}>{humanSize(p.file.size)}</div>
-                              <Button
-                                size="small"
-                                style={{ marginTop: 6 }}
-                                danger
-                                onClick={() => setFiles(prev => prev.filter((_, i) => i !== idx))}
-                              >
-                                移除
-                              </Button>
                             </div>
                           ))}
                         </div>
@@ -943,21 +965,8 @@ export default function TasksPage() {
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                         <Typography.Text style={{ fontWeight: 600 }}>媒体操作</Typography.Text>
                         <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
-                          <Button
-                            block
-                            onClick={() => filePickRef.current?.click()}
-                            style={{ height: 40 }}
-                          >
+                          <Button block onClick={() => filePickRef.current?.click()} style={{ height: 40 }}>
                             选择媒体
-                          </Button>
-                          <Button
-                            block
-                            onClick={() => setFiles([])}
-                            disabled={!files.length}
-                            danger
-                            style={{ height: 40 }}
-                          >
-                            清空附件
                           </Button>
                         </div>
                       </div>
