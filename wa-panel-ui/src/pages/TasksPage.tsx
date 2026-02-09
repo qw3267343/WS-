@@ -964,6 +964,7 @@ export default function TasksPage() {
                     );
                   })}
                   <div ref={hisBottomRef} />
+
                 </div>
               </Card>
 
@@ -1188,6 +1189,7 @@ export default function TasksPage() {
                               setText("");
                               setFiles([]);
                             }
+
                             ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
                             return;
                           } else {
