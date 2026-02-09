@@ -29,10 +29,10 @@ type HisItem = {
   ts: number;
   lastTs?: number;
 
-  kind: "single" | "batch";
+  kind: "single" | "batch" | "scheduled";
 
   roleRemark: string;
-  roleName: string;
+  roleName?: string;
   slot?: string;
 
   mode: "enabled_groups" | "single_group" | "single_contact";
@@ -44,7 +44,7 @@ type HisItem = {
   text: string;
 
   // ✅ 最终状态：OK(true)/NO(false)
-  ok: boolean;
+  ok?: boolean;
 
   // ✅ 批次发送中
   running?: boolean;
@@ -58,6 +58,12 @@ type HisItem = {
   lastErr?: string;
 
   media?: { name: string; type: string; size: number }[];
+
+  // ✅ 定时任务
+  jobId?: string;
+  status?: "WAITING" | "RUNNING" | "DONE" | "CANCELED";
+  runAt?: number;
+  createdAt?: number;
 };
 
 type ScheduledJob = {
@@ -67,7 +73,8 @@ type ScheduledJob = {
   mode: "enabled_groups" | "single_group" | "single_contact";
   targets: string[];
   text: string;
-  status: "pending" | "running" | "done" | "cancelled";
+  status: "pending" | "running" | "done" | "cancelled" | "failed";
+  roleName?: string;
   createdAt?: number;
   startedAt?: number;
   finishedAt?: number;
@@ -361,13 +368,23 @@ export default function TasksPage() {
   }, [history.length]);
 
   useEffect(() => {
+    const timer = setInterval(() => setNowTs(Date.now()), 500);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     let alive = true;
     const refresh = async () => {
       try {
-        const r = await http.get("/api/schedules");
+        const [activeResp, historyResp] = await Promise.all([
+          http.get("/api/schedules"),
+          http.get("/api/schedules/history")
+        ]);
         if (!alive) return;
-        const list = (r.data?.data || []) as ScheduledJob[];
-        setScheduledJobs(list);
+        const active = (activeResp.data?.data || []) as ScheduledJob[];
+        const historyList = (historyResp.data?.data || []) as ScheduledJob[];
+        setScheduledJobs(active);
+        syncScheduledHistory(active, historyList);
       } catch {
         if (!alive) return;
         setScheduledJobs([]);
@@ -376,7 +393,6 @@ export default function TasksPage() {
 
     void refresh();
     const timer = setInterval(() => {
-      setNowTs(Date.now());
       void refresh();
     }, 2000);
 
@@ -409,8 +425,70 @@ export default function TasksPage() {
     });
   }
 
+  function syncScheduledHistory(active: ScheduledJob[], historyList: ScheduledJob[]) {
+    setHistory(prev => {
+      let changed = false;
+      const next = prev.map(item => {
+        if (item.kind !== "scheduled" || !item.jobId) return item;
+
+        const activeJob = active.find(job => job.id === item.jobId);
+        if (activeJob) {
+          const status = activeJob.status === "running" ? "RUNNING" : "WAITING";
+          const updated: HisItem = {
+            ...item,
+            status,
+            roleName: item.roleName || activeJob.roleName,
+            runAt: activeJob.runAt ?? item.runAt,
+            total: item.total ?? activeJob.targets?.length ?? item.total,
+            lastTs: status === "RUNNING" ? Date.now() : item.lastTs
+          };
+          if (updated.status !== item.status || updated.runAt !== item.runAt) changed = true;
+          return updated;
+        }
+
+        const archivedJob = historyList.find(job => job.id === item.jobId);
+        if (archivedJob) {
+          const doneStatus = archivedJob.status === "cancelled" ? "CANCELED" : "DONE";
+          const ok = archivedJob.status === "done";
+          const okCount = archivedJob.result?.okCount ?? item.okCount ?? 0;
+          const total = archivedJob.result?.total ?? item.total ?? 0;
+          const updated: HisItem = {
+            ...item,
+            status: doneStatus,
+            ok,
+            okCount,
+            total,
+            roleName: item.roleName || archivedJob.roleName,
+            lastErr: archivedJob.result?.lastErr ?? item.lastErr,
+            lastTs: archivedJob.finishedAt ?? item.lastTs
+          };
+          if (
+            updated.status !== item.status ||
+            updated.ok !== item.ok ||
+            updated.okCount !== item.okCount ||
+            updated.total !== item.total ||
+            updated.lastErr !== item.lastErr
+          ) {
+            changed = true;
+          }
+          return updated;
+        }
+
+        return item;
+      });
+
+      if (!changed) return prev;
+      saveHis(next);
+      return next;
+    });
+  }
+
   function newId() {
     return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+
+  function getRoleNameForHistory(role?: Role | null) {
+    return role?.name ?? role?.id ?? "未知角色";
   }
 
   function startBatchHistory(batchId: string, total: number) {
@@ -424,7 +502,7 @@ export default function TasksPage() {
       lastTs: Date.now(),
       kind: "batch",
       roleRemark: activeRole.remark,
-      roleName: activeRole.name || "未知",
+      roleName: getRoleNameForHistory(activeRole),
       slot: activeRole.boundSlot,
       mode: "enabled_groups",
       text,
@@ -531,7 +609,7 @@ export default function TasksPage() {
         lastTs: Date.now(),
         kind: "single",
         roleRemark: activeRole.remark,
-        roleName: activeRole.name || "未知",
+        roleName: getRoleNameForHistory(activeRole),
         slot,
         mode,
         to,
@@ -566,7 +644,7 @@ export default function TasksPage() {
         lastTs: Date.now(),
         kind: "single",
         roleRemark: activeRole.remark,
-        roleName: activeRole.name || "未知",
+        roleName: getRoleNameForHistory(activeRole),
         slot,
         mode,
         to,
@@ -786,6 +864,18 @@ export default function TasksPage() {
     return `${pad(m)}:${pad(s)}`;
   }
 
+  function getScheduledStatus(h: HisItem) {
+    const status = h.status || "WAITING";
+    if (status === "WAITING") return { text: "等待执行", color: "red" };
+    if (status === "RUNNING") return { text: "发送中", color: "blue" };
+    if (status === "CANCELED") return { text: "已取消", color: "default" };
+    if (status === "DONE") {
+      if (h.ok) return { text: "OK", color: "green" };
+      return { text: "NO", color: "red" };
+    }
+    return { text: "等待执行", color: "red" };
+  }
+
   async function createScheduledJob() {
     if (!activeRole) return message.error("请先选择一个角色");
     if (!activeRole.boundSlot) return message.error("该角色未绑定账号，请先绑定账号");
@@ -807,6 +897,7 @@ export default function TasksPage() {
     fd.append("minutes", String(minutes));
     fd.append("targets", JSON.stringify(targets));
     fd.append("text", text || "");
+    fd.append("roleName", getRoleNameForHistory(activeRole));
     files.forEach(f => fd.append("files", f, f.name));
 
     try {
@@ -821,6 +912,26 @@ export default function TasksPage() {
         setScheduledJobs(prev => {
           const rest = prev.filter(x => x.id !== created.id);
           return [created, ...rest];
+        });
+
+        const textPreview = text ? text : (files.length ? `（仅媒体 ${files.length} 个）` : "");
+        pushHistory({
+          id: newId(),
+          ts: Date.now(),
+          lastTs: Date.now(),
+          kind: "scheduled",
+          roleRemark: activeRole.remark,
+          roleName: getRoleNameForHistory(activeRole),
+          slot: activeRole.boundSlot,
+          mode,
+          text: textPreview,
+          ok: false,
+          total: targets.length,
+          okCount: 0,
+          jobId: created.id,
+          status: "WAITING",
+          runAt: created.runAt,
+          createdAt: created.createdAt || Date.now()
         });
       } else {
         // 如果后端没返回 job（或没 id），就拉一次全量保证可见
@@ -868,10 +979,34 @@ export default function TasksPage() {
       await http.post(`/api/schedules/${job.id}/cancel`);
       const r = await http.get("/api/schedules");
       setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
+      patchScheduledHistoryStatus(job.id, "CANCELED");
       message.success("已取消定时任务");
     } catch (e: any) {
       message.error(`取消失败：${e?.response?.data?.error || e.message}`);
     }
+  }
+
+  async function cancelScheduledHistory(jobId: string) {
+    try {
+      await http.post(`/api/schedules/${jobId}/cancel`);
+      const r = await http.get("/api/schedules");
+      setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
+      patchScheduledHistoryStatus(jobId, "CANCELED");
+      message.success("已取消定时任务");
+    } catch (e: any) {
+      message.error(`取消失败：${e?.response?.data?.error || e.message}`);
+    }
+  }
+
+  function patchScheduledHistoryStatus(jobId: string, status: "WAITING" | "RUNNING" | "DONE" | "CANCELED") {
+    setHistory(prev => {
+      const next = prev.map(item => {
+        if (item.kind !== "scheduled" || item.jobId !== jobId) return item;
+        return { ...item, status, lastTs: Date.now() };
+      });
+      saveHis(next);
+      return next;
+    });
   }
 
   // 绑定弹窗 options（来自 accounts）
@@ -1145,12 +1280,20 @@ export default function TasksPage() {
               >
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   {history.map((h) => {
-                    const st =
-                      h.running ? { text: "发送中", color: "blue" } :
-                        h.ok ? { text: "OK", color: "green" } :
-                          { text: "NO", color: "red" };
+                    const isScheduled = h.kind === "scheduled";
+                    const st = isScheduled
+                      ? getScheduledStatus(h)
+                      : h.running
+                        ? { text: "发送中", color: "blue" }
+                        : h.ok
+                          ? { text: "OK", color: "green" }
+                          : { text: "NO", color: "red" };
 
                     const timeText = fmtTime(h.lastTs || h.ts);
+                    const roleLabel = h.roleName || "未知角色";
+                    const total = h.total || 0;
+                    const okCount = h.okCount || 0;
+                    const countdown = h.runAt ? formatCountdown(h.runAt - nowTs) : "--:--";
 
                     return (
                       <div key={h.id} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
@@ -1163,15 +1306,28 @@ export default function TasksPage() {
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                             <div style={{ fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              备注：{h.roleRemark}
-                              {h.kind === "batch" && (
+                              发送角色：{roleLabel}
+                              {(h.kind === "batch" || isScheduled) && (
                                 <span style={{ marginLeft: 8, fontWeight: 500, color: "#666" }}>
-                                  {h.okCount || 0}/{h.total || 0}{h.failCount ? `（失败${h.failCount}）` : ""}
+                                  {okCount}/{total}{h.failCount ? `（失败${h.failCount}）` : ""}
                                 </span>
                               )}
                             </div>
                             <div style={{ fontSize: 12, color: "#999", flex: "0 0 auto" }}>{timeText}</div>
                           </div>
+
+                          {isScheduled && h.status === "WAITING" && (
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6, gap: 12 }}>
+                              <div style={{ fontSize: 12, color: "#666" }}>
+                                倒计时：{countdown}
+                              </div>
+                              {h.jobId && (
+                                <Button size="small" type="link" danger onClick={() => void cancelScheduledHistory(h.jobId!)}>
+                                  取消任务
+                                </Button>
+                              )}
+                            </div>
+                          )}
 
                           <div
                             style={{
@@ -1181,7 +1337,15 @@ export default function TasksPage() {
                               borderRadius: 12,
                               padding: "10px 12px",
                               whiteSpace: "pre-wrap",
-                              wordBreak: "break-word"
+                              wordBreak: "break-word",
+                              ...(isScheduled
+                                ? {
+                                    display: "-webkit-box",
+                                    WebkitLineClamp: 3,
+                                    WebkitBoxOrient: "vertical",
+                                    overflow: "hidden"
+                                  }
+                                : {})
                             }}
                           >
                             {h.text ? h.text : (h.media?.length ? `（仅媒体 ${h.media.length} 个）` : "")}
@@ -1193,7 +1357,13 @@ export default function TasksPage() {
                             </div>
                           )}
 
-                          {!h.ok && !h.running && h.lastErr && (
+                          {!isScheduled && !h.ok && !h.running && h.lastErr && (
+                            <div style={{ marginTop: 6, fontSize: 12, color: "#999" }}>
+                              失败原因：{h.lastErr}
+                            </div>
+                          )}
+
+                          {isScheduled && h.status === "DONE" && !h.ok && h.lastErr && (
                             <div style={{ marginTop: 6, fontSize: 12, color: "#999" }}>
                               失败原因：{h.lastErr}
                             </div>
@@ -1365,130 +1535,123 @@ export default function TasksPage() {
                   </div>
                 </Col>
 
-                <Col span={8} style={{ display: "flex", flexDirection: "column" }}>
-
+                <Col span={8} style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
                   <Card
                     size="small"
                     style={{
                       width: "100%",
-                      height: inputAreaH,
                       display: "flex",
                       flexDirection: "column",
-                      marginTop: "auto",
                       overflow: "hidden"
                     }}
                     bodyStyle={{
                       padding: 16,
-                      flex: 1,
-                      overflow: "hidden",
-                      minHeight: 0,
                       display: "flex",
-                      flexDirection: "column"
+                      flexDirection: "column",
+                      gap: 12
                     }}
                   >
-                    <div style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0, flex: 1 }}>
-                      <Typography.Text style={{ fontWeight: 600 }}>
-                        当前角色：{activeRole?.remark || "-"}
-                      </Typography.Text>
+                    <Typography.Text style={{ fontWeight: 600 }}>
+                      当前角色：{activeRole?.remark || "-"}
+                    </Typography.Text>
 
-                      <Button
-                        type="primary"
-                        block
-                        size="middle"
-                        disabled={!canSend}
-                        onClick={() => void doSendNow()}
-                        style={{ height: 40, fontSize: 14 }}
-                      >
-                        立即发送
-                      </Button>
+                    <Button
+                      type="primary"
+                      block
+                      size="middle"
+                      disabled={!canSend}
+                      onClick={() => void doSendNow()}
+                      style={{ height: 40, fontSize: 14 }}
+                    >
+                      立即发送
+                    </Button>
 
-                      <Row gutter={8}>
-                        <Col span={12}>
-                          <Button
-                            block
-                            size="small"
-                            onClick={() => filePickRef.current?.click()}
-                            style={{ height: 32 }}
-                          >
-                            选择媒体
-                          </Button>
-                        </Col>
-                        <Col span={12}>
-                          <Button
-                            block
-                            size="small"
-                            disabled={!canSend}
-                            onClick={() => setScheduleOpen(true)}
-                            style={{ height: 32 }}
-                          >
-                            定时发送
-                          </Button>
-                        </Col>
-                      </Row>
+                    <Row gutter={8}>
+                      <Col span={12}>
+                        <Button
+                          block
+                          size="small"
+                          onClick={() => filePickRef.current?.click()}
+                          style={{ height: 32 }}
+                        >
+                          选择媒体
+                        </Button>
+                      </Col>
+                      <Col span={12}>
+                        <Button
+                          block
+                          size="small"
+                          disabled={!canSend}
+                          onClick={() => setScheduleOpen(true)}
+                          style={{ height: 32 }}
+                        >
+                          定时发送
+                        </Button>
+                      </Col>
+                    </Row>
 
-                      <Card
-                        size="small"
-                        title="定时任务"
-                        style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}
-                        bodyStyle={{ padding: 10, flex: 1, overflowY: "auto", minHeight: 0 }}
-                      >
-                        {activeScheduledJobs.length === 0 ? (
-                          <div style={{ fontSize: 12, color: "#999" }}>暂无待执行任务</div>
-                        ) : (
-                          <Space direction="vertical" style={{ width: "100%" }} size={8}>
-                            {activeScheduledJobs.map((job) => {
-                              const remainMs = job.runAt - nowTs;
-                              const remainText = formatCountdown(remainMs);
-                              const targetText = job.mode === "enabled_groups" ? "启用群" : (job.targets?.[0] || "-");
-                              const hintText =
-                                job.status === "running"
-                                  ? `执行中 / 目标：${targetText}`
-                                  : `${Math.max(1, Math.ceil(remainMs / 60000))}分钟后发送 / 目标：${targetText}`;
-                              return (
-                                <div key={job.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                                  <Tag color={job.status === "running" ? "blue" : "green"} style={{ marginRight: 0 }}>
-                                    OK
-                                  </Tag>
-                                  <div style={{ width: 50, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
-                                    {remainText}
-                                  </div>
-                                  <div style={{ flex: 1, fontSize: 12, color: "#555" }}>{hintText}</div>
-                                  <Button size="small" danger onClick={() => cancelScheduledJob(job)}>
-                                    取消
-                                  </Button>
-                                </div>
-                              );
-                            })}
-                          </Space>
-                        )}
-                      </Card>
-
-                      {mode === "enabled_groups" && enabledGroups.length > 0 && (
-                        <div style={{ marginTop: 4, textAlign: "center" }}>
-                          <Typography.Text type="secondary">
-                            进度: {Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}
-                          </Typography.Text>
-                          <div style={{ marginTop: 4 }}>
-                            <div style={{
-                              width: "100%",
-                              height: 6,
-                              backgroundColor: "#f0f0f0",
-                              borderRadius: 3,
-                              overflow: "hidden"
-                            }}>
-                              <div
-                                style={{
-                                  width: `${(runIdx / enabledGroups.length) * 100}%`,
-                                  height: "100%",
-                                  backgroundColor: "#1890ff",
-                                  transition: "width 0.3s"
-                                }}
-                              />
-                            </div>
+                    {mode === "enabled_groups" && enabledGroups.length > 0 && (
+                      <div style={{ marginTop: 4, textAlign: "center" }}>
+                        <Typography.Text type="secondary">
+                          进度: {Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}
+                        </Typography.Text>
+                        <div style={{ marginTop: 4 }}>
+                          <div style={{
+                            width: "100%",
+                            height: 6,
+                            backgroundColor: "#f0f0f0",
+                            borderRadius: 3,
+                            overflow: "hidden"
+                          }}>
+                            <div
+                              style={{
+                                width: `${(runIdx / enabledGroups.length) * 100}%`,
+                                height: "100%",
+                                backgroundColor: "#1890ff",
+                                transition: "width 0.3s"
+                              }}
+                            />
                           </div>
                         </div>
-                      )}
-                    </div>
+                      </div>
+                    )}
+                  </Card>
+
+                  <Card
+                    size="small"
+                    title="定时任务"
+                    style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", marginTop: 12, overflow: "hidden" }}
+                    bodyStyle={{ padding: 10, flex: 1, overflowY: "auto", minHeight: 0 }}
+                  >
+                    {activeScheduledJobs.length === 0 ? (
+                      <div style={{ fontSize: 12, color: "#999" }}>暂无待执行任务</div>
+                    ) : (
+                      <Space direction="vertical" style={{ width: "100%" }} size={8}>
+                        {activeScheduledJobs.map((job) => {
+                          const remainMs = job.runAt - nowTs;
+                          const remainText = formatCountdown(remainMs);
+                          const targetText = job.mode === "enabled_groups" ? "启用群" : (job.targets?.[0] || "-");
+                          const hintText =
+                            job.status === "running"
+                              ? `执行中 / 目标：${targetText}`
+                              : `${Math.max(1, Math.ceil(remainMs / 60000))}分钟后发送 / 目标：${targetText}`;
+                          return (
+                            <div key={job.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                              <Tag color={job.status === "running" ? "blue" : "green"} style={{ marginRight: 0 }}>
+                                OK
+                              </Tag>
+                              <div style={{ width: 50, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                                {remainText}
+                              </div>
+                              <div style={{ flex: 1, fontSize: 12, color: "#555" }}>{hintText}</div>
+                              <Button size="small" danger onClick={() => cancelScheduledJob(job)}>
+                                取消
+                              </Button>
+                            </div>
+                          );
+                        })}
+                      </Space>
+                    )}
                   </Card>
                 </Col>
               </Row>

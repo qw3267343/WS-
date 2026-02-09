@@ -890,11 +890,18 @@ app.get('/api/schedules', (req, res) => {
   res.json({ ok: true, data: active });
 });
 
+app.get('/api/schedules/history', (req, res) => {
+  const ws = getWs(req);
+  const list = loadScheduledHistory(ws);
+  res.json({ ok: true, data: list });
+});
+
 app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.body?.slot);
   const mode = String(req.body?.mode || '').trim();
   const text = String(req.body?.text || '');
+  const roleName = String(req.body?.roleName || '').trim();
   const minutes = Number(req.body?.minutes || 0);
   const targetsRaw = req.body?.targets;
 
@@ -947,6 +954,7 @@ app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
     mode,
     targets,
     text,
+    roleName,
     attachments,
     status: 'pending',
     createdAt: Date.now(),
@@ -967,6 +975,7 @@ app.post('/api/schedules/:id/cancel', (req, res) => {
   cleanupScheduledUploads(ws, id);
 
   if (!removed) return res.status(404).json({ ok: false, error: 'not found' });
+  archiveScheduledJob(ws, { ...removed, status: 'cancelled', finishedAt: Date.now() });
   res.json({ ok: true });
 });
 
