@@ -843,6 +843,7 @@ export default function TasksPage() {
                         height: INPUT_AREA_H,
                         display: "flex",
                         flexDirection: "column",
+                        overflow: "hidden",
                       }}
                     >
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -851,9 +852,6 @@ export default function TasksPage() {
                         </Typography.Text>
                         <Space size={8} wrap>
                           {files.length > 0 && <Tag color="purple">已选媒体 {files.length} 个</Tag>}
-                          <Button size="small" onClick={() => filePickRef.current?.click()}>
-                            选择媒体
-                          </Button>
                         </Space>
                       </div>
 
@@ -869,22 +867,39 @@ export default function TasksPage() {
                           padding: "12px",
                           lineHeight: 1.5,
                           height: "auto",
+                          flex: 1,
+                          minHeight: 0,
+                          overflow: "auto",
                         }}
-                        autoSize={{ minRows: 5, maxRows: 8 }}
                       />
 
                       {files.length > 0 && (
-                        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                        <div
+                          style={{
+                            marginTop: 10,
+                            paddingTop: 10,
+                            borderTop: "1px dashed #eee",
+                            display: "flex",
+                            gap: 8,
+                            overflowX: "auto",
+                            overflowY: "hidden",
+                            whiteSpace: "nowrap",
+                            flex: "0 0 auto",
+                            scrollbarWidth: "thin",
+                          }}
+                        >
                           {previews.map((p, idx) => (
                             <div
                               key={p.key}
                               style={{
-                                width: 140,
+                                flex: "0 0 auto",
+                                width: 96,
                                 border: "1px solid #eee",
-                                borderRadius: 8,
+                                borderRadius: 10,
                                 padding: 8,
                                 background: "#fff",
                                 position: "relative",
+                                boxShadow: "0 1px 4px rgba(0, 0, 0, 0.06)",
                               }}
                             >
                               <Button
@@ -903,9 +918,9 @@ export default function TasksPage() {
                                 }}
                               />
                               {p.isImg ? (
-                                <img src={p.url} style={{ width: "100%", height: 80, objectFit: "cover", borderRadius: 6 }} />
+                                <img src={p.url} style={{ width: "100%", height: 64, objectFit: "cover", borderRadius: 8 }} />
                               ) : (
-                                <div style={{ height: 80, display: "flex", alignItems: "center", justifyContent: "center", background: "#fafafa", borderRadius: 6 }}>
+                                <div style={{ height: 64, display: "flex", alignItems: "center", justifyContent: "center", background: "#fafafa", borderRadius: 8 }}>
                                   <span style={{ color: "#666" }}>VIDEO</span>
                                 </div>
                               )}
@@ -936,99 +951,82 @@ export default function TasksPage() {
                   >
                     <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%" }}>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        <Typography.Text style={{ fontWeight: 600 }}>当前角色</Typography.Text>
-
-                        <Tag
-                          color={activeRole?.boundSlot ? "blue" : "default"}
-                          style={{
-                            fontSize: 14,
-                            padding: "8px 16px",
-                            lineHeight: "20px",
-                            width: "100%",
-                            textAlign: "center"
-                          }}
-                        >
-                          {activeRole ? `${activeRole.remark} - ${activeRole.name || "未知"}` : "未选择"}
-                        </Tag>
-                        {activeRole?.boundSlot && (
-                          <Tag
-                            color={getAccText(activeRole.boundSlot).color as any}
-                            style={{ width: "100%", textAlign: "center" }}
-                          >
-                            {getAccText(activeRole.boundSlot).text}
-                          </Tag>
-                        )}
-                      </div>
-
-                      <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 4 }} />
-
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        <Typography.Text style={{ fontWeight: 600 }}>媒体操作</Typography.Text>
-                        <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
-                          <Button block onClick={() => filePickRef.current?.click()} style={{ height: 40 }}>
-                            选择媒体
-                          </Button>
+                        <Typography.Text style={{ fontWeight: 600 }}>当前角色：</Typography.Text>
+                        <div style={{ border: "1px solid #f0f0f0", borderRadius: 8, padding: 12, background: "#fafafa" }}>
+                          <div style={{ fontWeight: 600, fontSize: 14 }}>
+                            {activeRole ? `${activeRole.remark} - ${activeRole.name || "未知"}` : "未选择"}
+                          </div>
+                          {activeRole?.boundSlot ? (
+                            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                              <Tag color={getAccText(activeRole.boundSlot).color as any}>
+                                {getAccText(activeRole.boundSlot).text}
+                              </Tag>
+                            </div>
+                          ) : (
+                            <div style={{ marginTop: 6, color: "#999" }}>未绑定账号</div>
+                          )}
                         </div>
                       </div>
 
-                      <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 4 }} />
+                      <div style={{ borderTop: "1px solid #f0f0f0" }} />
 
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        <Typography.Text style={{ fontWeight: 600 }}>发送控制</Typography.Text>
+                      <Button block onClick={() => filePickRef.current?.click()} style={{ height: 40 }}>
+                        选择媒体
+                      </Button>
 
-                        <Button
-                          type="primary"
-                          block
-                          disabled={!canSend}
-                          onClick={async () => {
-                            if (!activeRole) return message.error("请先选择一个角色");
-                            const hasContent = (text && text.trim().length > 0) || files.length > 0;
-                            if (!hasContent) return message.error("内容或附件至少要有一个");
+                      <div style={{ borderTop: "1px solid #f0f0f0" }} />
 
-                            if (mode === "enabled_groups") {
-                              if (!enabledGroups.length) return message.error("没有启用的群");
-                              if (runIdx >= enabledGroups.length) return message.error("已发送完所有启用群（可切换任务类型或刷新群）");
-                              const to = enabledGroups[runIdx].id;
-                              const ok = await sendOne(to);
-                              setRunIdx(i => i + 1);
-                              ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
-                            } else {
-                              const ok = await sendOne(singleTo.trim());
-                              ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
-                            }
-                          }}
-                          style={{ height: 50, fontSize: 16 }}
-                        >
-                          立即发送
-                        </Button>
+                      <Button
+                        type="primary"
+                        block
+                        disabled={!canSend}
+                        onClick={async () => {
+                          if (!activeRole) return message.error("请先选择一个角色");
+                          const hasContent = (text && text.trim().length > 0) || files.length > 0;
+                          if (!hasContent) return message.error("内容或附件至少要有一个");
 
-                        {mode === "enabled_groups" && enabledGroups.length > 0 && (
-                          <div style={{ marginTop: 12, textAlign: "center" }}>
-                            <Typography.Text type="secondary">
-                              进度: {Math.min(runIdx + 1, enabledGroups.length)}/{enabledGroups.length}
-                            </Typography.Text>
-                            <div style={{ marginTop: 4 }}>
-                              <div style={{
-                                width: "100%",
-                                height: 6,
-                                backgroundColor: "#f0f0f0",
-                                borderRadius: 3,
-                                overflow: "hidden"
-                              }}>
-                                <div
-                                  style={{
-                                    width: `${(runIdx / enabledGroups.length) * 100}%`,
-                                    height: "100%",
-                                    backgroundColor: "#1890ff",
-                                    transition: "width 0.3s"
-                                  }}
-                                />
-                              </div>
+                          if (mode === "enabled_groups") {
+                            if (!enabledGroups.length) return message.error("没有启用的群");
+                            if (runIdx >= enabledGroups.length) return message.error("已发送完所有启用群（可切换任务类型或刷新群）");
+                            const to = enabledGroups[runIdx].id;
+                            const ok = await sendOne(to);
+                            setRunIdx(i => i + 1);
+                            ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+                          } else {
+                            const ok = await sendOne(singleTo.trim());
+                            ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+                          }
+                        }}
+                        style={{ height: 50, fontSize: 16 }}
+                      >
+                        立即发送
+                      </Button>
 
+                      {mode === "enabled_groups" && enabledGroups.length > 0 && (
+                        <div style={{ marginTop: 12, textAlign: "center" }}>
+                          <Typography.Text type="secondary">
+                            进度: {Math.min(runIdx + 1, enabledGroups.length)}/{enabledGroups.length}
+                          </Typography.Text>
+                          <div style={{ marginTop: 4 }}>
+                            <div style={{
+                              width: "100%",
+                              height: 6,
+                              backgroundColor: "#f0f0f0",
+                              borderRadius: 3,
+                              overflow: "hidden"
+                            }}>
+                              <div
+                                style={{
+                                  width: `${(runIdx / enabledGroups.length) * 100}%`,
+                                  height: "100%",
+                                  backgroundColor: "#1890ff",
+                                  transition: "width 0.3s"
+                                }}
+                              />
                             </div>
                           </div>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   </Card>
                 </Col>
