@@ -806,36 +806,38 @@ export default function TasksPage() {
     fd.append("mode", mode);
     fd.append("minutes", String(minutes));
     fd.append("targets", JSON.stringify(targets));
-    fd.append("text", text);
-    files.forEach((f) => fd.append("files", f, f.name));
+    fd.append("text", text || "");
+    files.forEach(f => fd.append("files", f, f.name));
 
-  try {
-    // 1) 创建（后端应返回创建后的 job）
-    const resp = await http.post("/api/schedules", fd);
-    const created = (resp.data?.data || resp.data?.job || job) as ScheduledJob;
+    try {
+      // 1) 创建（后端应返回创建后的 job）
+      const resp = await http.post("/api/schedules", fd);
 
-    // 2) 立刻插入本地列表（避免必须刷新才看到）
-    if (created) {
-      setScheduledJobs(prev => {
-        const rest = prev.filter(x => x.id !== created.id);
-        return [created, ...rest];
-      });
+      // 只从 resp 里取，别再引用未定义的 job 变量
+      const created = (resp.data?.data || resp.data?.job || null) as ScheduledJob | null;
+
+      // 2) 立刻插入本地列表（避免必须刷新才看到）
+      if (created?.id) {
+        setScheduledJobs(prev => {
+          const rest = prev.filter(x => x.id !== created.id);
+          return [created, ...rest];
+        });
+      } else {
+        // 如果后端没返回 job（或没 id），就拉一次全量保证可见
+        const r = await http.get("/api/schedules");
+        setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
+      }
+
+      // 3) 关闭弹窗 & 清空输入
+      setScheduleOpen(false);
+      setText("");
+      setFiles([]);
+
+      message.success(`已安排：${minutes}分钟后发送`);
+    } catch (e: any) {
+      message.error(`定时任务创建失败：${e?.response?.data?.error || e.message}`);
     }
-
-    // 3) 关闭弹窗 & 清空输入
-    setScheduleOpen(false);
-    setText("");
-    setFiles([]);
-
-    // 4) 可选：再拉一次全量，保证与后端一致（如果你后端会补字段/排序）
-    // const r = await http.get("/api/schedules");
-    // setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
-
-    message.success(`已安排：${minutes}分钟后发送`);
-  } catch (e: any) {
-    message.error(`定时任务创建失败：${e?.response?.data?.error || e.message}`);
   }
-
 
   async function doSendNow() {
     if (!activeRole) return message.error("请先选择一个角色");
