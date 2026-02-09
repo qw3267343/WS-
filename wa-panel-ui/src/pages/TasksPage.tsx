@@ -1139,6 +1139,8 @@ export default function TasksPage() {
 
     setScheduledJobs(prev => [job, ...prev]);
     setScheduleOpen(false);
+    setText("");
+    setFiles([]);
     message.success(`已安排：${minutes}分钟后发送`);
   }
 
@@ -1662,7 +1664,7 @@ export default function TasksPage() {
                   </div>
                 </Col>
 
-                <Col span={8} style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
+                <Col span={8} style={{ display: "flex", flexDirection: "column" }}>
 
                   <Card
                     size="small"
@@ -1671,28 +1673,63 @@ export default function TasksPage() {
                       height: inputAreaH,
                       display: "flex",
                       flexDirection: "column",
-                      marginTop: "auto"
+                      marginTop: "auto",
+                      overflow: "hidden"
                     }}
-                    bodyStyle={{ padding: 16, flex: 1, overflowY: "auto", minHeight: 0 }}
+                    bodyStyle={{
+                      padding: 16,
+                      flex: 1,
+                      overflow: "hidden",
+                      minHeight: 0,
+                      display: "flex",
+                      flexDirection: "column"
+                    }}
                   >
-                    <div style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                        <Typography.Text style={{ fontWeight: 600 }}>
-                          当前角色：{activeRole ? activeRole.remark : "未选择"}
-                        </Typography.Text>
-                        {!activeRole?.boundSlot && (
-                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                            未绑定账号
-                          </Typography.Text>
-                        )}
-                      </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0, flex: 1 }}>
+                      <Typography.Text style={{ fontWeight: 600 }}>
+                        当前角色：{activeRole?.remark || "-"}
+                      </Typography.Text>
 
-                      <div style={{ borderTop: "1px solid #f0f0f0" }} />
+                      <Button
+                        type="primary"
+                        block
+                        size="middle"
+                        disabled={!canSend}
+                        onClick={() => void doSendNow()}
+                        style={{ height: 40, fontSize: 14 }}
+                      >
+                        立即发送
+                      </Button>
+
+                      <Row gutter={8}>
+                        <Col span={12}>
+                          <Button
+                            block
+                            size="small"
+                            onClick={() => filePickRef.current?.click()}
+                            style={{ height: 32 }}
+                          >
+                            选择媒体
+                          </Button>
+                        </Col>
+                        <Col span={12}>
+                          <Button
+                            block
+                            size="small"
+                            disabled={!canSend}
+                            onClick={() => setScheduleOpen(true)}
+                            style={{ height: 32 }}
+                          >
+                            定时发送
+                          </Button>
+                        </Col>
+                      </Row>
 
                       <Card
                         size="small"
                         title="定时任务"
-                        bodyStyle={{ padding: 10 }}
+                        style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}
+                        bodyStyle={{ padding: 10, flex: 1, overflowY: "auto", minHeight: 0 }}
                       >
                         {activeScheduledJobs.length === 0 ? (
                           <div style={{ fontSize: 12, color: "#999" }}>暂无待执行任务</div>
@@ -1725,45 +1762,8 @@ export default function TasksPage() {
                         )}
                       </Card>
 
-                      <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
-                        <Button
-                          type="primary"
-                          block
-                          size="middle"
-                          disabled={!canSend}
-                          onClick={() => void doSendNow()}
-                          style={{ height: 40, fontSize: 14 }}
-                        >
-                          立即发送
-                        </Button>
-
-                        <Row gutter={8}>
-                          <Col span={12}>
-                            <Button
-                              block
-                              size="small"
-                              disabled={!canSend}
-                              onClick={() => setScheduleOpen(true)}
-                              style={{ height: 34 }}
-                            >
-                              定时发送
-                            </Button>
-                          </Col>
-                          <Col span={12}>
-                            <Button
-                              block
-                              size="small"
-                              onClick={() => filePickRef.current?.click()}
-                              style={{ height: 34 }}
-                            >
-                              选择媒体
-                            </Button>
-                          </Col>
-                        </Row>
-                      </div>
-
                       {mode === "enabled_groups" && enabledGroups.length > 0 && (
-                        <div style={{ marginTop: 12, textAlign: "center" }}>
+                        <div style={{ marginTop: 4, textAlign: "center" }}>
                           <Typography.Text type="secondary">
                             进度: {Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}
                           </Typography.Text>
