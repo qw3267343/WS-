@@ -906,9 +906,18 @@ export default function TasksPage() {
                       size="small"
                       title="当前角色"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
+
+                      bodyStyle={{
+                        padding: 16,
+                        flex: 1,
+                        overflow: "hidden",
+                        display: "flex",
+                        alignItems: "stretch",
+                        justifyContent: "flex-start"
+                      }}
+
                     >
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "stretch" }}>
                         <Tag
                           color={activeRole?.boundSlot ? "blue" : "default"}
                           style={{
@@ -922,7 +931,10 @@ export default function TasksPage() {
                           {activeRole ? `${activeRole.remark} - ${activeRole.name || "未知"}` : "未选择"}
                         </Tag>
                         {activeRole?.boundSlot && (
-                          <Tag color={getAccText(activeRole.boundSlot).color as any}>
+                          <Tag
+                            color={getAccText(activeRole.boundSlot).color as any}
+                            style={{ width: "100%", textAlign: "center" }}
+                          >
                             {getAccText(activeRole.boundSlot).text}
                           </Tag>
                         )}
@@ -933,7 +945,16 @@ export default function TasksPage() {
                       size="small"
                       title="媒体操作"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
+
+                      bodyStyle={{
+                        padding: 16,
+                        flex: 1,
+                        overflow: "hidden",
+                        display: "flex",
+                        alignItems: "stretch",
+                        justifyContent: "flex-start"
+                      }}
+
                     >
                       <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
                         <Button
@@ -959,7 +980,16 @@ export default function TasksPage() {
                       size="small"
                       title="发送控制"
                       style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}
-                      bodyStyle={{ padding: 16, flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
+
+                      bodyStyle={{
+                        padding: 16,
+                        flex: 1,
+                        overflow: "hidden",
+                        display: "flex",
+                        alignItems: "stretch",
+                        justifyContent: "flex-start"
+                      }}
+
                     >
                       <Button
                         type="primary"
