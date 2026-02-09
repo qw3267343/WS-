@@ -1,4 +1,6 @@
 export function getWsId(): string {
+  const pathMatch = window.location.pathname.match(/^\/w\/([^\/?#]+)/);
+  if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
   const params = new URLSearchParams(window.location.search);
   const ws = (params.get("ws") || "").trim();
   if (ws) return ws;

@@ -18,7 +18,7 @@ import type { MenuProps } from "antd";
 import { MoreOutlined, PlusOutlined, ReloadOutlined, DeleteOutlined, DragOutlined, CloseOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
-import { getWsId } from "../lib/workspace";
+import { getWsId, wsKey } from "../lib/workspace";
 import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
 import { loadGroups, loadRoles, saveRoles, uid } from "../lib/storage";
 
@@ -60,10 +60,10 @@ type HisItem = {
 };
 
 function loadHis(): HisItem[] {
-  try { return JSON.parse(localStorage.getItem(K_HIS) || "[]"); } catch { return []; }
+  try { return JSON.parse(localStorage.getItem(wsKey(K_HIS)) || "[]"); } catch { return []; }
 }
 function saveHis(arr: HisItem[]) {
-  localStorage.setItem(K_HIS, JSON.stringify(arr.slice(-500)));
+  localStorage.setItem(wsKey(K_HIS), JSON.stringify(arr.slice(-500)));
 }
 function fmtTime(ts: number) {
   const d = new Date(ts);
@@ -93,9 +93,8 @@ type AccRow = WaAccountRow & {
 
 export default function TasksPage() {
   const PAGE_H = "calc(100vh - 64px - 32px)";
-  const BOTTOM_H = 300;
   const BASE_INPUT_AREA_H = 240;
-  const MAX_INPUT_AREA_H = 420;
+  const MEDIA_INPUT_AREA_H = 340;
   const SEND_CONCURRENCY = 4;
 
   function sleep(ms: number) {
@@ -168,20 +167,8 @@ export default function TasksPage() {
   const textAreaRef = useRef<any>(null);
 
   useLayoutEffect(() => {
-    const el =
-      textAreaRef.current?.resizableTextArea?.textArea ||
-      textAreaRef.current?.textarea ||
-      null;
-    if (!el) return;
-
-    const extra = files.length > 0 ? 120 : 70;
-    const next = Math.min(
-      MAX_INPUT_AREA_H,
-      Math.max(BASE_INPUT_AREA_H, el.scrollHeight + extra)
-    );
-
-    setInputAreaH((prev) => (Math.abs(prev - next) >= 8 ? next : prev));
-  }, [text, files.length]);
+    setInputAreaH(files.length > 0 ? MEDIA_INPUT_AREA_H : BASE_INPUT_AREA_H);
+  }, [files.length]);
 
   const onDropFiles = (e: React.DragEvent) => {
     e.preventDefault();
@@ -629,17 +616,30 @@ export default function TasksPage() {
       { key: "edit", label: "编辑角色资料" },
       { key: "bind", label: "绑定/替换账号" },
       { key: "unbind", label: "解绑账号" },
+      { key: "open_chat", label: "打开聊天" },
       { type: "divider" as const },
       { key: "move_to_top", label: "置顶" },
       { key: "move_to_bottom", label: "置底" },
       { type: "divider" as const },
       { key: "delete", label: "删除角色", danger: true },
     ],
-    onClick: ({ key }) => {
+    onClick: async ({ key }) => {
       if (key === "edit") setRoleModal({ open: true, editing: role });
       if (key === "bind") openBind(role);
       if (key === "unbind") {
         setRoles(prev => prev.map(r => (r.id === role.id ? { ...r, boundSlot: undefined } : r)));
+      }
+      if (key === "open_chat") {
+        if (!role.boundSlot) {
+          message.error("该角色未绑定账号");
+        } else {
+          try {
+            await http.post(`/api/accounts/${role.boundSlot}/open`);
+            message.success("已置顶打开");
+          } catch (e) {
+            message.error(String(e));
+          }
+        }
       }
 
       if (key === "move_to_top") {
