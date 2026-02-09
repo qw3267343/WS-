@@ -1,12 +1,14 @@
-﻿import { useEffect, useMemo, useState } from "react";
+﻿import { ReactNode, useEffect, useMemo, useState } from "react";
 import { Layout, Menu } from "antd";
-import { Link, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import MasterPage from "./pages/MasterPage";
 import TasksPage from "./pages/TasksPage";
 import GroupsPage from "./pages/GroupsPage";
 import AccountsPage from "./pages/AccountsPage";
 import SettingsPage from "./pages/SettingsPage";
+import { setActiveWs } from "./lib/api";
+import { getSocket } from "./lib/socket";
 
 function getWsFromSearch(search: string) {
   try {
@@ -21,20 +23,50 @@ function withWsPath(path: string, ws: string) {
   return `${path}?ws=${encodeURIComponent(ws)}`;
 }
 
-export default function App() {
+type WorkspaceLayoutProps = {
+  ws: string;
+  buildPath: (path: string) => string;
+  children: ReactNode;
+};
+
+function WorkspaceLayout({ ws, buildPath, children }: WorkspaceLayoutProps) {
   const location = useLocation();
-  const navigate = useNavigate();
+  const selectedKey = location.pathname.includes("/groups")
+    ? "groups"
+    : location.pathname.includes("/accounts")
+    ? "accounts"
+    : location.pathname.includes("/settings")
+    ? "settings"
+    : "tasks";
 
-  const wsUrl = useMemo(() => getWsFromSearch(location.search), [location.search]);
+  const items = [
+    { key: "tasks", label: <Link to={buildPath("/tasks")}>任务</Link> },
+    { key: "groups", label: <Link to={buildPath("/groups")}>群</Link> },
+    { key: "accounts", label: <Link to={buildPath("/accounts")}>账号</Link> },
+    { key: "settings", label: <Link to={buildPath("/settings")}>设置</Link> },
+  ];
 
-  useEffect(() => {
-    if (wsUrl) sessionStorage.setItem("ws", wsUrl);
-  }, [wsUrl]);
+  return (
+    <Layout style={{ minHeight: "100vh" }}>
+      <Layout.Header style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        {/* 左：固定标题 */}
+        <div style={{ color: "#fff", fontWeight: 800, fontSize: 16 }}>
+          WS中控-
+        </div>
 
-  const ws = wsUrl || sessionStorage.getItem("ws") || "";
-  const inWorkspace = !!ws;
+        {/* ✅ 中：当前任务名（放在 Workspace 和菜单之间） */}
+        <WorkspaceTitle ws={ws} />
 
-  // ✅ 左上角显示任务名（来自 projects/:id）
+        {/* 中：菜单 */}
+        <Menu theme="dark" mode="horizontal" selectedKeys={[selectedKey]} items={items} style={{ flex: 1 }} />
+      </Layout.Header>
+
+      <Layout.Content style={{ padding: 16 }}>{children}</Layout.Content>
+    </Layout>
+  );
+}
+
+function WorkspaceTitle({ ws }: { ws: string }) {
   const [taskName, setTaskName] = useState<string>("");
 
   useEffect(() => {
@@ -58,6 +90,45 @@ export default function App() {
     };
   }, [ws]);
 
+  return (
+    <div
+      title={taskName || ws}
+      style={{
+        color: "#fff",
+        fontWeight: 800,
+        fontSize: 16,
+        maxWidth: 260,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        opacity: 0.95,
+      }}
+    >
+      {taskName || ws}
+    </div>
+  );
+}
+
+function LegacyWorkspaceApp() {
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const wsUrl = useMemo(() => getWsFromSearch(location.search), [location.search]);
+
+  useEffect(() => {
+    if (wsUrl) sessionStorage.setItem("ws", wsUrl);
+  }, [wsUrl]);
+
+  const ws = wsUrl || sessionStorage.getItem("ws") || "";
+  const inWorkspace = !!ws;
+
+  useEffect(() => {
+    if (ws) {
+      setActiveWs(ws);
+      getSocket(ws);
+    }
+  }, [ws]);
+
   // 兜底：workspace 窗口丢了 ws 时补回
   useEffect(() => {
     if (!wsUrl) {
@@ -76,61 +147,52 @@ export default function App() {
 
   if (!inWorkspace) return <MasterPage />;
 
-  const selectedKey =
-    location.pathname.startsWith("/groups")
-      ? "groups"
-      : location.pathname.startsWith("/accounts")
-      ? "accounts"
-      : location.pathname.startsWith("/settings")
-      ? "settings"
-      : "tasks";
+  return (
+    <WorkspaceLayout ws={ws} buildPath={(path) => withWsPath(path, ws)}>
+      <Routes>
+        <Route path="/" element={<Navigate to={withWsPath("/tasks", ws)} replace />} />
+        <Route path="/tasks" element={<TasksPage />} />
+        <Route path="/groups" element={<GroupsPage />} />
+        <Route path="/accounts" element={<AccountsPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
+        <Route path="*" element={<Navigate to={withWsPath("/tasks", ws)} replace />} />
+      </Routes>
+    </WorkspaceLayout>
+  );
+}
 
-  const items = [
-    { key: "tasks", label: <Link to={withWsPath("/tasks", ws)}>任务</Link> },
-    { key: "groups", label: <Link to={withWsPath("/groups", ws)}>群</Link> },
-    { key: "accounts", label: <Link to={withWsPath("/accounts", ws)}>账号</Link> },
-    { key: "settings", label: <Link to={withWsPath("/settings", ws)}>设置</Link> },
-  ];
+function WorkspaceApp() {
+  const { wid } = useParams();
+  const ws = wid || "";
+
+  useEffect(() => {
+    if (ws) {
+      setActiveWs(ws);
+      getSocket(ws);
+    }
+  }, [ws]);
+
+  if (!ws) return <MasterPage />;
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
-      <Layout.Header style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        {/* 左：固定标题 */}
-        <div style={{ color: "#fff", fontWeight: 800, fontSize: 16 }}>
-          WS中控-
-        </div>
+    <WorkspaceLayout ws={ws} buildPath={(path) => `/w/${ws}${path}`}>
+      <Routes>
+        <Route index element={<Navigate to="tasks" replace />} />
+        <Route path="tasks" element={<TasksPage />} />
+        <Route path="groups" element={<GroupsPage />} />
+        <Route path="accounts" element={<AccountsPage />} />
+        <Route path="settings" element={<SettingsPage />} />
+        <Route path="*" element={<Navigate to="tasks" replace />} />
+      </Routes>
+    </WorkspaceLayout>
+  );
+}
 
-        {/* ✅ 中：当前任务名（放在 Workspace 和菜单之间） */}
-        <div
-          title={taskName || ws}
-          style={{
-            color: "#fff",
-            fontWeight: 800,
-            fontSize: 16,
-            maxWidth: 260,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            opacity: 0.95,
-          }}
-        >
-          {taskName || ws}
-        </div>
-
-        {/* 中：菜单 */}
-        <Menu theme="dark" mode="horizontal" selectedKeys={[selectedKey]} items={items} style={{ flex: 1 }} />
-      </Layout.Header>
-
-      <Layout.Content style={{ padding: 16 }}>
-        <Routes>
-          <Route path="/" element={<Navigate to={withWsPath("/tasks", ws)} replace />} />
-          <Route path="/tasks" element={<TasksPage />} />
-          <Route path="/groups" element={<GroupsPage />} />
-          <Route path="/accounts" element={<AccountsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to={withWsPath("/tasks", ws)} replace />} />
-        </Routes>
-      </Layout.Content>
-    </Layout>
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/w/:wid/*" element={<WorkspaceApp />} />
+      <Route path="/*" element={<LegacyWorkspaceApp />} />
+    </Routes>
   );
 }

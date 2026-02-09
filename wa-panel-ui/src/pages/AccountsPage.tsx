@@ -16,6 +16,7 @@ import type { MenuProps } from "antd";
 import { DownOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
+import { getWsId } from "../lib/workspace";
 import type { Role, WaAccountRow } from "../lib/types";
 import { loadRoles } from "../lib/storage";
 
@@ -68,7 +69,7 @@ export default function AccountsPage() {
   useEffect(() => {
     refresh();
 
-    const s = getSocket();
+    const s = getSocket(getWsId());
     const onStatus = (p: any) => {
       const slot = String(p?.slot || "").trim();
       if (!slot) return;

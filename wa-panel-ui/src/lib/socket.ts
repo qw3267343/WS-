@@ -1,15 +1,13 @@
 ﻿import { io, Socket } from "socket.io-client";
 import { getApiBase } from "./api";
-import { getWsId } from "./workspace";
-
 let socket: Socket | null = null;
 
-export function getSocket(): Socket {
+export function getSocket(wsId: string): Socket {
   if (!socket) {
     socket = io(getApiBase(), {
       transports: ["polling", "websocket"],
       autoConnect: true,
-      query: { ws: getWsId() },
+      query: { ws: wsId },
     });
   }
   return socket;

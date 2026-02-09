@@ -104,7 +104,7 @@ export default function MasterPage() {
   };
 
   const handleOpen = (row: ProjectRow) => {
-    window.open(`/?ws=${row.id}`, "_blank", "popup,width=1200,height=800");
+    window.open(`/w/${row.id}`, "_blank", "popup,width=1200,height=800");
   };
 
   return (
