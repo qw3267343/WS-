@@ -113,6 +113,7 @@ export default function TasksPage() {
   const nextGroup = enabledGroups[runIdx] || null;
 
   const [history, setHistory] = useState<HisItem[]>(() => loadHis());
+  const hisBottomRef = useRef<HTMLDivElement>(null);
 
   // 角色编辑弹窗
   const [roleModal, setRoleModal] = useState<{ open: boolean; editing?: Role | null }>({ open: false });
@@ -312,6 +313,10 @@ export default function TasksPage() {
       setActiveRoleId(roles[0]?.id || null);
     }
   }, [roles]);
+
+  useEffect(() => {
+    hisBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [history.length]);
 
   function getAccText(slot?: string) {
     if (!slot) return { text: "未绑定", color: "default" as const };
@@ -900,7 +905,7 @@ export default function TasksPage() {
                 bodyStyle={{ flex: 1, overflowY: "auto" }}
               >
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {history.slice().reverse().map((h) => {
+                  {history.map((h) => {
                     const st =
                       h.running ? { text: "发送中", color: "blue" } :
                         h.ok ? { text: "OK", color: "green" } :
@@ -958,6 +963,8 @@ export default function TasksPage() {
                       </div>
                     );
                   })}
+                  <div ref={hisBottomRef} />
+
                 </div>
               </Card>
 
@@ -994,6 +1001,7 @@ export default function TasksPage() {
                         flexDirection: "column",
                         overflow: "hidden",
                         position: "relative",
+                        minHeight: 0,
                       }}
                     >
                       {showHint && (
@@ -1033,17 +1041,18 @@ export default function TasksPage() {
                         value={text}
                         onChange={(e) => setText(e.target.value)}
                         onPaste={onPasteFiles}
-                        placeholder="输入要发送的内容…（支持 Ctrl+V 粘贴图片/视频；也可拖拽文件到此区域）"
+                        placeholder="输入要发送的内容…"
+                        autoSize={false}
                         style={{
+                          flex: 1,
+                          minHeight: 0,
                           fontSize: 14,
                           resize: "none",
                           border: "none",
-                          padding: "12px 8px",
+                          padding: 12,
                           lineHeight: 1.5,
-                          flex: 1,
-                          minHeight: 0,
-                          overflow: "auto",
-                          marginTop: showHint ? 18 : 0,
+                          overflowY: "auto",
+                          marginTop: showHint ? 18 : 0
                         }}
                       />
 
@@ -1176,10 +1185,19 @@ export default function TasksPage() {
                             const ok = await sendOne(to);
 
                             setRunIdx(idx + 1);
+                            if (ok) {
+                              setText("");
+                              setFiles([]);
+                            }
+
                             ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
                             return;
                           } else {
                             const ok = await sendOne(singleTo.trim());
+                            if (ok) {
+                              setText("");
+                              setFiles([]);
+                            }
                             ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
                           }
                         }}
