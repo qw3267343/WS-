@@ -18,6 +18,7 @@ import type { ColumnsType } from "antd/es/table";
 import type { GroupTarget } from "../lib/types";
 import { loadGroups, saveGroups } from "../lib/storage";
 import { withWs, getWsId } from "../lib/workspace";
+import { http } from "../lib/api";
 
 
 type ResolveResp =
@@ -58,6 +59,7 @@ export default function GroupsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<GroupTarget | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => {
     saveGroups(rows);
@@ -153,6 +155,7 @@ export default function GroupsPage() {
               添加群
             </Button>
             <Button onClick={() => setBatchOpen(true)}>批量添加</Button>
+            <Button onClick={() => setImportOpen(true)}>从账号导入</Button>
           </Space>
         }
       >
@@ -214,6 +217,31 @@ export default function GroupsPage() {
                 next[idx] = { ...next[idx], ...g, enabled: true };
               } else {
                 next = [{ ...g, enabled: true }, ...next];
+              }
+            }
+            return next;
+          });
+        }}
+      />
+
+      <ImportGroupsModal
+        open={importOpen}
+        onCancel={() => setImportOpen(false)}
+        onImport={(items, enabled) => {
+          setRows((prev) => {
+            let next = prev.slice();
+            for (const g of items) {
+              if (!/@g\.us$/.test(g.id)) continue;
+              const idx = next.findIndex((x) => x.id === g.id);
+              if (idx >= 0) {
+                next[idx] = {
+                  ...next[idx],
+                  name: g.name,
+                  link: g.link,
+                  enabled,
+                };
+              } else {
+                next = [{ ...g, enabled }, ...next];
               }
             }
             return next;
@@ -553,6 +581,155 @@ function BatchAddGroupsModal(props: {
             ))}
           </div>
         )}
+      </Space>
+    </Modal>
+  );
+}
+
+type AccountSummary = {
+  slot: string;
+  status: string;
+};
+
+type ImportGroupItem = { id: string; name: string };
+
+function ImportGroupsModal(props: {
+  open: boolean;
+  onCancel: () => void;
+  onImport: (items: GroupTarget[], enabled: boolean) => void;
+}) {
+  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
+  const [slot, setSlot] = useState<string>("");
+  const [loadingAccounts, setLoadingAccounts] = useState(false);
+  const [loadingGroups, setLoadingGroups] = useState(false);
+  const [groups, setGroups] = useState<ImportGroupItem[]>([]);
+  const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
+  const [query, setQuery] = useState("");
+  const [enabled, setEnabled] = useState(true);
+
+  useEffect(() => {
+    if (!props.open) return;
+    setGroups([]);
+    setSelectedKeys([]);
+    setQuery("");
+    setEnabled(true);
+    setSlot("");
+    void loadAccounts();
+  }, [props.open]);
+
+  async function loadAccounts() {
+    setLoadingAccounts(true);
+    try {
+      const r = await http.get("/api/accounts");
+      const list = (r.data?.data || []) as AccountSummary[];
+      setAccounts(list);
+      const ready = list.find((a) => a.status === "READY");
+      setSlot(ready?.slot || list[0]?.slot || "");
+    } catch (e: any) {
+      message.error("加载账号失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    } finally {
+      setLoadingAccounts(false);
+    }
+  }
+
+  async function loadGroups() {
+    const s = slot.trim();
+    if (!s) return message.error("请先选择账号");
+    setLoadingGroups(true);
+    try {
+      const r = await http.get(`/api/accounts/${s}/groups`);
+      if (!r.data?.ok) throw new Error(r.data?.error || "拉取失败");
+      const list = (r.data?.data || []) as ImportGroupItem[];
+      setGroups(list);
+      setSelectedKeys([]);
+    } catch (e: any) {
+      message.error("拉取群列表失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    } finally {
+      setLoadingGroups(false);
+    }
+  }
+
+  const filteredGroups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return groups;
+    return groups.filter((g) => String(g.name || "").toLowerCase().includes(q));
+  }, [groups, query]);
+
+  const selectedItems = useMemo(() => {
+    const set = new Set(selectedKeys.map(String));
+    return groups.filter((g) => set.has(g.id));
+  }, [groups, selectedKeys]);
+
+  function onImport() {
+    if (!selectedItems.length) return message.warning("请先勾选要导入的群");
+    const items: GroupTarget[] = selectedItems.map((g) => ({
+      id: g.id,
+      name: g.name,
+      enabled,
+      link: undefined,
+      note: undefined,
+      tags: [],
+    }));
+    props.onImport(items, enabled);
+    message.success(`导入 ${items.length} 个群`);
+  }
+
+  return (
+    <Modal
+      title="从账号导入群聊"
+      open={props.open}
+      onCancel={props.onCancel}
+      footer={
+        <Space>
+          <Button onClick={props.onCancel}>关闭</Button>
+          <Button type="primary" onClick={onImport}>
+            导入选中
+          </Button>
+        </Space>
+      }
+    >
+      <Space direction="vertical" style={{ width: "100%" }}>
+        <Space wrap>
+          <span>账号</span>
+          <Select
+            value={slot || undefined}
+            style={{ width: 160 }}
+            onChange={(v) => setSlot(String(v))}
+            loading={loadingAccounts}
+            options={accounts.map((a) => ({
+              value: a.slot,
+              label: `${a.slot}（${a.status}）`,
+              disabled: a.status !== "READY",
+            }))}
+          />
+          <Button onClick={loadGroups} loading={loadingGroups} disabled={!slot}>
+            拉取群列表
+          </Button>
+          <span style={{ marginLeft: 8 }}>导入后启用</span>
+          <Switch checked={enabled} onChange={setEnabled} />
+        </Space>
+
+        <Input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="搜索群名"
+          allowClear
+        />
+
+        <Table
+          rowKey="id"
+          size="small"
+          dataSource={filteredGroups}
+          pagination={{ pageSize: 8 }}
+          rowSelection={{
+            selectedRowKeys: selectedKeys,
+            onChange: (keys) => setSelectedKeys(keys),
+          }}
+          columns={[
+            { title: "群名", dataIndex: "name", width: 240, render: (v) => <b>{v}</b> },
+            { title: "群ID", dataIndex: "id", render: (v) => <Tag>{v}</Tag> },
+          ]}
+        />
       </Space>
     </Modal>
   );
