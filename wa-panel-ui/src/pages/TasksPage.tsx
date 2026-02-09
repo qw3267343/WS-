@@ -6,7 +6,6 @@ import {
   Col,
   Dropdown,
   Input,
-  List,
   Modal,
   Row,
   Select,
@@ -25,16 +24,38 @@ import { loadGroups, loadRoles, saveRoles, uid } from "../lib/storage";
 
 const K_HIS = "wa_send_history_v2";
 type HisItem = {
+  id: string;
   ts: number;
+  lastTs?: number;
+
+  kind: "single" | "batch";
+
   roleRemark: string;
   roleName: string;
   slot?: string;
+
   mode: "enabled_groups" | "single_group" | "single_contact";
-  to: string;
+
+  // 不再需要展示 to/toName
+  to?: string;
   toName?: string;
+
   text: string;
+
+  // ✅ 最终状态：OK(true)/NO(false)
   ok: boolean;
-  err?: string;
+
+  // ✅ 批次发送中
+  running?: boolean;
+
+  // ✅ 批次统计
+  total?: number;
+  okCount?: number;
+  failCount?: number;
+
+  // ✅ 失败时显示一个简短原因（不展示群信息）
+  lastErr?: string;
+
   media?: { name: string; type: string; size: number }[];
 };
 
@@ -87,10 +108,12 @@ export default function TasksPage() {
   const [inputAreaH, setInputAreaH] = useState(BASE_INPUT_AREA_H);
 
   const [runIdx, setRunIdx] = useState(0);
+  const [batchId, setBatchId] = useState<string | null>(null);
   const enabledGroups = useMemo(() => groups.filter(g => g.enabled), [groups]);
   const nextGroup = enabledGroups[runIdx] || null;
 
   const [history, setHistory] = useState<HisItem[]>(() => loadHis());
+  const hisBottomRef = useRef<HTMLDivElement>(null);
 
   // 角色编辑弹窗
   const [roleModal, setRoleModal] = useState<{ open: boolean; editing?: Role | null }>({ open: false });
@@ -291,6 +314,10 @@ export default function TasksPage() {
     }
   }, [roles]);
 
+  useEffect(() => {
+    hisBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [history.length]);
+
   function getAccText(slot?: string) {
     if (!slot) return { text: "未绑定", color: "default" as const };
     const a = accounts.find(x => x.slot === slot);
@@ -299,14 +326,62 @@ export default function TasksPage() {
   }
 
   function pushHistory(item: HisItem) {
-    const next = [...history, item].slice(-500);
-    setHistory(next);
-    saveHis(next);
+    setHistory(prev => {
+      const next = [...prev, item].slice(-500);
+      saveHis(next);
+      return next;
+    });
   }
 
-  function resolveToName(to: string) {
-    const g = groups.find(x => x.id === to);
-    return g?.name;
+  function patchHistory(id: string, updater: (h: HisItem) => HisItem) {
+    setHistory(prev => {
+      const next = prev.map(h => (h.id === id ? updater(h) : h));
+      saveHis(next);
+      return next;
+    });
+  }
+
+  function newId() {
+    return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+
+  function startBatchHistory(batchId: string, total: number) {
+    if (!activeRole?.boundSlot) return;
+
+    const mediaMeta = files.map(f => ({ name: f.name, type: f.type || "unknown", size: f.size }));
+
+    pushHistory({
+      id: batchId,
+      ts: Date.now(),
+      lastTs: Date.now(),
+      kind: "batch",
+      roleRemark: activeRole.remark,
+      roleName: activeRole.name || "未知",
+      slot: activeRole.boundSlot,
+      mode: "enabled_groups",
+      text,
+      ok: false,
+      running: true,
+      total,
+      okCount: 0,
+      failCount: 0,
+      media: mediaMeta.length ? mediaMeta : undefined
+    });
+  }
+
+  function finalizeBatchHistory(batchId: string) {
+    patchHistory(batchId, h => {
+      const okCount = h.okCount || 0;
+      const failCount = h.failCount || 0;
+      const total = h.total || (okCount + failCount);
+      return {
+        ...h,
+        total,
+        running: false,
+        ok: failCount === 0 && (okCount + failCount) >= total,
+        lastTs: Date.now()
+      };
+    });
   }
 
   function addFiles(list: File[]) {
@@ -354,7 +429,7 @@ export default function TasksPage() {
     await http.post(`/api/accounts/${slot}/sendMedia`, fd);
   }
 
-  async function sendOne(to: string) {
+  async function sendOne(to: string, opt?: { batchId?: string }) {
     if (!activeRole?.boundSlot) {
       message.error("该角色未绑定账号，请先绑定账号");
       return false;
@@ -367,35 +442,70 @@ export default function TasksPage() {
       if (files.length) await sendMedia(slot, to);
       else await sendText(slot, to);
 
+      if (opt?.batchId) {
+        patchHistory(opt.batchId, h => {
+          const okCount = (h.okCount || 0) + 1;
+          const failCount = h.failCount || 0;
+          return {
+            ...h,
+            okCount,
+            failCount,
+            lastTs: Date.now(),
+            ok: false
+          };
+        });
+        return true;
+      }
+
       pushHistory({
+        id: newId(),
         ts: Date.now(),
+        lastTs: Date.now(),
+        kind: "single",
         roleRemark: activeRole.remark,
         roleName: activeRole.name || "未知",
         slot,
         mode,
         to,
-        toName: resolveToName(to),
         text,
         ok: true,
-        media: mediaMeta.length ? mediaMeta : undefined,
+        media: mediaMeta.length ? mediaMeta : undefined
       });
 
       return true;
     } catch (e: any) {
       const err = e?.response?.data?.error || e.message;
 
+      if (opt?.batchId) {
+        patchHistory(opt.batchId, h => {
+          const okCount = h.okCount || 0;
+          const failCount = (h.failCount || 0) + 1;
+          return {
+            ...h,
+            okCount,
+            failCount,
+            lastErr: err,
+            lastTs: Date.now(),
+            ok: false
+          };
+        });
+        return false;
+      }
+
       pushHistory({
+        id: newId(),
         ts: Date.now(),
+        lastTs: Date.now(),
+        kind: "single",
         roleRemark: activeRole.remark,
         roleName: activeRole.name || "未知",
         slot,
         mode,
         to,
-        toName: resolveToName(to),
         text,
         ok: false,
-        err,
-        media: mediaMeta.length ? mediaMeta : undefined,
+        lastErr: err,
+        media: mediaMeta.length ? mediaMeta : undefined
       });
 
       return false;
@@ -520,7 +630,7 @@ export default function TasksPage() {
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
     if (!activeRole) return false;
     if (!hasContent) return false;
-    if (mode === "enabled_groups") return enabledGroups.length > 0 && runIdx < enabledGroups.length;
+    if (mode === "enabled_groups") return enabledGroups.length > 0;
     return singleTo.trim().length > 0;
   }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo]);
   const showHint = !text.trim() && files.length === 0;
@@ -794,43 +904,67 @@ export default function TasksPage() {
                 style={{ flex: "1 1 auto", overflow: "hidden", display: "flex", flexDirection: "column", minHeight: 200 }}
                 bodyStyle={{ flex: 1, overflowY: "auto" }}
               >
-                <List
-                  size="small"
-                  dataSource={history.slice().reverse()}
-                  locale={{ emptyText: "暂无记录" }}
-                  renderItem={(h) => (
-                    <List.Item style={{ paddingBlock: 6 }}>
-                      <div style={{ width: "100%" }}>
-                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                          <Tag>{fmtTime(h.ts)}</Tag>
-                          <Tag color={h.ok ? "green" : "red"}>{h.ok ? "OK" : "FAIL"}</Tag>
-                          <Tag color="blue">{h.roleRemark}-{h.roleName}</Tag>
-                          {h.slot && <Tag>{h.slot}</Tag>}
-                          <Tag>{h.toName ? `${h.toName} (${h.to})` : h.to}</Tag>
-                          {h.media && h.media.length > 0 && (
-                            <Tag color="purple">媒体 {h.media.length} 个</Tag>
-                          )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {history.map((h) => {
+                    const st =
+                      h.running ? { text: "发送中", color: "blue" } :
+                        h.ok ? { text: "OK", color: "green" } :
+                          { text: "NO", color: "red" };
+
+                    const timeText = fmtTime(h.lastTs || h.ts);
+
+                    return (
+                      <div key={h.id} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                        <div style={{ width: 42, textAlign: "center", paddingTop: 2 }}>
+                          <Tag color={st.color as any} style={{ marginRight: 0, minWidth: 40, textAlign: "center" }}>
+                            {st.text}
+                          </Tag>
                         </div>
 
-                        {h.media && h.media.length > 0 && (
-                          <div style={{ marginTop: 4, color: "#666" }}>
-                            {h.media.map(m => `${m.name}(${humanSize(m.size)})`).join(" / ")}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                            <div style={{ fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                              备注：{h.roleRemark}
+                              {h.kind === "batch" && (
+                                <span style={{ marginLeft: 8, fontWeight: 500, color: "#666" }}>
+                                  {h.okCount || 0}/{h.total || 0}{h.failCount ? `（失败${h.failCount}）` : ""}
+                                </span>
+                              )}
+                            </div>
+                            <div style={{ fontSize: 12, color: "#999", flex: "0 0 auto" }}>{timeText}</div>
                           </div>
-                        )}
 
-                        {h.text && (
-                          <div style={{ marginTop: 4, whiteSpace: "pre-wrap" }}>
-                            {h.text}
+                          <div
+                            style={{
+                              marginTop: 6,
+                              background: "#fafafa",
+                              border: "1px solid #f0f0f0",
+                              borderRadius: 12,
+                              padding: "10px 12px",
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-word"
+                            }}
+                          >
+                            {h.text ? h.text : (h.media?.length ? `（仅媒体 ${h.media.length} 个）` : "")}
                           </div>
-                        )}
 
-                        {!h.ok && h.err && (
-                          <div style={{ marginTop: 4, color: "#999" }}>{h.err}</div>
-                        )}
+                          {!!h.media?.length && (
+                            <div style={{ marginTop: 6, fontSize: 12, color: "#888" }}>
+                              媒体：{h.media.length} 个
+                            </div>
+                          )}
+
+                          {!h.ok && !h.running && h.lastErr && (
+                            <div style={{ marginTop: 6, fontSize: 12, color: "#999" }}>
+                              失败原因：{h.lastErr}
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </List.Item>
-                  )}
-                />
+                    );
+                  })}
+                  <div ref={hisBottomRef} />
+                </div>
               </Card>
 
               <Row gutter={16} style={{ marginTop: "auto" }} align="stretch">
@@ -866,6 +1000,7 @@ export default function TasksPage() {
                         flexDirection: "column",
                         overflow: "hidden",
                         position: "relative",
+                        minHeight: 0,
                       }}
                     >
                       {showHint && (
@@ -905,17 +1040,18 @@ export default function TasksPage() {
                         value={text}
                         onChange={(e) => setText(e.target.value)}
                         onPaste={onPasteFiles}
-                        placeholder="输入要发送的内容…（支持 Ctrl+V 粘贴图片/视频；也可拖拽文件到此区域）"
+                        placeholder="输入要发送的内容…"
+                        autoSize={false}
                         style={{
+                          flex: 1,
+                          minHeight: 0,
                           fontSize: 14,
                           resize: "none",
                           border: "none",
-                          padding: "12px 8px",
+                          padding: 12,
                           lineHeight: 1.5,
-                          flex: 1,
-                          minHeight: 0,
-                          overflow: "auto",
-                          marginTop: showHint ? 18 : 0,
+                          overflowY: "auto",
+                          marginTop: showHint ? 18 : 0
                         }}
                       />
 
@@ -1032,14 +1168,34 @@ export default function TasksPage() {
                           if (!hasContent) return message.error("内容或附件至少要有一个");
 
                           if (mode === "enabled_groups") {
-                            if (!enabledGroups.length) return message.error("没有启用的群");
-                            if (runIdx >= enabledGroups.length) return message.error("已发送完所有启用群（可切换任务类型或刷新群）");
-                            const to = enabledGroups[runIdx].id;
+                            if (!enabledGroups.length) {
+                              message.error("没有启用的群");
+                              return;
+                            }
+
+                            let idx = runIdx;
+                            if (idx >= enabledGroups.length) {
+                              idx = 0;
+                              setRunIdx(0);
+                              message.info("已完成一轮，已从头开始");
+                            }
+
+                            const to = enabledGroups[idx].id;
                             const ok = await sendOne(to);
-                            setRunIdx(i => i + 1);
+
+                            setRunIdx(idx + 1);
+                            if (ok) {
+                              setText("");
+                              setFiles([]);
+                            }
                             ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+                            return;
                           } else {
                             const ok = await sendOne(singleTo.trim());
+                            if (ok) {
+                              setText("");
+                              setFiles([]);
+                            }
                             ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
                           }
                         }}
