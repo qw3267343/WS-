@@ -3,7 +3,10 @@ import {
   Button,
   Card,
   Dropdown,
+  Input,
   Modal,
+  Progress,
+  Select,
   Space,
   Table,
   Tag,
@@ -16,7 +19,7 @@ import type { MenuProps } from "antd";
 import { DownOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
-import { getWsId } from "../lib/workspace";
+import { getWsId, wsKey } from "../lib/workspace";
 import type { Role, WaAccountRow } from "../lib/types";
 import { loadRoles } from "../lib/storage";
 
@@ -47,10 +50,31 @@ type AccRow = WaAccountRow & {
   nickname?: string | null;
 };
 
+type BatchResult =
+  | { ok: true; slot: string }
+  | { ok: false; slot: string; error: string };
+
 export default function AccountsPage() {
   const [rows, setRows] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>(() => loadRoles());
   const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
+  const [remarks, setRemarks] = useState<Record<string, string>>({});
+  const [bindFilter, setBindFilter] = useState<"all" | "bound" | "unbound">("all");
+  const [remarkQuery, setRemarkQuery] = useState("");
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchAction, setBatchAction] = useState<"connect" | "logout" | null>(null);
+
+  const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(remarksStorageKey);
+      const parsed = raw ? JSON.parse(raw) : {};
+      setRemarks(parsed && typeof parsed === "object" ? parsed : {});
+    } catch {
+      setRemarks({});
+    }
+  }, [remarksStorageKey]);
 
   async function refresh() {
     const r = await http.get(`/api/accounts`);
@@ -99,6 +123,18 @@ export default function AccountsPage() {
   function boundRole(slot: string) {
     const r = roles.find(x => x.boundSlot === slot);
     return r ? `${r.remark}-${r.name}` : "未绑定";
+  }
+
+  function isBound(slot: string) {
+    return roles.some(x => x.boundSlot === slot);
+  }
+
+  function commitRemark(slot: string, value: string) {
+    setRemarks((prev) => {
+      const next = { ...prev, [slot]: value };
+      localStorage.setItem(remarksStorageKey, JSON.stringify(next));
+      return next;
+    });
   }
 
   async function createAccountOnly() {
@@ -159,30 +195,13 @@ export default function AccountsPage() {
     });
   }
 
-  // 批量工具
-  async function runBatch(slots: string[], fn: (s: string) => Promise<void>, label: string) {
-    if (!slots.length) return message.warning("请先勾选账号");
-    let ok = 0, fail = 0;
-    for (const s of slots) {
-      try { await fn(s); ok++; }
-      catch { fail++; }
-    }
-    message.success(`${label} 完成：成功 ${ok} / 失败 ${fail}`);
-    await refresh();
-  }
-
   const selectedSlots = useMemo(() => selectedKeys.map(String), [selectedKeys]);
 
   const batchMenu: MenuProps = {
     items: [
-      { key: "connect", label: "批量 连接/扫码" },
-      { key: "logout", label: "批量 登出" },
-      { type: "divider" as const },
       { key: "delete", label: "批量 删除账号", danger: true },
     ],
     onClick: async ({ key }: { key: string }) => {
-      if (key === "connect") return runBatch(selectedSlots, connect, "连接/扫码");
-      if (key === "logout") return runBatch(selectedSlots, logout, "登出");
       if (key === "delete") {
         Modal.confirm({
           title: "批量删除账号",
@@ -238,6 +257,24 @@ export default function AccountsPage() {
     { title: "昵称", dataIndex: "nickname", width: 180, render: (v: any) => (v ? String(v) : "-") },
 
     {
+      title: "备注",
+      dataIndex: "remark",
+      width: 200,
+      render: (_, r) => (
+        <Input
+          value={remarks[r.slot] ?? ""}
+          placeholder="备注..."
+          onChange={(e) => {
+            const v = e.target.value;
+            setRemarks((prev) => ({ ...prev, [r.slot]: v }));
+          }}
+          onBlur={(e) => commitRemark(r.slot, e.currentTarget.value)}
+          onPressEnter={(e) => commitRemark(r.slot, e.currentTarget.value)}
+        />
+      )
+    },
+
+    {
       title: "状态",
       dataIndex: "status",
       width: 120,
@@ -279,6 +316,20 @@ export default function AccountsPage() {
     }
   ];
 
+  const filteredRows = useMemo(() => {
+    const query = remarkQuery.trim().toLowerCase();
+    return rows.filter((row) => {
+      const bound = isBound(row.slot);
+      if (bindFilter === "bound" && !bound) return false;
+      if (bindFilter === "unbound" && bound) return false;
+      if (query) {
+        const remark = (remarks[row.slot] || "").toLowerCase();
+        if (!remark.includes(query)) return false;
+      }
+      return true;
+    });
+  }, [rows, bindFilter, remarkQuery, remarks, roles]);
+
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
       <Card
@@ -287,9 +338,28 @@ export default function AccountsPage() {
           <Space>
             <Button type="primary" onClick={createAccountOnly}>新增账号</Button>
 
+            <Button
+              disabled={!selectedSlots.length}
+              onClick={() => {
+                setBatchAction("connect");
+                setBatchOpen(true);
+              }}
+            >
+              一键登录({selectedSlots.length})
+            </Button>
+            <Button
+              disabled={!selectedSlots.length}
+              onClick={() => {
+                setBatchAction("logout");
+                setBatchOpen(true);
+              }}
+            >
+              一键登出({selectedSlots.length})
+            </Button>
+
             <Dropdown menu={batchMenu} trigger={["click"]}>
               <Button disabled={!selectedSlots.length}>
-                批量操作({selectedSlots.length}) <DownOutlined />
+                更多批量 <DownOutlined />
               </Button>
             </Dropdown>
 
@@ -297,14 +367,213 @@ export default function AccountsPage() {
           </Space>
         }
       >
+        <Space style={{ marginBottom: 12 }} wrap>
+          <span>绑定筛选</span>
+          <Select
+            value={bindFilter}
+            style={{ width: 140 }}
+            onChange={(v) => setBindFilter(v)}
+            options={[
+              { value: "all", label: "全部" },
+              { value: "bound", label: "已绑定" },
+              { value: "unbound", label: "未绑定" },
+            ]}
+          />
+          <Input
+            value={remarkQuery}
+            onChange={(e) => setRemarkQuery(e.target.value)}
+            placeholder="备注关键词搜索"
+            style={{ width: 220 }}
+            allowClear
+          />
+        </Space>
         <Table
           rowKey="slot"
           columns={columns}
-          dataSource={rows}
+          dataSource={filteredRows}
           rowSelection={rowSelection}
           pagination={false}
         />
       </Card>
+
+      <BatchProgressModal
+        open={batchOpen}
+        action={batchAction}
+        slots={selectedSlots}
+        rows={rows}
+        onCancel={() => setBatchOpen(false)}
+        onDone={async () => {
+          setBatchOpen(false);
+          await refresh();
+        }}
+      />
     </div>
+  );
+}
+
+async function runPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+) {
+  const n = Math.max(1, Math.min(concurrency || 1, 10));
+  let i = 0;
+  const runners = Array.from({ length: n }).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+}
+
+function BatchProgressModal(props: {
+  open: boolean;
+  action: "connect" | "logout" | null;
+  slots: string[];
+  rows: AccRow[];
+  onCancel: () => void;
+  onDone: () => void;
+}) {
+  const [concurrency, setConcurrency] = useState<number>(2);
+  const [running, setRunning] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [done, setDone] = useState(0);
+  const [okCount, setOkCount] = useState(0);
+  const [failCount, setFailCount] = useState(0);
+  const [results, setResults] = useState<BatchResult[]>([]);
+
+  useEffect(() => {
+    if (props.open) {
+      setRunning(false);
+      setTotal(0);
+      setDone(0);
+      setOkCount(0);
+      setFailCount(0);
+      setResults([]);
+    }
+  }, [props.open, props.action, props.slots]);
+
+  async function onRun() {
+    if (!props.slots.length || !props.action) {
+      message.warning("请先勾选账号");
+      return;
+    }
+
+    const rowMap = new Map(props.rows.map((r) => [r.slot, r]));
+
+    setRunning(true);
+    setTotal(props.slots.length);
+    setDone(0);
+    setOkCount(0);
+    setFailCount(0);
+    setResults([]);
+
+    await runPool(props.slots, concurrency, async (slot) => {
+      try {
+        if (props.action === "connect") {
+          const row = rowMap.get(slot);
+          if (row?.status === "READY") {
+            setResults((prev) => [...prev, { ok: true, slot }]);
+            setOkCount((x) => x + 1);
+            return;
+          }
+          await http.post(`/api/accounts/${slot}/connect`);
+        } else {
+          await http.post(`/api/accounts/${slot}/logout`);
+        }
+        setResults((prev) => [...prev, { ok: true, slot }]);
+        setOkCount((x) => x + 1);
+      } catch (e: any) {
+        setResults((prev) => [
+          ...prev,
+          { ok: false, slot, error: String(e?.response?.data?.error || e?.message || "unknown error") },
+        ]);
+        setFailCount((x) => x + 1);
+      } finally {
+        setDone((x) => x + 1);
+      }
+    });
+
+    message.success(`批量${props.action === "connect" ? "登录" : "登出"}完成`);
+    setRunning(false);
+    await props.onDone();
+  }
+
+  const percent = total ? Math.round((done / total) * 100) : 0;
+
+  return (
+    <Modal
+      title={props.action === "connect" ? "一键登录" : "一键登出"}
+      open={props.open}
+      onCancel={props.onCancel}
+      footer={
+        <Space>
+          <Button onClick={props.onCancel}>关闭</Button>
+          <Button type="primary" loading={running} onClick={onRun}>
+            开始执行
+          </Button>
+        </Space>
+      }
+    >
+      <Space direction="vertical" style={{ width: "100%" }}>
+        <Space wrap>
+          <span>并发</span>
+          <Select
+            value={concurrency}
+            style={{ width: 140 }}
+            onChange={(v) => setConcurrency(Number(v))}
+            options={[
+              { value: 1, label: "1（串行）" },
+              { value: 2, label: "2（推荐）" },
+              { value: 3, label: "3（较快）" },
+              { value: 4, label: "4（更快）" },
+            ]}
+          />
+          <span style={{ marginLeft: 8 }}>已选择 {props.slots.length} 个账号</span>
+        </Space>
+
+        {total > 0 && (
+          <div>
+            <Progress percent={percent} />
+            <div style={{ fontSize: 12, opacity: 0.75 }}>
+              总数 {total}，已完成 {done}，成功 {okCount}，失败 {failCount}
+            </div>
+          </div>
+        )}
+
+        {results.length > 0 && (
+          <div
+            style={{
+              maxHeight: 240,
+              overflowY: "auto",
+              border: "1px solid #eee",
+              borderRadius: 8,
+              padding: 8,
+            }}
+          >
+            {results.map((r, i) => (
+              <div
+                key={`${r.slot}-${i}`}
+                style={{ padding: "6px 4px", borderBottom: "1px solid #f2f2f2" }}
+              >
+                {r.ok ? (
+                  <span style={{ color: "green", fontWeight: 600 }}>OK</span>
+                ) : (
+                  <span style={{ color: "red", fontWeight: 600 }}>NO</span>
+                )}
+                <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.8 }}>{r.slot}</span>
+                {!r.ok && (
+                  <div style={{ marginTop: 4, fontSize: 13, opacity: 0.8 }}>
+                    失败原因：{r.error}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </Space>
+    </Modal>
   );
 }
