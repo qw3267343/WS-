@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AutoComplete,
   Button,
@@ -72,7 +72,8 @@ type AccRow = WaAccountRow & {
 export default function TasksPage() {
   const PAGE_H = "calc(100vh - 64px - 32px)";
   const BOTTOM_H = 300;
-  const INPUT_AREA_H = 240;
+  const BASE_INPUT_AREA_H = 240;
+  const MAX_INPUT_AREA_H = 420;
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>(() => loadRoles());
@@ -82,6 +83,7 @@ export default function TasksPage() {
   const [mode, setMode] = useState<"enabled_groups" | "single_group" | "single_contact">("enabled_groups");
   const [singleTo, setSingleTo] = useState("");
   const [text, setText] = useState("");
+  const [inputAreaH, setInputAreaH] = useState(BASE_INPUT_AREA_H);
 
   const [runIdx, setRunIdx] = useState(0);
   const enabledGroups = useMemo(() => groups.filter(g => g.enabled), [groups]);
@@ -113,6 +115,23 @@ export default function TasksPage() {
   }, [previews]);
 
   const filePickRef = useRef<HTMLInputElement>(null);
+  const textAreaRef = useRef<any>(null);
+
+  useLayoutEffect(() => {
+    const el =
+      textAreaRef.current?.resizableTextArea?.textArea ||
+      textAreaRef.current?.textarea ||
+      null;
+    if (!el) return;
+
+    const extra = files.length > 0 ? 120 : 70;
+    const next = Math.min(
+      MAX_INPUT_AREA_H,
+      Math.max(BASE_INPUT_AREA_H, el.scrollHeight + extra)
+    );
+
+    setInputAreaH((prev) => (Math.abs(prev - next) >= 8 ? next : prev));
+  }, [text, files.length]);
 
   const onDropFiles = (e: React.DragEvent) => {
     e.preventDefault();
@@ -503,6 +522,7 @@ export default function TasksPage() {
     if (mode === "enabled_groups") return enabledGroups.length > 0 && runIdx < enabledGroups.length;
     return singleTo.trim().length > 0;
   }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo]);
+  const showHint = !text.trim() && files.length === 0;
 
   // 绑定弹窗 options（来自 accounts）
   const bindOptions = useMemo(() => {
@@ -840,22 +860,47 @@ export default function TasksPage() {
                         borderRadius: 8,
                         padding: 14,
                         background: "#fff",
-                        height: INPUT_AREA_H,
+                        height: inputAreaH,
                         display: "flex",
                         flexDirection: "column",
                         overflow: "hidden",
+                        position: "relative",
                       }}
                     >
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                          提示：拖拽图片/视频到这个框内即可添加附件
-                        </Typography.Text>
-                        <Space size={8} wrap>
-                          {files.length > 0 && <Tag color="purple">已选媒体 {files.length} 个</Tag>}
-                        </Space>
-                      </div>
+                      {showHint && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            left: 14,
+                            top: 12,
+                            fontSize: 12,
+                            color: "#999",
+                            pointerEvents: "none",
+                            zIndex: 2,
+                          }}
+                        >
+                          提示：拖拽图片/视频到这个框内即可添加附件（也支持 Ctrl+V）
+                        </div>
+                      )}
+                      {files.length > 0 && (
+                        <Tag
+                          color="purple"
+                          style={{
+                            position: "absolute",
+                            right: 14,
+                            top: 10,
+                            zIndex: 2,
+                            margin: 0,
+                            borderRadius: 8,
+                            padding: "4px 10px",
+                          }}
+                        >
+                          已选媒体 {files.length} 个
+                        </Tag>
+                      )}
 
                       <Input.TextArea
+                        ref={textAreaRef}
                         value={text}
                         onChange={(e) => setText(e.target.value)}
                         onPaste={onPasteFiles}
@@ -864,12 +909,12 @@ export default function TasksPage() {
                           fontSize: 14,
                           resize: "none",
                           border: "none",
-                          padding: "12px",
+                          padding: "12px 8px",
                           lineHeight: 1.5,
-                          height: "auto",
                           flex: 1,
                           minHeight: 0,
                           overflow: "auto",
+                          marginTop: showHint ? 18 : 0,
                         }}
                       />
 
@@ -942,7 +987,7 @@ export default function TasksPage() {
                     size="small"
                     style={{
                       width: "100%",
-                      height: INPUT_AREA_H,
+                      height: inputAreaH,
                       display: "flex",
                       flexDirection: "column",
                       overflow: "hidden"
