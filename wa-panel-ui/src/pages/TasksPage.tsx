@@ -24,8 +24,6 @@ import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
 import { loadGroups, loadRoles, saveRoles, uid } from "../lib/storage";
 
 const K_HIS = "wa_send_history_v2";
-const K_SCHEDULED_JOBS = "wa_scheduled_jobs_v1";
-const K_SCHEDULED_FILES = "wa_scheduled_files_v1";
 type HisItem = {
   id: string;
   ts: number;
@@ -64,34 +62,31 @@ type HisItem = {
 
 type ScheduledJob = {
   id: string;
-  createdAt: number;
-  fireAt: number;
-  roleId: string;
+  runAt: number;
+  slot: string;
   mode: "enabled_groups" | "single_group" | "single_contact";
-  singleTo: string;
+  targets: string[];
   text: string;
-  filesMeta?: { name: string; type: string; size: number }[];
-  filesCacheKey?: string;
   status: "pending" | "running" | "done" | "cancelled";
+  createdAt?: number;
+  startedAt?: number;
+  finishedAt?: number;
+  result?: {
+    total: number;
+    okCount: number;
+    failCount: number;
+    lastErr?: string | null;
+  };
+  attachments?: { id: string; name: string; type: string; path: string }[];
+  ws?: string;
   lastErr?: string;
 };
-
-type ScheduledFile = { name: string; type: string; b64: string };
 
 function loadHis(): HisItem[] {
   try { return JSON.parse(localStorage.getItem(wsKey(K_HIS)) || "[]"); } catch { return []; }
 }
 function saveHis(arr: HisItem[]) {
   localStorage.setItem(wsKey(K_HIS), JSON.stringify(arr.slice(-500)));
-}
-function loadScheduledJobs(): ScheduledJob[] {
-  try { return JSON.parse(localStorage.getItem(wsKey(K_SCHEDULED_JOBS)) || "[]"); } catch { return []; }
-}
-function saveScheduledJobs(arr: ScheduledJob[]) {
-  localStorage.setItem(wsKey(K_SCHEDULED_JOBS), JSON.stringify(arr));
-}
-function scheduledFilesKey(jobId: string) {
-  return wsKey(`${K_SCHEDULED_FILES}:${jobId}`);
 }
 function fmtTime(ts: number) {
   const d = new Date(ts);
@@ -113,27 +108,6 @@ function humanSize(n: number) {
   return n + "B";
 }
 
-function base64ToFile(entry: ScheduledFile): File {
-  const binary = atob(entry.b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return new File([bytes], entry.name, { type: entry.type });
-}
-
-function fileToBase64(file: File): Promise<ScheduledFile> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || "");
-      const b64 = result.includes(",") ? result.split(",")[1] : result;
-      resolve({ name: file.name, type: file.type || "application/octet-stream", b64 });
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
 
 type AccRow = WaAccountRow & {
   phone?: string | null;
@@ -190,11 +164,10 @@ export default function TasksPage() {
   const [history, setHistory] = useState<HisItem[]>(() => loadHis());
   const hisBottomRef = useRef<HTMLDivElement>(null);
 
-  const [scheduledJobs, setScheduledJobs] = useState<ScheduledJob[]>(() => loadScheduledJobs());
+  const [scheduledJobs, setScheduledJobs] = useState<ScheduledJob[]>([]);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleMinutes, setScheduleMinutes] = useState(5);
   const [nowTs, setNowTs] = useState(Date.now());
-  const scheduledJobsRef = useRef<ScheduledJob[]>(scheduledJobs);
 
   // 角色编辑弹窗
   const [roleModal, setRoleModal] = useState<{ open: boolean; editing?: Role | null }>({ open: false });
@@ -388,27 +361,29 @@ export default function TasksPage() {
   }, [history.length]);
 
   useEffect(() => {
-    saveScheduledJobs(scheduledJobs);
-  }, [scheduledJobs]);
-
-  useEffect(() => {
-    scheduledJobsRef.current = scheduledJobs;
-  }, [scheduledJobs]);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const now = Date.now();
-      setNowTs(now);
-      const due = scheduledJobsRef.current.filter(
-        job => job.status === "pending" && job.fireAt <= now
-      );
-      if (!due.length) return;
-      for (const job of due) {
-        updateScheduledJob(job.id, j => ({ ...j, status: "running" }));
-        void executeScheduledJob({ ...job, status: "running" });
+    let alive = true;
+    const refresh = async () => {
+      try {
+        const r = await http.get("/api/schedules");
+        if (!alive) return;
+        const list = (r.data?.data || []) as ScheduledJob[];
+        setScheduledJobs(list);
+      } catch {
+        if (!alive) return;
+        setScheduledJobs([]);
       }
-    }, 1000);
-    return () => clearInterval(timer);
+    };
+
+    void refresh();
+    const timer = setInterval(() => {
+      setNowTs(Date.now());
+      void refresh();
+    }, 2000);
+
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
   }, []);
 
   function getAccText(slot?: string) {
@@ -477,62 +452,6 @@ export default function TasksPage() {
     });
   }
 
-  function startBatchHistorySnapshot(args: {
-    batchId: string;
-    roleRemark: string;
-    roleName: string;
-    slot: string;
-    text: string;
-    total: number;
-    mediaMeta?: { name: string; type: string; size: number }[];
-  }) {
-    pushHistory({
-      id: args.batchId,
-      ts: Date.now(),
-      lastTs: Date.now(),
-      kind: "batch",
-      roleRemark: args.roleRemark,
-      roleName: args.roleName,
-      slot: args.slot,
-      mode: "enabled_groups",
-      text: args.text,
-      ok: false,
-      running: true,
-      total: args.total,
-      okCount: 0,
-      failCount: 0,
-      media: args.mediaMeta?.length ? args.mediaMeta : undefined
-    });
-  }
-
-  function pushSingleHistorySnapshot(args: {
-    roleRemark: string;
-    roleName: string;
-    slot?: string;
-    mode: "single_group" | "single_contact";
-    to: string;
-    text: string;
-    ok: boolean;
-    lastErr?: string;
-    mediaMeta?: { name: string; type: string; size: number }[];
-  }) {
-    pushHistory({
-      id: newId(),
-      ts: Date.now(),
-      lastTs: Date.now(),
-      kind: "single",
-      roleRemark: args.roleRemark,
-      roleName: args.roleName,
-      slot: args.slot,
-      mode: args.mode,
-      to: args.to,
-      text: args.text,
-      ok: args.ok,
-      lastErr: args.lastErr,
-      media: args.mediaMeta?.length ? args.mediaMeta : undefined
-    });
-  }
-
   function addFiles(list: File[]) {
     if (!list.length) return;
     const merged = [...files, ...list];
@@ -576,92 +495,6 @@ export default function TasksPage() {
     fd.append("caption", text || "");
     files.forEach(f => fd.append("files", f, f.name));
     await http.post(`/api/accounts/${slot}/sendMedia`, fd);
-  }
-
-  async function sendTextSnapshot(slot: string, to: string, payloadText: string) {
-    await http.post(`/api/accounts/${slot}/send`, { to, text: payloadText });
-  }
-
-  async function sendMediaSnapshot(slot: string, to: string, payloadText: string, payloadFiles: File[]) {
-    const fd = new FormData();
-    fd.append("to", to);
-    fd.append("caption", payloadText || "");
-    payloadFiles.forEach(f => fd.append("files", f, f.name));
-    await http.post(`/api/accounts/${slot}/sendMedia`, fd);
-  }
-
-  async function sendOneSnapshot(args: {
-    slot: string;
-    to: string;
-    text: string;
-    files: File[];
-    roleRemark: string;
-    roleName: string;
-    mode: "single_group" | "single_contact";
-    batchId?: string;
-  }) {
-    const mediaMeta = args.files.map(f => ({ name: f.name, type: f.type || "unknown", size: f.size }));
-    try {
-      if (args.files.length) await sendMediaSnapshot(args.slot, args.to, args.text, args.files);
-      else await sendTextSnapshot(args.slot, args.to, args.text);
-
-      if (args.batchId) {
-        patchHistory(args.batchId, h => {
-          const okCount = (h.okCount || 0) + 1;
-          const failCount = h.failCount || 0;
-          return {
-            ...h,
-            okCount,
-            failCount,
-            lastTs: Date.now(),
-            ok: false
-          };
-        });
-        return true;
-      }
-
-      pushSingleHistorySnapshot({
-        roleRemark: args.roleRemark,
-        roleName: args.roleName,
-        slot: args.slot,
-        mode: args.mode,
-        to: args.to,
-        text: args.text,
-        ok: true,
-        mediaMeta
-      });
-      return true;
-    } catch (e: any) {
-      const err = e?.response?.data?.error || e.message;
-      if (args.batchId) {
-        patchHistory(args.batchId, h => {
-          const okCount = h.okCount || 0;
-          const failCount = (h.failCount || 0) + 1;
-          return {
-            ...h,
-            okCount,
-            failCount,
-            lastErr: err,
-            lastTs: Date.now(),
-            ok: false
-          };
-        });
-        return false;
-      }
-
-      pushSingleHistorySnapshot({
-        roleRemark: args.roleRemark,
-        roleName: args.roleName,
-        slot: args.slot,
-        mode: args.mode,
-        to: args.to,
-        text: args.text,
-        ok: false,
-        lastErr: err,
-        mediaMeta
-      });
-      return false;
-    }
   }
 
   async function sendOne(to: string, opt?: { batchId?: string }) {
@@ -953,156 +786,6 @@ export default function TasksPage() {
     return `${pad(m)}:${pad(s)}`;
   }
 
-  function updateScheduledJob(id: string, updater: (job: ScheduledJob) => ScheduledJob) {
-    setScheduledJobs(prev => prev.map(j => (j.id === id ? updater(j) : j)));
-  }
-
-  function removeScheduledFiles(cacheKey?: string) {
-    if (cacheKey) localStorage.removeItem(cacheKey);
-  }
-
-  async function executeScheduledJob(job: ScheduledJob) {
-    const role = roleMap.get(job.roleId);
-    if (!role || !role.boundSlot) {
-      updateScheduledJob(job.id, j => ({
-        ...j,
-        status: "done",
-        lastErr: "角色未绑定账号或已不存在"
-      }));
-      pushSingleHistorySnapshot({
-        roleRemark: role?.remark || "未知",
-        roleName: role?.name || "未知",
-        slot: role?.boundSlot,
-        mode: job.mode === "single_contact" ? "single_contact" : "single_group",
-        to: job.singleTo,
-        text: job.text,
-        ok: false,
-        lastErr: "角色未绑定账号或已不存在",
-        mediaMeta: job.filesMeta
-      });
-      removeScheduledFiles(job.filesCacheKey);
-      return;
-    }
-
-    let payloadFiles: File[] = [];
-    if (job.filesCacheKey) {
-      try {
-        const raw = localStorage.getItem(job.filesCacheKey);
-        const parsed = raw ? (JSON.parse(raw) as ScheduledFile[]) : [];
-        payloadFiles = parsed.map(base64ToFile);
-      } catch {
-        payloadFiles = [];
-      }
-    }
-
-    const hasContent = (job.text && job.text.trim().length > 0) || payloadFiles.length > 0;
-    if (!hasContent) {
-      updateScheduledJob(job.id, j => ({
-        ...j,
-        status: "done",
-        lastErr: "内容或附件为空"
-      }));
-      pushSingleHistorySnapshot({
-        roleRemark: role.remark,
-        roleName: role.name || "未知",
-        slot: role.boundSlot,
-        mode: job.mode === "single_contact" ? "single_contact" : "single_group",
-        to: job.singleTo,
-        text: job.text,
-        ok: false,
-        lastErr: "内容或附件为空",
-        mediaMeta: job.filesMeta
-      });
-      removeScheduledFiles(job.filesCacheKey);
-      return;
-    }
-
-    if (job.mode === "enabled_groups") {
-      if (!enabledGroups.length) {
-        updateScheduledJob(job.id, j => ({
-          ...j,
-          status: "done",
-          lastErr: "没有启用的群"
-        }));
-        pushHistory({
-          id: job.id,
-          ts: Date.now(),
-          lastTs: Date.now(),
-          kind: "batch",
-          roleRemark: role.remark,
-          roleName: role.name || "未知",
-          slot: role.boundSlot,
-          mode: "enabled_groups",
-          text: job.text,
-          ok: false,
-          running: false,
-          total: 0,
-          okCount: 0,
-          failCount: 0,
-          lastErr: "没有启用的群",
-          media: job.filesMeta?.length ? job.filesMeta : undefined
-        });
-        removeScheduledFiles(job.filesCacheKey);
-        return;
-      }
-
-      startBatchHistorySnapshot({
-        batchId: job.id,
-        roleRemark: role.remark,
-        roleName: role.name || "未知",
-        slot: role.boundSlot,
-        text: job.text,
-        total: enabledGroups.length,
-        mediaMeta: job.filesMeta
-      });
-
-      const results = await runPool(
-        enabledGroups,
-        async (g) => {
-          await sleep(120);
-          return sendOneSnapshot({
-            slot: role.boundSlot as string,
-            to: g.id,
-            text: job.text,
-            files: payloadFiles,
-            roleRemark: role.remark,
-            roleName: role.name || "未知",
-            mode: "single_group",
-            batchId: job.id
-          });
-        },
-        SEND_CONCURRENCY
-      );
-
-      finalizeBatchHistory(job.id);
-      const allOk = results.every(Boolean);
-      updateScheduledJob(job.id, j => ({
-        ...j,
-        status: "done",
-        lastErr: allOk ? undefined : "部分群发送失败"
-      }));
-      removeScheduledFiles(job.filesCacheKey);
-      return;
-    }
-
-    const ok = await sendOneSnapshot({
-      slot: role.boundSlot as string,
-      to: job.singleTo,
-      text: job.text,
-      files: payloadFiles,
-      roleRemark: role.remark,
-      roleName: role.name || "未知",
-      mode: job.mode === "single_contact" ? "single_contact" : "single_group"
-    });
-
-    updateScheduledJob(job.id, j => ({
-      ...j,
-      status: "done",
-      lastErr: ok ? undefined : "发送失败"
-    }));
-    removeScheduledFiles(job.filesCacheKey);
-  }
-
   async function createScheduledJob() {
     if (!activeRole) return message.error("请先选择一个角色");
     if (!activeRole.boundSlot) return message.error("该角色未绑定账号，请先绑定账号");
@@ -1113,36 +796,46 @@ export default function TasksPage() {
     if (mode !== "enabled_groups" && !singleTo.trim()) return message.error("请输入目标");
 
     const minutes = Math.max(1, Math.min(1440, scheduleMinutes || 1));
-    const id = newId();
-    let filesCacheKey: string | undefined;
-    let filesMeta: { name: string; type: string; size: number }[] | undefined;
+    const targets =
+      mode === "enabled_groups"
+        ? enabledGroups.map(g => g.id)
+        : [singleTo.trim()];
 
-    if (files.length) {
-      filesMeta = files.map(f => ({ name: f.name, type: f.type || "unknown", size: f.size }));
-      const entries = await Promise.all(files.map(fileToBase64));
-      filesCacheKey = scheduledFilesKey(id);
-      localStorage.setItem(filesCacheKey, JSON.stringify(entries));
+    const fd = new FormData();
+    fd.append("slot", activeRole.boundSlot);
+    fd.append("mode", mode);
+    fd.append("minutes", String(minutes));
+    fd.append("targets", JSON.stringify(targets));
+    fd.append("text", text);
+    files.forEach((f) => fd.append("files", f, f.name));
+
+  try {
+    // 1) 创建（后端应返回创建后的 job）
+    const resp = await http.post("/api/schedules", fd);
+    const created = (resp.data?.data || resp.data?.job || job) as ScheduledJob;
+
+    // 2) 立刻插入本地列表（避免必须刷新才看到）
+    if (created) {
+      setScheduledJobs(prev => {
+        const rest = prev.filter(x => x.id !== created.id);
+        return [created, ...rest];
+      });
     }
 
-    const job: ScheduledJob = {
-      id,
-      createdAt: Date.now(),
-      fireAt: Date.now() + minutes * 60 * 1000,
-      roleId: activeRole.id,
-      mode,
-      singleTo: singleTo.trim(),
-      text,
-      filesMeta,
-      filesCacheKey,
-      status: "pending"
-    };
-
-    setScheduledJobs(prev => [job, ...prev]);
+    // 3) 关闭弹窗 & 清空输入
     setScheduleOpen(false);
     setText("");
     setFiles([]);
+
+    // 4) 可选：再拉一次全量，保证与后端一致（如果你后端会补字段/排序）
+    // const r = await http.get("/api/schedules");
+    // setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
+
     message.success(`已安排：${minutes}分钟后发送`);
+  } catch (e: any) {
+    message.error(`定时任务创建失败：${e?.response?.data?.error || e.message}`);
   }
+
 
   async function doSendNow() {
     if (!activeRole) return message.error("请先选择一个角色");
@@ -1164,13 +857,19 @@ export default function TasksPage() {
   const activeScheduledJobs = useMemo(() => {
     return scheduledJobs
       .filter(j => j.status === "pending" || j.status === "running")
-      .sort((a, b) => a.fireAt - b.fireAt)
+      .sort((a, b) => a.runAt - b.runAt)
       .slice(0, 5);
   }, [scheduledJobs]);
 
-  function cancelScheduledJob(job: ScheduledJob) {
-    updateScheduledJob(job.id, j => ({ ...j, status: "cancelled" }));
-    removeScheduledFiles(job.filesCacheKey);
+  async function cancelScheduledJob(job: ScheduledJob) {
+    try {
+      await http.post(`/api/schedules/${job.id}/cancel`);
+      const r = await http.get("/api/schedules");
+      setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
+      message.success("已取消定时任务");
+    } catch (e: any) {
+      message.error(`取消失败：${e?.response?.data?.error || e.message}`);
+    }
   }
 
   // 绑定弹窗 options（来自 accounts）
@@ -1736,9 +1435,9 @@ export default function TasksPage() {
                         ) : (
                           <Space direction="vertical" style={{ width: "100%" }} size={8}>
                             {activeScheduledJobs.map((job) => {
-                              const remainMs = job.fireAt - nowTs;
+                              const remainMs = job.runAt - nowTs;
                               const remainText = formatCountdown(remainMs);
-                              const targetText = job.mode === "enabled_groups" ? "启用群" : job.singleTo;
+                              const targetText = job.mode === "enabled_groups" ? "启用群" : (job.targets?.[0] || "-");
                               const hintText =
                                 job.status === "running"
                                   ? `执行中 / 目标：${targetText}`
