@@ -557,6 +557,10 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
 
   try {
     await client.initialize();
+    const page = await getPupPage(client);
+    if (page?.bringToFront) {
+      try { await page.bringToFront(); } catch {}
+    }
     res.json({ ok: true, data: acc });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });

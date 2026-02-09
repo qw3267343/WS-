@@ -104,7 +104,10 @@ export default function MasterPage() {
   };
 
   const handleOpen = (row: ProjectRow) => {
-    window.open(`/w/${row.id}`, "_blank", "popup,width=1200,height=800");
+    const url = `/w/${row.id}/tasks`;
+    const name = `wa_ws_${row.id}`;
+    const win = window.open(url, name, "popup,width=1200,height=800");
+    if (win) win.focus();
   };
 
   return (

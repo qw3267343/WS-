@@ -2,11 +2,11 @@
 import { useState } from "react";
 import { setApiBase } from "../lib/api";
 import { resetSocket } from "../lib/socket";
-import { saveSlots } from "../lib/storage";
+import { loadSlots, saveSlots } from "../lib/storage";
 
 export default function SettingsPage() {
   const [api, setApi] = useState(localStorage.getItem("wa_api_base") || "http://127.0.0.1:3001");
-  const [slots, setSlots] = useState(localStorage.getItem("wa_slots_v1") || "acc001,acc002,acc003");
+  const [slots, setSlots] = useState(loadSlots().join(",") || "acc001,acc002,acc003");
 
   return (
     <div style={{ maxWidth: 900, margin: "0 auto" }}>
