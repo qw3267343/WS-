@@ -23,10 +23,28 @@ const upload = multer({
   limits: { fileSize: 64 * 1024 * 1024 } // 64MB
 });
 
+const scheduleUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const ws = getWs(req);
+      const jobId = req.scheduleId || newId();
+      req.scheduleId = jobId;
+      const dir = ensureSchedulesUploadDir(ws, jobId);
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+      const safeName = String(file.originalname || 'file').replace(/[^A-Za-z0-9._-]/g, '_');
+      cb(null, `${Date.now()}_${Math.random().toString(16).slice(2)}_${safeName}`);
+    }
+  }),
+  limits: { fileSize: 64 * 1024 * 1024 }
+});
+
 // ---------- 持久化 ----------
 const DATA_DIR = path.join(__dirname, 'data');
 const WORKSPACES_DIR = path.join(DATA_DIR, 'workspaces');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
+const SCHEDULED_HISTORY_LIMIT = 200;
 // ① 新增一个计数文件常量
 const UID_COUNTER_FILE = path.join(DATA_DIR, 'uid_counter.txt'); // 只记录最后一次使用的uid数字
 const UID_START = 100001;
@@ -58,6 +76,9 @@ function safeId(raw) {
   return s.replace(/[^A-Za-z0-9_-]/g, '_');
 }
 function nowIso() { return new Date().toISOString(); }
+function newId() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 
 function getWs(req) {
   const raw = req.query?.ws || req.headers['x-ws'] || 'default';
@@ -73,6 +94,16 @@ function getWorkspaceAccountsFile(ws) {
 }
 function getWorkspaceGroupsFile(ws) {
   return path.join(getWorkspaceDir(ws), 'groups.json');
+}
+function getWorkspaceSchedulesFile(ws) {
+  return path.join(getWorkspaceDir(ws), 'scheduled_jobs.json');
+}
+function getWorkspaceSchedulesHistoryFile(ws) {
+  return path.join(getWorkspaceDir(ws), 'scheduled_jobs_history.json');
+}
+function getWorkspaceSchedulesUploadsDir(ws, jobId) {
+  if (jobId) return path.join(getWorkspaceDir(ws), 'scheduled_uploads', jobId);
+  return path.join(getWorkspaceDir(ws), 'scheduled_uploads');
 }
 function getWorkspaceAuthDir(ws) {
   return path.join(getWorkspaceDir(ws), 'wwebjs_auth');
@@ -198,6 +229,47 @@ function nextSlotLabel(list) {
   return `A${max + 1}`;
 }
 
+function loadScheduledJobs(ws) {
+  const file = getWorkspaceSchedulesFile(ws);
+  const data = readJson(file, []);
+  return Array.isArray(data) ? data : [];
+}
+function saveScheduledJobs(ws, list) {
+  const file = getWorkspaceSchedulesFile(ws);
+  writeJson(file, list);
+}
+function removeScheduledJob(ws, id) {
+  const list = loadScheduledJobs(ws);
+  const next = list.filter(job => job.id !== id);
+  if (next.length !== list.length) saveScheduledJobs(ws, next);
+  return list.find(job => job.id === id) || null;
+}
+function loadScheduledHistory(ws) {
+  const file = getWorkspaceSchedulesHistoryFile(ws);
+  const data = readJson(file, []);
+  return Array.isArray(data) ? data : [];
+}
+function saveScheduledHistory(ws, list) {
+  const file = getWorkspaceSchedulesHistoryFile(ws);
+  writeJson(file, list.slice(0, SCHEDULED_HISTORY_LIMIT));
+}
+function archiveScheduledJob(ws, job) {
+  const list = loadScheduledHistory(ws);
+  const next = [job, ...list].slice(0, SCHEDULED_HISTORY_LIMIT);
+  saveScheduledHistory(ws, next);
+}
+
+function ensureSchedulesUploadDir(ws, jobId) {
+  const dir = getWorkspaceSchedulesUploadsDir(ws, jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+function cleanupScheduledUploads(ws, jobId) {
+  if (!jobId) return;
+  const dir = getWorkspaceSchedulesUploadsDir(ws, jobId);
+  try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+}
+
 // ---------- 运行态：按 ws 分桶 ----------
 const contexts = new Map(); // ws -> { clients, statuses, profiles }
 function ctx(ws) {
@@ -210,6 +282,47 @@ function ctx(ws) {
     });
   }
   return contexts.get(key);
+}
+
+async function runPool(items, worker, concurrency) {
+  let idx = 0;
+  const results = new Array(items.length).fill(false);
+  const runners = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) break;
+      results[i] = await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function getClientReady(ws, slot) {
+  const { clients, statuses } = ctx(ws);
+  const client = clients.get(slot);
+  const st = statuses.get(slot)?.status;
+  if (!client) throw new Error('client not initialized');
+  if (st !== 'READY') throw new Error(`slot not READY: ${st}`);
+  return client;
+}
+
+async function sendTextBySlot(ws, slot, to, text) {
+  const client = getClientReady(ws, slot);
+  return client.sendMessage(to, text);
+}
+
+async function sendMediaBySlot(ws, slot, to, caption, attachments) {
+  const client = getClientReady(ws, slot);
+  for (let i = 0; i < attachments.length; i++) {
+    const item = attachments[i];
+    const buf = fs.readFileSync(item.path);
+    const b64 = buf.toString('base64');
+    const mime = item.type || 'application/octet-stream';
+    const media = new MessageMedia(mime, b64, item.name);
+    if (i === 0 && caption) await client.sendMessage(to, media, { caption });
+    else await client.sendMessage(to, media);
+  }
 }
 
 // admin / fallback（默认 A1 / A2，可 env 覆盖）
@@ -769,5 +882,177 @@ app.post('/api/accounts/:slot/sendMedia', upload.array('files', 10), async (req,
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+app.get('/api/schedules', (req, res) => {
+  const ws = getWs(req);
+  const list = loadScheduledJobs(ws);
+  const active = list.filter(job => job.status === 'pending' || job.status === 'running');
+  res.json({ ok: true, data: active });
+});
+
+app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
+  const ws = getWs(req);
+  const slot = normalizeSlot(req.body?.slot);
+  const mode = String(req.body?.mode || '').trim();
+  const text = String(req.body?.text || '');
+  const minutes = Number(req.body?.minutes || 0);
+  const targetsRaw = req.body?.targets;
+
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot required' });
+  if (!mode) return res.status(400).json({ ok: false, error: 'mode required' });
+  if (!targetsRaw) return res.status(400).json({ ok: false, error: 'targets required' });
+  if (!['enabled_groups', 'single_group', 'single_contact'].includes(mode)) {
+    return res.status(400).json({ ok: false, error: 'mode invalid' });
+  }
+
+  let targets = [];
+  try {
+    targets = JSON.parse(targetsRaw);
+  } catch {
+    return res.status(400).json({ ok: false, error: 'targets invalid' });
+  }
+
+  if (!Array.isArray(targets) || targets.length === 0) {
+    return res.status(400).json({ ok: false, error: 'targets empty' });
+  }
+  targets = targets.map(item => String(item || '').trim()).filter(Boolean);
+  if (!targets.length) {
+    return res.status(400).json({ ok: false, error: 'targets empty' });
+  }
+
+  const runAtValue = Number(req.body?.runAt);
+  const runAt = Number.isFinite(runAtValue)
+    ? runAtValue
+    : (Date.now() + Math.max(1, Math.min(1440, minutes || 1)) * 60 * 1000);
+  const jobId = req.scheduleId || newId();
+  const files = req.files || [];
+  const workspaceDir = getWorkspaceDir(ws);
+  const attachments = files.map(f => ({
+    id: f.filename,
+    name: f.originalname,
+    type: f.mimetype,
+    path: path.relative(workspaceDir, f.path)
+  }));
+  const hasContent = (text && text.trim().length > 0) || attachments.length > 0;
+  if (!hasContent) {
+    cleanupScheduledUploads(ws, jobId);
+    return res.status(400).json({ ok: false, error: 'content empty' });
+  }
+
+  const job = {
+    id: jobId,
+    ws,
+    runAt,
+    slot,
+    mode,
+    targets,
+    text,
+    attachments,
+    status: 'pending',
+    createdAt: Date.now(),
+  };
+
+  const list = loadScheduledJobs(ws);
+  saveScheduledJobs(ws, [job, ...list]);
+
+  res.json({ ok: true, data: job });
+});
+
+app.post('/api/schedules/:id/cancel', (req, res) => {
+  const ws = getWs(req);
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+
+  const removed = removeScheduledJob(ws, id);
+  cleanupScheduledUploads(ws, id);
+
+  if (!removed) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true });
+});
+
+async function executeScheduledJob(ws, job) {
+  const targets = Array.isArray(job.targets) ? job.targets : [];
+  const attachments = (job.attachments || []).map(att => ({
+    ...att,
+    path: path.join(getWorkspaceDir(ws), att.path || '')
+  }));
+
+  const hasContent = (job.text && String(job.text).trim().length > 0) || attachments.length > 0;
+  const result = { total: targets.length, okCount: 0, failCount: 0, lastErr: null };
+
+  if (!targets.length) {
+    result.failCount = 1;
+    result.lastErr = 'targets empty';
+  } else if (!hasContent) {
+    result.failCount = targets.length;
+    result.lastErr = 'content empty';
+  } else {
+    const sendOne = async (to) => {
+      try {
+        if (attachments.length > 0) {
+          await sendMediaBySlot(ws, job.slot, to, job.text || '', attachments);
+        } else {
+          await sendTextBySlot(ws, job.slot, to, job.text || '');
+        }
+        result.okCount += 1;
+        return true;
+      } catch (e) {
+        result.failCount += 1;
+        result.lastErr = String(e?.message || e);
+        return false;
+      }
+    };
+
+    if (job.mode === 'enabled_groups') {
+      await runPool(targets, async (t) => sendOne(t), 4);
+    } else {
+      await sendOne(targets[0]);
+    }
+  }
+
+  const status = result.failCount > 0 ? 'failed' : 'done';
+  const finishedJob = {
+    ...job,
+    status,
+    result,
+    finishedAt: Date.now()
+  };
+
+  archiveScheduledJob(ws, finishedJob);
+  removeScheduledJob(ws, job.id);
+  cleanupScheduledUploads(ws, job.id);
+}
+
+let scheduleTickRunning = false;
+setInterval(async () => {
+  if (scheduleTickRunning) return;
+  scheduleTickRunning = true;
+  try {
+    if (!fs.existsSync(WORKSPACES_DIR)) return;
+    const wsList = fs.readdirSync(WORKSPACES_DIR).filter((name) => {
+      const full = path.join(WORKSPACES_DIR, name);
+      return fs.existsSync(full) && fs.statSync(full).isDirectory();
+    });
+
+    for (const ws of wsList) {
+      const list = loadScheduledJobs(ws);
+      const now = Date.now();
+      const due = list.filter(job => job.status === 'pending' && job.runAt <= now);
+      if (!due.length) continue;
+
+      for (const job of due) {
+        const currentList = loadScheduledJobs(ws);
+        const currentJob = currentList.find(j => j.id === job.id);
+        if (!currentJob) continue;
+        const updated = { ...currentJob, status: 'running', startedAt: Date.now() };
+        const next = currentList.map(j => (j.id === job.id ? updated : j));
+        saveScheduledJobs(ws, next);
+        await executeScheduledJob(ws, updated);
+      }
+    }
+  } finally {
+    scheduleTickRunning = false;
+  }
+}, 1000);
 
 server.listen(3001, () => console.log('wa-gateway http://127.0.0.1:3001'));
