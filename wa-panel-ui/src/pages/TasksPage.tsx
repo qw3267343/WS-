@@ -809,18 +809,33 @@ export default function TasksPage() {
     fd.append("text", text);
     files.forEach((f) => fd.append("files", f, f.name));
 
-    try {
-      await http.post("/api/schedules", fd);
-      setScheduleOpen(false);
-      setText("");
-      setFiles([]);
-      const r = await http.get("/api/schedules");
-      setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
-      message.success(`已安排：${minutes}分钟后发送`);
-    } catch (e: any) {
-      message.error(`定时任务创建失败：${e?.response?.data?.error || e.message}`);
+  try {
+    // 1) 创建（后端应返回创建后的 job）
+    const resp = await http.post("/api/schedules", fd);
+    const created = (resp.data?.data || resp.data?.job || job) as ScheduledJob;
+
+    // 2) 立刻插入本地列表（避免必须刷新才看到）
+    if (created) {
+      setScheduledJobs(prev => {
+        const rest = prev.filter(x => x.id !== created.id);
+        return [created, ...rest];
+      });
     }
+
+    // 3) 关闭弹窗 & 清空输入
+    setScheduleOpen(false);
+    setText("");
+    setFiles([]);
+
+    // 4) 可选：再拉一次全量，保证与后端一致（如果你后端会补字段/排序）
+    // const r = await http.get("/api/schedules");
+    // setScheduledJobs((r.data?.data || []) as ScheduledJob[]);
+
+    message.success(`已安排：${minutes}分钟后发送`);
+  } catch (e: any) {
+    message.error(`定时任务创建失败：${e?.response?.data?.error || e.message}`);
   }
+
 
   async function doSendNow() {
     if (!activeRole) return message.error("请先选择一个角色");
