@@ -843,6 +843,7 @@ export default function TasksPage() {
                         height: INPUT_AREA_H,
                         display: "flex",
                         flexDirection: "column",
+                        overflow: "hidden",
                       }}
                     >
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -866,22 +867,39 @@ export default function TasksPage() {
                           padding: "12px",
                           lineHeight: 1.5,
                           height: "auto",
+                          flex: 1,
+                          minHeight: 0,
+                          overflow: "auto",
                         }}
-                        autoSize={{ minRows: 5, maxRows: 8 }}
                       />
 
                       {files.length > 0 && (
-                        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                        <div
+                          style={{
+                            marginTop: 10,
+                            paddingTop: 10,
+                            borderTop: "1px dashed #eee",
+                            display: "flex",
+                            gap: 8,
+                            overflowX: "auto",
+                            overflowY: "hidden",
+                            whiteSpace: "nowrap",
+                            flex: "0 0 auto",
+                            scrollbarWidth: "thin",
+                          }}
+                        >
                           {previews.map((p, idx) => (
                             <div
                               key={p.key}
                               style={{
-                                width: 140,
+                                flex: "0 0 auto",
+                                width: 96,
                                 border: "1px solid #eee",
-                                borderRadius: 8,
+                                borderRadius: 10,
                                 padding: 8,
                                 background: "#fff",
                                 position: "relative",
+                                boxShadow: "0 1px 4px rgba(0, 0, 0, 0.06)",
                               }}
                             >
                               <Button
@@ -900,9 +918,9 @@ export default function TasksPage() {
                                 }}
                               />
                               {p.isImg ? (
-                                <img src={p.url} style={{ width: "100%", height: 80, objectFit: "cover", borderRadius: 6 }} />
+                                <img src={p.url} style={{ width: "100%", height: 64, objectFit: "cover", borderRadius: 8 }} />
                               ) : (
-                                <div style={{ height: 80, display: "flex", alignItems: "center", justifyContent: "center", background: "#fafafa", borderRadius: 6 }}>
+                                <div style={{ height: 64, display: "flex", alignItems: "center", justifyContent: "center", background: "#fafafa", borderRadius: 8 }}>
                                   <span style={{ color: "#666" }}>VIDEO</span>
                                 </div>
                               )}
