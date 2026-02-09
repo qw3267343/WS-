@@ -1646,25 +1646,18 @@ export default function TasksPage() {
                       width: "100%",
                       height: inputAreaH,
                       display: "flex",
-                      flexDirection: "column",
-                      overflow: "hidden"
+                      flexDirection: "column"
                     }}
-                    bodyStyle={{ padding: 16, flex: 1, overflow: "hidden" }}
+                    bodyStyle={{ padding: 16, flex: 1, overflowY: "auto", minHeight: 0 }}
                   >
-                    <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%" }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                         <Typography.Text style={{ fontWeight: 600 }}>当前角色：</Typography.Text>
                         <div style={{ border: "1px solid #f0f0f0", borderRadius: 8, padding: 12, background: "#fafafa" }}>
                           <div style={{ fontWeight: 600, fontSize: 14 }}>
                             {activeRole ? `${activeRole.remark} - ${activeRole.name || "未知"}` : "未选择"}
                           </div>
-                          {activeRole?.boundSlot ? (
-                            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
-                              <Tag color={getAccText(activeRole.boundSlot).color as any}>
-                                {getAccText(activeRole.boundSlot).text}
-                              </Tag>
-                            </div>
-                          ) : (
+                          {!activeRole?.boundSlot && (
                             <div style={{ marginTop: 6, color: "#999" }}>未绑定账号</div>
                           )}
                         </div>
@@ -1678,31 +1671,79 @@ export default function TasksPage() {
 
                       <div style={{ borderTop: "1px solid #f0f0f0" }} />
 
-                      <Button
-                        type="primary"
-                        block
-                        disabled={!canSend}
-                        onClick={async () => {
-                          if (!activeRole) return message.error("请先选择一个角色");
-                          const hasContent = (text && text.trim().length > 0) || files.length > 0;
-                          if (!hasContent) return message.error("内容或附件至少要有一个");
+                      <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
+                        <Button
+                          type="primary"
+                          block
+                          disabled={!canSend}
+                          onClick={async () => {
+                            if (!activeRole) return message.error("请先选择一个角色");
+                            const hasContent = (text && text.trim().length > 0) || files.length > 0;
+                            if (!hasContent) return message.error("内容或附件至少要有一个");
 
-                          if (mode === "enabled_groups") {
-                            await sendAllEnabledGroupsConcurrent();
-                            return;
-                          } else {
-                            const ok = await sendOne(singleTo.trim());
-                            if (ok) {
-                              setText("");
-                              setFiles([]);
+                            if (mode === "enabled_groups") {
+                              await sendAllEnabledGroupsConcurrent();
+                              return;
+                            } else {
+                              const ok = await sendOne(singleTo.trim());
+                              if (ok) {
+                                setText("");
+                                setFiles([]);
+                              }
+                              ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
                             }
-                            ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
-                          }
-                        }}
-                        style={{ height: 50, fontSize: 16 }}
-                      >
-                        立即发送
-                      </Button>
+                          }}
+                          style={{ height: 50, fontSize: 16 }}
+                        >
+                          立即发送
+                        </Button>
+
+                        <Button
+                          block
+                          disabled={!canSend}
+                          onClick={() => setScheduleOpen(true)}
+                          style={{ height: 40 }}
+                        >
+                          定时发送
+                        </Button>
+
+                        <Card
+                          size="small"
+                          title="定时任务"
+                          style={{ marginTop: 8 }}
+                          bodyStyle={{ padding: 10 }}
+                        >
+                          {activeScheduledJobs.length === 0 ? (
+                            <div style={{ fontSize: 12, color: "#999" }}>暂无待执行任务</div>
+                          ) : (
+                            <Space direction="vertical" style={{ width: "100%" }} size={8}>
+                              {activeScheduledJobs.map((job) => {
+                                const remainMs = job.fireAt - nowTs;
+                                const remainText = formatCountdown(remainMs);
+                                const targetText = job.mode === "enabled_groups" ? "启用群" : job.singleTo;
+                                const hintText =
+                                  job.status === "running"
+                                    ? `执行中 / 目标：${targetText}`
+                                    : `${Math.max(1, Math.ceil(remainMs / 60000))}分钟后发送 / 目标：${targetText}`;
+                                return (
+                                  <div key={job.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                                    <Tag color={job.status === "running" ? "blue" : "green"} style={{ marginRight: 0 }}>
+                                      OK
+                                    </Tag>
+                                    <div style={{ width: 50, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                                      {remainText}
+                                    </div>
+                                    <div style={{ flex: 1, fontSize: 12, color: "#555" }}>{hintText}</div>
+                                    <Button size="small" danger onClick={() => cancelScheduledJob(job)}>
+                                      取消
+                                    </Button>
+                                  </div>
+                                );
+                              })}
+                            </Space>
+                          )}
+                        </Card>
+                      </div>
 
                       <Button
                         block
