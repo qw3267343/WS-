@@ -900,6 +900,7 @@ export default function TasksPage() {
                 </Col>
 
                 <Col span={8} style={{ display: "flex" }}>
+
                   <Card
                     size="small"
                     style={{
@@ -914,6 +915,7 @@ export default function TasksPage() {
                     <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%" }}>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                         <Typography.Text style={{ fontWeight: 600 }}>当前角色</Typography.Text>
+
                         <Tag
                           color={activeRole?.boundSlot ? "blue" : "default"}
                           style={{
@@ -964,6 +966,7 @@ export default function TasksPage() {
 
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                         <Typography.Text style={{ fontWeight: 600 }}>发送控制</Typography.Text>
+
                         <Button
                           type="primary"
                           block
@@ -1012,6 +1015,7 @@ export default function TasksPage() {
                                   }}
                                 />
                               </div>
+
                             </div>
                           </div>
                         )}
