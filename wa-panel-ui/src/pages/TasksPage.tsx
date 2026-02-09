@@ -19,6 +19,7 @@ import type { MenuProps } from "antd";
 import { MoreOutlined, PlusOutlined, ReloadOutlined, DeleteOutlined, DragOutlined, CloseOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
+import { getWsId } from "../lib/workspace";
 import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
 import { loadGroups, loadRoles, saveRoles, uid } from "../lib/storage";
 
@@ -258,7 +259,7 @@ export default function TasksPage() {
       await refreshRoleNicknames();
     })();
 
-    const s = getSocket();
+    const s = getSocket(getWsId());
     const onStatus = (p: any) => {
       const slot = String(p?.slot || "").trim();
       if (!slot) return;

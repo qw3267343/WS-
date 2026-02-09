@@ -1,7 +1,9 @@
 export function getWsId(): string {
   const params = new URLSearchParams(window.location.search);
   const ws = (params.get("ws") || "").trim();
-  return ws || "default";
+  if (ws) return ws;
+  const saved = localStorage.getItem("wa_active_ws");
+  return (saved || "").trim() || "default";
 }
 
 export function wsKey(key: string): string {
