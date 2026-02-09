@@ -6,6 +6,7 @@ import {
   Col,
   Dropdown,
   Input,
+  InputNumber,
   Modal,
   Row,
   Select,
@@ -23,6 +24,8 @@ import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
 import { loadGroups, loadRoles, saveRoles, uid } from "../lib/storage";
 
 const K_HIS = "wa_send_history_v2";
+const K_SCHEDULED_JOBS = "wa_scheduled_jobs_v1";
+const K_SCHEDULED_FILES = "wa_scheduled_files_v1";
 type HisItem = {
   id: string;
   ts: number;
@@ -59,11 +62,36 @@ type HisItem = {
   media?: { name: string; type: string; size: number }[];
 };
 
+type ScheduledJob = {
+  id: string;
+  createdAt: number;
+  fireAt: number;
+  roleId: string;
+  mode: "enabled_groups" | "single_group" | "single_contact";
+  singleTo: string;
+  text: string;
+  filesMeta?: { name: string; type: string; size: number }[];
+  filesCacheKey?: string;
+  status: "pending" | "running" | "done" | "cancelled";
+  lastErr?: string;
+};
+
+type ScheduledFile = { name: string; type: string; b64: string };
+
 function loadHis(): HisItem[] {
   try { return JSON.parse(localStorage.getItem(wsKey(K_HIS)) || "[]"); } catch { return []; }
 }
 function saveHis(arr: HisItem[]) {
   localStorage.setItem(wsKey(K_HIS), JSON.stringify(arr.slice(-500)));
+}
+function loadScheduledJobs(): ScheduledJob[] {
+  try { return JSON.parse(localStorage.getItem(wsKey(K_SCHEDULED_JOBS)) || "[]"); } catch { return []; }
+}
+function saveScheduledJobs(arr: ScheduledJob[]) {
+  localStorage.setItem(wsKey(K_SCHEDULED_JOBS), JSON.stringify(arr));
+}
+function scheduledFilesKey(jobId: string) {
+  return wsKey(`${K_SCHEDULED_FILES}:${jobId}`);
 }
 function fmtTime(ts: number) {
   const d = new Date(ts);
@@ -83,6 +111,28 @@ function humanSize(n: number) {
   if (n >= mb) return (n / mb).toFixed(1) + "MB";
   if (n >= kb) return (n / kb).toFixed(1) + "KB";
   return n + "B";
+}
+
+function base64ToFile(entry: ScheduledFile): File {
+  const binary = atob(entry.b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new File([bytes], entry.name, { type: entry.type });
+}
+
+function fileToBase64(file: File): Promise<ScheduledFile> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const b64 = result.includes(",") ? result.split(",")[1] : result;
+      resolve({ name: file.name, type: file.type || "application/octet-stream", b64 });
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 type AccRow = WaAccountRow & {
@@ -139,6 +189,12 @@ export default function TasksPage() {
 
   const [history, setHistory] = useState<HisItem[]>(() => loadHis());
   const hisBottomRef = useRef<HTMLDivElement>(null);
+
+  const [scheduledJobs, setScheduledJobs] = useState<ScheduledJob[]>(() => loadScheduledJobs());
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleMinutes, setScheduleMinutes] = useState(5);
+  const [nowTs, setNowTs] = useState(Date.now());
+  const scheduledJobsRef = useRef<ScheduledJob[]>(scheduledJobs);
 
   // 角色编辑弹窗
   const [roleModal, setRoleModal] = useState<{ open: boolean; editing?: Role | null }>({ open: false });
@@ -331,6 +387,30 @@ export default function TasksPage() {
     hisBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [history.length]);
 
+  useEffect(() => {
+    saveScheduledJobs(scheduledJobs);
+  }, [scheduledJobs]);
+
+  useEffect(() => {
+    scheduledJobsRef.current = scheduledJobs;
+  }, [scheduledJobs]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setNowTs(now);
+      const due = scheduledJobsRef.current.filter(
+        job => job.status === "pending" && job.fireAt <= now
+      );
+      if (!due.length) return;
+      for (const job of due) {
+        updateScheduledJob(job.id, j => ({ ...j, status: "running" }));
+        void executeScheduledJob({ ...job, status: "running" });
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   function getAccText(slot?: string) {
     if (!slot) return { text: "未绑定", color: "default" as const };
     const a = accounts.find(x => x.slot === slot);
@@ -397,6 +477,62 @@ export default function TasksPage() {
     });
   }
 
+  function startBatchHistorySnapshot(args: {
+    batchId: string;
+    roleRemark: string;
+    roleName: string;
+    slot: string;
+    text: string;
+    total: number;
+    mediaMeta?: { name: string; type: string; size: number }[];
+  }) {
+    pushHistory({
+      id: args.batchId,
+      ts: Date.now(),
+      lastTs: Date.now(),
+      kind: "batch",
+      roleRemark: args.roleRemark,
+      roleName: args.roleName,
+      slot: args.slot,
+      mode: "enabled_groups",
+      text: args.text,
+      ok: false,
+      running: true,
+      total: args.total,
+      okCount: 0,
+      failCount: 0,
+      media: args.mediaMeta?.length ? args.mediaMeta : undefined
+    });
+  }
+
+  function pushSingleHistorySnapshot(args: {
+    roleRemark: string;
+    roleName: string;
+    slot?: string;
+    mode: "single_group" | "single_contact";
+    to: string;
+    text: string;
+    ok: boolean;
+    lastErr?: string;
+    mediaMeta?: { name: string; type: string; size: number }[];
+  }) {
+    pushHistory({
+      id: newId(),
+      ts: Date.now(),
+      lastTs: Date.now(),
+      kind: "single",
+      roleRemark: args.roleRemark,
+      roleName: args.roleName,
+      slot: args.slot,
+      mode: args.mode,
+      to: args.to,
+      text: args.text,
+      ok: args.ok,
+      lastErr: args.lastErr,
+      media: args.mediaMeta?.length ? args.mediaMeta : undefined
+    });
+  }
+
   function addFiles(list: File[]) {
     if (!list.length) return;
     const merged = [...files, ...list];
@@ -440,6 +576,92 @@ export default function TasksPage() {
     fd.append("caption", text || "");
     files.forEach(f => fd.append("files", f, f.name));
     await http.post(`/api/accounts/${slot}/sendMedia`, fd);
+  }
+
+  async function sendTextSnapshot(slot: string, to: string, payloadText: string) {
+    await http.post(`/api/accounts/${slot}/send`, { to, text: payloadText });
+  }
+
+  async function sendMediaSnapshot(slot: string, to: string, payloadText: string, payloadFiles: File[]) {
+    const fd = new FormData();
+    fd.append("to", to);
+    fd.append("caption", payloadText || "");
+    payloadFiles.forEach(f => fd.append("files", f, f.name));
+    await http.post(`/api/accounts/${slot}/sendMedia`, fd);
+  }
+
+  async function sendOneSnapshot(args: {
+    slot: string;
+    to: string;
+    text: string;
+    files: File[];
+    roleRemark: string;
+    roleName: string;
+    mode: "single_group" | "single_contact";
+    batchId?: string;
+  }) {
+    const mediaMeta = args.files.map(f => ({ name: f.name, type: f.type || "unknown", size: f.size }));
+    try {
+      if (args.files.length) await sendMediaSnapshot(args.slot, args.to, args.text, args.files);
+      else await sendTextSnapshot(args.slot, args.to, args.text);
+
+      if (args.batchId) {
+        patchHistory(args.batchId, h => {
+          const okCount = (h.okCount || 0) + 1;
+          const failCount = h.failCount || 0;
+          return {
+            ...h,
+            okCount,
+            failCount,
+            lastTs: Date.now(),
+            ok: false
+          };
+        });
+        return true;
+      }
+
+      pushSingleHistorySnapshot({
+        roleRemark: args.roleRemark,
+        roleName: args.roleName,
+        slot: args.slot,
+        mode: args.mode,
+        to: args.to,
+        text: args.text,
+        ok: true,
+        mediaMeta
+      });
+      return true;
+    } catch (e: any) {
+      const err = e?.response?.data?.error || e.message;
+      if (args.batchId) {
+        patchHistory(args.batchId, h => {
+          const okCount = h.okCount || 0;
+          const failCount = (h.failCount || 0) + 1;
+          return {
+            ...h,
+            okCount,
+            failCount,
+            lastErr: err,
+            lastTs: Date.now(),
+            ok: false
+          };
+        });
+        return false;
+      }
+
+      pushSingleHistorySnapshot({
+        roleRemark: args.roleRemark,
+        roleName: args.roleName,
+        slot: args.slot,
+        mode: args.mode,
+        to: args.to,
+        text: args.text,
+        ok: false,
+        lastErr: err,
+        mediaMeta
+      });
+      return false;
+    }
   }
 
   async function sendOne(to: string, opt?: { batchId?: string }) {
@@ -720,6 +942,217 @@ export default function TasksPage() {
     return singleTo.trim().length > 0;
   }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo, sending]);
   const showHint = !text.trim() && files.length === 0;
+
+  function formatCountdown(ms: number) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n: number) => String(n).padStart(2, "0");
+    if (h > 0) return `${pad(h)}:${pad(m)}`;
+    return `${pad(m)}:${pad(s)}`;
+  }
+
+  function updateScheduledJob(id: string, updater: (job: ScheduledJob) => ScheduledJob) {
+    setScheduledJobs(prev => prev.map(j => (j.id === id ? updater(j) : j)));
+  }
+
+  function removeScheduledFiles(cacheKey?: string) {
+    if (cacheKey) localStorage.removeItem(cacheKey);
+  }
+
+  async function executeScheduledJob(job: ScheduledJob) {
+    const role = roleMap.get(job.roleId);
+    if (!role || !role.boundSlot) {
+      updateScheduledJob(job.id, j => ({
+        ...j,
+        status: "done",
+        lastErr: "角色未绑定账号或已不存在"
+      }));
+      pushSingleHistorySnapshot({
+        roleRemark: role?.remark || "未知",
+        roleName: role?.name || "未知",
+        slot: role?.boundSlot,
+        mode: job.mode === "single_contact" ? "single_contact" : "single_group",
+        to: job.singleTo,
+        text: job.text,
+        ok: false,
+        lastErr: "角色未绑定账号或已不存在",
+        mediaMeta: job.filesMeta
+      });
+      removeScheduledFiles(job.filesCacheKey);
+      return;
+    }
+
+    let payloadFiles: File[] = [];
+    if (job.filesCacheKey) {
+      try {
+        const raw = localStorage.getItem(job.filesCacheKey);
+        const parsed = raw ? (JSON.parse(raw) as ScheduledFile[]) : [];
+        payloadFiles = parsed.map(base64ToFile);
+      } catch {
+        payloadFiles = [];
+      }
+    }
+
+    const hasContent = (job.text && job.text.trim().length > 0) || payloadFiles.length > 0;
+    if (!hasContent) {
+      updateScheduledJob(job.id, j => ({
+        ...j,
+        status: "done",
+        lastErr: "内容或附件为空"
+      }));
+      pushSingleHistorySnapshot({
+        roleRemark: role.remark,
+        roleName: role.name || "未知",
+        slot: role.boundSlot,
+        mode: job.mode === "single_contact" ? "single_contact" : "single_group",
+        to: job.singleTo,
+        text: job.text,
+        ok: false,
+        lastErr: "内容或附件为空",
+        mediaMeta: job.filesMeta
+      });
+      removeScheduledFiles(job.filesCacheKey);
+      return;
+    }
+
+    if (job.mode === "enabled_groups") {
+      if (!enabledGroups.length) {
+        updateScheduledJob(job.id, j => ({
+          ...j,
+          status: "done",
+          lastErr: "没有启用的群"
+        }));
+        pushHistory({
+          id: job.id,
+          ts: Date.now(),
+          lastTs: Date.now(),
+          kind: "batch",
+          roleRemark: role.remark,
+          roleName: role.name || "未知",
+          slot: role.boundSlot,
+          mode: "enabled_groups",
+          text: job.text,
+          ok: false,
+          running: false,
+          total: 0,
+          okCount: 0,
+          failCount: 0,
+          lastErr: "没有启用的群",
+          media: job.filesMeta?.length ? job.filesMeta : undefined
+        });
+        removeScheduledFiles(job.filesCacheKey);
+        return;
+      }
+
+      startBatchHistorySnapshot({
+        batchId: job.id,
+        roleRemark: role.remark,
+        roleName: role.name || "未知",
+        slot: role.boundSlot,
+        text: job.text,
+        total: enabledGroups.length,
+        mediaMeta: job.filesMeta
+      });
+
+      const results = await runPool(
+        enabledGroups,
+        async (g) => {
+          await sleep(120);
+          return sendOneSnapshot({
+            slot: role.boundSlot as string,
+            to: g.id,
+            text: job.text,
+            files: payloadFiles,
+            roleRemark: role.remark,
+            roleName: role.name || "未知",
+            mode: "single_group",
+            batchId: job.id
+          });
+        },
+        SEND_CONCURRENCY
+      );
+
+      finalizeBatchHistory(job.id);
+      const allOk = results.every(Boolean);
+      updateScheduledJob(job.id, j => ({
+        ...j,
+        status: "done",
+        lastErr: allOk ? undefined : "部分群发送失败"
+      }));
+      removeScheduledFiles(job.filesCacheKey);
+      return;
+    }
+
+    const ok = await sendOneSnapshot({
+      slot: role.boundSlot as string,
+      to: job.singleTo,
+      text: job.text,
+      files: payloadFiles,
+      roleRemark: role.remark,
+      roleName: role.name || "未知",
+      mode: job.mode === "single_contact" ? "single_contact" : "single_group"
+    });
+
+    updateScheduledJob(job.id, j => ({
+      ...j,
+      status: "done",
+      lastErr: ok ? undefined : "发送失败"
+    }));
+    removeScheduledFiles(job.filesCacheKey);
+  }
+
+  async function createScheduledJob() {
+    if (!activeRole) return message.error("请先选择一个角色");
+    if (!activeRole.boundSlot) return message.error("该角色未绑定账号，请先绑定账号");
+
+    const hasContent = (text && text.trim().length > 0) || files.length > 0;
+    if (!hasContent) return message.error("内容或附件至少要有一个");
+    if (mode === "enabled_groups" && !enabledGroups.length) return message.error("没有启用的群");
+    if (mode !== "enabled_groups" && !singleTo.trim()) return message.error("请输入目标");
+
+    const minutes = Math.max(1, Math.min(1440, scheduleMinutes || 1));
+    const id = newId();
+    let filesCacheKey: string | undefined;
+    let filesMeta: { name: string; type: string; size: number }[] | undefined;
+
+    if (files.length) {
+      filesMeta = files.map(f => ({ name: f.name, type: f.type || "unknown", size: f.size }));
+      const entries = await Promise.all(files.map(fileToBase64));
+      filesCacheKey = scheduledFilesKey(id);
+      localStorage.setItem(filesCacheKey, JSON.stringify(entries));
+    }
+
+    const job: ScheduledJob = {
+      id,
+      createdAt: Date.now(),
+      fireAt: Date.now() + minutes * 60 * 1000,
+      roleId: activeRole.id,
+      mode,
+      singleTo: singleTo.trim(),
+      text,
+      filesMeta,
+      filesCacheKey,
+      status: "pending"
+    };
+
+    setScheduledJobs(prev => [job, ...prev]);
+    setScheduleOpen(false);
+    message.success(`已安排：${minutes}分钟后发送`);
+  }
+
+  const activeScheduledJobs = useMemo(() => {
+    return scheduledJobs
+      .filter(j => j.status === "pending" || j.status === "running")
+      .sort((a, b) => a.fireAt - b.fireAt)
+      .slice(0, 5);
+  }, [scheduledJobs]);
+
+  function cancelScheduledJob(job: ScheduledJob) {
+    updateScheduledJob(job.id, j => ({ ...j, status: "cancelled" }));
+    removeScheduledFiles(job.filesCacheKey);
+  }
 
   // 绑定弹窗 options（来自 accounts）
   const bindOptions = useMemo(() => {
@@ -1271,6 +1704,52 @@ export default function TasksPage() {
                         立即发送
                       </Button>
 
+                      <Button
+                        block
+                        disabled={!canSend}
+                        onClick={() => setScheduleOpen(true)}
+                        style={{ height: 40 }}
+                      >
+                        定时发送
+                      </Button>
+
+                      <Card
+                        size="small"
+                        title="定时任务"
+                        style={{ marginTop: 8 }}
+                        bodyStyle={{ padding: 10 }}
+                      >
+                        {activeScheduledJobs.length === 0 ? (
+                          <div style={{ fontSize: 12, color: "#999" }}>暂无待执行任务</div>
+                        ) : (
+                          <Space direction="vertical" style={{ width: "100%" }} size={8}>
+                            {activeScheduledJobs.map((job) => {
+                              const remainMs = job.fireAt - nowTs;
+                              const remainText = formatCountdown(remainMs);
+                              const targetText = job.mode === "enabled_groups" ? "启用群" : job.singleTo;
+                              const hintText =
+                                job.status === "running"
+                                  ? `执行中 / 目标：${targetText}`
+                                  : `${Math.max(1, Math.ceil(remainMs / 60000))}分钟后发送 / 目标：${targetText}`;
+                              return (
+                                <div key={job.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                                  <Tag color={job.status === "running" ? "blue" : "green"} style={{ marginRight: 0 }}>
+                                    OK
+                                  </Tag>
+                                  <div style={{ width: 50, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                                    {remainText}
+                                  </div>
+                                  <div style={{ flex: 1, fontSize: 12, color: "#555" }}>{hintText}</div>
+                                  <Button size="small" danger onClick={() => cancelScheduledJob(job)}>
+                                    取消
+                                  </Button>
+                                </div>
+                              );
+                            })}
+                          </Space>
+                        )}
+                      </Card>
+
                       {mode === "enabled_groups" && enabledGroups.length > 0 && (
                         <div style={{ marginTop: 12, textAlign: "center" }}>
                           <Typography.Text type="secondary">
@@ -1306,6 +1785,31 @@ export default function TasksPage() {
         </Col>
       </Row>
 
+      <Modal
+        title="定时发送"
+        open={scheduleOpen}
+        onCancel={() => setScheduleOpen(false)}
+        onOk={() => void createScheduledJob()}
+        okText="确认"
+        cancelText="取消"
+      >
+        <Space direction="vertical" style={{ width: "100%" }}>
+          <div>
+            <Typography.Text>X 分钟后</Typography.Text>
+            <InputNumber
+              min={1}
+              max={1440}
+              step={1}
+              value={scheduleMinutes}
+              onChange={(v) => setScheduleMinutes(Number(v || 1))}
+              style={{ width: "100%", marginTop: 6 }}
+            />
+          </div>
+          <Typography.Text type="secondary">
+            将使用当前角色/当前模式/当前内容/当前附件执行一次发送
+          </Typography.Text>
+        </Space>
+      </Modal>
 
       {/* ✅ 绑定/替换账号弹窗（任意角色都可随意换到任何 Axx） */}
       <Modal

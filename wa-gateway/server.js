@@ -481,6 +481,34 @@ app.get('/api/accounts', (req, res) => {
   });
 });
 
+app.get('/api/accounts/:slot/groups', async (req, res) => {
+  try {
+    const ws = getWs(req);
+    const { clients, statuses } = ctx(ws);
+    const slot = normalizeSlot(req.params.slot);
+
+    const client = clients.get(slot);
+    const st = statuses.get(slot)?.status;
+
+    if (!client) return res.status(400).json({ ok: false, error: 'client not initialized' });
+    if (st !== 'READY') return res.status(400).json({ ok: false, error: `slot not READY: ${st}` });
+
+    const chats = await client.getChats();
+    const groups = (chats || [])
+      .filter(c => c && c.isGroup && String(c?.id?._serialized || '').endsWith('@g.us'))
+      .map(c => {
+        const id = String(c.id._serialized);
+        const name = String(c.name || c.formattedTitle || 'Group');
+        return { id, name };
+      })
+      .sort((a, b) => String(a.name).localeCompare(String(b.name), 'zh-Hans-CN', { numeric: true }));
+
+    return res.json({ ok: true, data: groups });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 // 兼容：若你还在别处用 /api/accounts/profiles
 app.get('/api/accounts/profiles', (req, res) => {
   const ws = getWs(req);
