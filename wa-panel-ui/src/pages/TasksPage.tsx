@@ -74,7 +74,6 @@ type ScheduledJob = {
   targets: string[];
   text: string;
   status: "pending" | "running" | "done" | "cancelled" | "failed";
-  roleName?: string;
   createdAt?: number;
   startedAt?: number;
   finishedAt?: number;
@@ -84,9 +83,6 @@ type ScheduledJob = {
     failCount: number;
     lastErr?: string | null;
   };
-  attachments?: { id: string; name: string; type: string; path: string }[];
-  ws?: string;
-  lastErr?: string;
 };
 
 function loadHis(): HisItem[] {
@@ -160,6 +156,7 @@ export default function TasksPage() {
   const [mode, setMode] = useState<"enabled_groups" | "single_group" | "single_contact">("enabled_groups");
   const [singleTo, setSingleTo] = useState("");
   const [text, setText] = useState("");
+  const [composing, setComposing] = useState(false);
   const [inputAreaH, setInputAreaH] = useState(BASE_INPUT_AREA_H);
 
   const [runIdx, setRunIdx] = useState(0);
@@ -437,7 +434,10 @@ export default function TasksPage() {
           const updated: HisItem = {
             ...item,
             status,
-            roleName: item.roleName || activeJob.roleName,
+
+            // ✅ 关键：永远用“角色备注”来显示（admin/老师/助理…）
+            // 旧数据如果没有 roleRemark，就退回 item.roleName
+            roleRemark: (item.roleRemark || item.roleName || "未知角色").trim(),
 
             runAt: activeJob.runAt ?? item.runAt,
             total: item.total ?? activeJob.targets?.length ?? item.total,
@@ -459,7 +459,9 @@ export default function TasksPage() {
             ok,
             okCount,
             total,
-            roleName: item.roleName || archivedJob.roleName,
+
+            // ✅ 同样：只用角色备注（不碰 archivedJob.roleName）
+            roleRemark: (item.roleRemark || item.roleName || "未知角色").trim(),
 
             lastErr: archivedJob.result?.lastErr ?? item.lastErr,
             lastTs: archivedJob.finishedAt ?? item.lastTs
@@ -485,12 +487,22 @@ export default function TasksPage() {
     });
   }
 
+
   function newId() {
     return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   }
 
   function getRoleNameForHistory(role?: Role | null) {
-    return role?.name ?? role?.id ?? "未知角色";
+    const remark = String(role?.remark || "").trim();
+    if (remark) return remark;
+
+    const name = String(role?.name || "").trim();
+    if (name) return name;
+
+    const id = String(role?.id || "").trim();
+    if (id) return id;
+
+    return "未知角色";
   }
 
   function startBatchHistory(batchId: string, total: number) {
@@ -503,8 +515,7 @@ export default function TasksPage() {
       ts: Date.now(),
       lastTs: Date.now(),
       kind: "batch",
-      roleRemark: activeRole.remark,
-      roleName: getRoleNameForHistory(activeRole),
+      roleRemark: (activeRole.remark || "").trim() || "未知角色", // ✅ 用备注：admin/老师...
       slot: activeRole.boundSlot,
       mode: "enabled_groups",
       text,
@@ -553,15 +564,6 @@ export default function TasksPage() {
     if (got.length) {
       e.preventDefault();
       addFiles(got);
-    }
-  }
-
-  async function connectSlot(slot: string) {
-    try {
-      await http.post(`/api/accounts/${slot}/connect`);
-      message.success("已触发连接/扫码（等待二维码）");
-    } catch (e: any) {
-      message.error("连接失败：" + (e?.response?.data?.error || e.message));
     }
   }
 
@@ -1293,7 +1295,7 @@ export default function TasksPage() {
                           : { text: "NO", color: "red" };
 
                     const timeText = fmtTime(h.lastTs || h.ts);
-                    const roleLabel = h.roleName || h.roleRemark || "未知角色";
+                    const roleLabel = (h.roleRemark || "").trim() || "未知角色";
                     const total = h.total || 0;
                     const okCount = h.okCount || 0;
                     const countdown = h.runAt ? formatCountdown(h.runAt - nowTs) : "--:--";
@@ -1346,7 +1348,7 @@ export default function TasksPage() {
                                     display: "-webkit-box",
                                     WebkitLineClamp: 3,
                                     WebkitBoxOrient: "vertical",
-                                    overflow: "hidden"
+                                    overflow: "hidden",
                                   }
                                 : {})
                             }}
@@ -1453,9 +1455,11 @@ export default function TasksPage() {
                         value={text}
                         onChange={(e) => setText(e.target.value)}
                         onPaste={onPasteFiles}
+                        onCompositionStart={() => setComposing(true)}
+                        onCompositionEnd={() => setComposing(false)}
                         onKeyDown={(e) => {
-                          const isComposing = e.nativeEvent.isComposing || e.isComposing;
-                          if (e.key === "Enter" && !e.shiftKey && !isComposing) {
+                          const nativeComposing = Boolean((e.nativeEvent as any)?.isComposing);
+                          if (e.key === "Enter" && !e.shiftKey && !composing && !nativeComposing) {
                             e.preventDefault();
                             void doSendNow();
                           }
