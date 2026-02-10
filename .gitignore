@@ -44,3 +44,14 @@ electron/release/
 
 # WAStack local user data (不要提交)
 **/@ws-manager/
+
+# Bundled node (do not commit)
+electron/vendor/node/
+
+# Electron outputs & deps
+electron/dist/
+electron/release/
+electron/node_modules/
+# Bundled node (do not commit)
+electron/vendor/node/
+
