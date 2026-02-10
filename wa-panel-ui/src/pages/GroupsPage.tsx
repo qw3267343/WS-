@@ -16,15 +16,12 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { GroupTarget } from "../lib/types";
-import { loadGroups, saveGroups } from "../lib/storage";
 import { withWs, getWsId } from "../lib/workspace";
 import { http } from "../lib/api";
-
 
 type ResolveResp =
   | { ok: true; data: { slot?: string; id: string; name: string } }
   | { ok: false; error?: string };
-
 
 function normalizeLink(s: string) {
   const v = (s || "").trim();
@@ -55,15 +52,35 @@ async function postJSON<T>(url: string, body: any): Promise<T> {
 }
 
 export default function GroupsPage() {
-  const [rows, setRows] = useState<GroupTarget[]>(() => loadGroups());
+  const [rows, setRows] = useState<GroupTarget[]>([]);
+  const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<GroupTarget | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
 
+  async function loadGroups() {
+    setLoading(true);
+    try {
+      const r = await http.get("/api/groups");
+      setRows(Array.isArray(r.data?.rows) ? r.data.rows : []);
+    } catch (e: any) {
+      message.error("加载群数据失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveByBatch(nextRows: GroupTarget[]) {
+    const r = await http.post("/api/groups/batch", { rows: nextRows });
+    const latest = Array.isArray(r.data?.rows) ? r.data.rows : nextRows;
+    setRows(latest);
+    return latest;
+  }
+
   useEffect(() => {
-    saveGroups(rows);
-  }, [rows]);
+    void loadGroups();
+  }, []);
 
   const columns: ColumnsType<GroupTarget> = useMemo(
     () => [
@@ -74,11 +91,17 @@ export default function GroupsPage() {
         render: (_, r) => (
           <Switch
             checked={r.enabled}
-            onChange={(v) =>
-              setRows((prev) =>
-                prev.map((x) => (x.id === r.id ? { ...x, enabled: v } : x))
-              )
-            }
+            onChange={async (v) => {
+              try {
+                const resp = await http.put(`/api/groups/${encodeURIComponent(r.id)}`, {
+                  ...r,
+                  enabled: v,
+                });
+                setRows(Array.isArray(resp.data?.rows) ? resp.data.rows : []);
+              } catch (e: any) {
+                message.error("更新失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+              }
+            }}
           />
         ),
       },
@@ -123,9 +146,13 @@ export default function GroupsPage() {
               title="确认删除这个群？"
               okText="删除"
               cancelText="取消"
-              onConfirm={() =>
-                setRows((prev) => prev.filter((x) => x.id !== r.id))
-              }
+              onConfirm={async () => {
+                try {
+                  await saveByBatch(rows.filter((x) => x.id !== r.id));
+                } catch (e: any) {
+                  message.error("删除失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+                }
+              }}
             >
               <Button danger size="small">
                 删除
@@ -135,7 +162,7 @@ export default function GroupsPage() {
         ),
       },
     ],
-    []
+    [rows]
   );
 
   return (
@@ -144,7 +171,7 @@ export default function GroupsPage() {
         title="群（目标库）"
         extra={
           <Space>
-            <Button onClick={() => setRows(loadGroups())}>刷新</Button>
+            <Button onClick={loadGroups} loading={loading}>刷新</Button>
             <Button
               type="primary"
               onClick={() => {
@@ -168,6 +195,7 @@ export default function GroupsPage() {
           rowKey="id"
           columns={columns}
           dataSource={rows}
+          loading={loading}
           size="small"
           pagination={{ pageSize: 12 }}
         />
@@ -180,72 +208,76 @@ export default function GroupsPage() {
           setModalOpen(false);
           setEditing(null);
         }}
-        onOk={(g, originalId) => {
-          if (!/@g\.us$/.test(g.id)) return message.error("群ID 必须以 @g.us 结尾");
+        onOk={async (g, originalId) => {
+          if (!/@g\.us$/.test(g.id)) {
+            message.error("群ID 必须以 @g.us 结尾");
+            return;
+          }
 
-          setRows((prev) => {
-            let base = prev;
-            if (originalId && originalId !== g.id) {
-              base = prev.filter((x) => x.id !== originalId);
+          try {
+            if (originalId) {
+              const r = await http.put(`/api/groups/${encodeURIComponent(originalId)}`, g);
+              setRows(Array.isArray(r.data?.rows) ? r.data.rows : []);
+            } else {
+              const r = await http.post("/api/groups", g);
+              setRows(Array.isArray(r.data?.rows) ? r.data.rows : []);
             }
-
-            const idx = base.findIndex((x) => x.id === g.id);
-            if (idx >= 0) {
-              const next = [...base];
-              next[idx] = { ...next[idx], ...g };
-              return next;
-            }
-
-            return [{ ...g, enabled: true }, ...base];
-          });
-
-          setModalOpen(false);
-          setEditing(null);
+            setModalOpen(false);
+            setEditing(null);
+          } catch (e: any) {
+            message.error("保存失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+          }
         }}
       />
 
       <BatchAddGroupsModal
         open={batchOpen}
         onCancel={() => setBatchOpen(false)}
-        onAddMany={(items) => {
-          setRows((prev) => {
-            let next = prev.slice();
-            for (const g of items) {
-              if (!/@g\.us$/.test(g.id)) continue;
-              const idx = next.findIndex((x) => x.id === g.id);
-              if (idx >= 0) {
-                next[idx] = { ...next[idx], ...g, enabled: true };
-              } else {
-                next = [{ ...g, enabled: true }, ...next];
-              }
+        onAddMany={async (items) => {
+          let next = rows.slice();
+          for (const g of items) {
+            if (!/@g\.us$/.test(g.id)) continue;
+            const idx = next.findIndex((x) => x.id === g.id);
+            if (idx >= 0) {
+              next[idx] = { ...next[idx], ...g, enabled: true };
+            } else {
+              next = [{ ...g, enabled: true }, ...next];
             }
-            return next;
-          });
+          }
+
+          try {
+            await saveByBatch(next);
+          } catch (e: any) {
+            message.error("批量写入失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+          }
         }}
       />
 
       <ImportGroupsModal
         open={importOpen}
         onCancel={() => setImportOpen(false)}
-        onImport={(items, enabled) => {
-          setRows((prev) => {
-            let next = prev.slice();
-            for (const g of items) {
-              if (!/@g\.us$/.test(g.id)) continue;
-              const idx = next.findIndex((x) => x.id === g.id);
-              if (idx >= 0) {
-                next[idx] = {
-                  ...next[idx],
-                  name: g.name,
-                  link: g.link,
-                  enabled,
-                };
-              } else {
-                next = [{ ...g, enabled }, ...next];
-              }
+        onImport={async (items, enabled) => {
+          let next = rows.slice();
+          for (const g of items) {
+            if (!/@g\.us$/.test(g.id)) continue;
+            const idx = next.findIndex((x) => x.id === g.id);
+            if (idx >= 0) {
+              next[idx] = {
+                ...next[idx],
+                name: g.name,
+                link: g.link,
+                enabled,
+              };
+            } else {
+              next = [{ ...g, enabled }, ...next];
             }
-            return next;
-          });
+          }
+
+          try {
+            await saveByBatch(next);
+          } catch (e: any) {
+            message.error("导入写入失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+          }
         }}
       />
     </div>
@@ -256,7 +288,7 @@ function AddGroupModal(props: {
   open: boolean;
   editing: GroupTarget | null;
   onCancel: () => void;
-  onOk: (g: GroupTarget, originalId?: string) => void;
+  onOk: (g: GroupTarget, originalId?: string) => void | Promise<void>;
 }) {
   const [link, setLink] = useState("");
   const [resolving, setResolving] = useState(false);
@@ -330,7 +362,7 @@ function AddGroupModal(props: {
         if (!/@g\.us$/.test(gid)) return message.error("群ID 必须以 @g.us 结尾");
         if (!gname) return message.error("群名不能为空");
 
-        props.onOk(
+        void props.onOk(
           {
             id: gid,
             name: gname,
@@ -404,7 +436,7 @@ async function runPool<T>(
 function BatchAddGroupsModal(props: {
   open: boolean;
   onCancel: () => void;
-  onAddMany: (items: GroupTarget[]) => void;
+  onAddMany: (items: GroupTarget[]) => void | Promise<void>;
 }) {
   const [text, setText] = useState("");
   const [join, setJoin] = useState(true);
@@ -483,7 +515,7 @@ function BatchAddGroupsModal(props: {
     });
 
     if (out.length) {
-      props.onAddMany(out);
+      await props.onAddMany(out);
       message.success(`已写入 ${out.length} 条群记录`);
     } else {
       message.warning("没有成功解析的群");
@@ -596,7 +628,7 @@ type ImportGroupItem = { id: string; name: string };
 function ImportGroupsModal(props: {
   open: boolean;
   onCancel: () => void;
-  onImport: (items: GroupTarget[], enabled: boolean) => void;
+  onImport: (items: GroupTarget[], enabled: boolean) => void | Promise<void>;
 }) {
   const [accounts, setAccounts] = useState<AccountSummary[]>([]);
   const [slot, setSlot] = useState<string>("");
@@ -660,7 +692,7 @@ function ImportGroupsModal(props: {
     return groups.filter((g) => set.has(g.id));
   }, [groups, selectedKeys]);
 
-  function onImport() {
+  async function onImport() {
     if (!selectedItems.length) return message.warning("请先勾选要导入的群");
     const items: GroupTarget[] = selectedItems.map((g) => ({
       id: g.id,
@@ -670,7 +702,7 @@ function ImportGroupsModal(props: {
       note: undefined,
       tags: [],
     }));
-    props.onImport(items, enabled);
+    await props.onImport(items, enabled);
     message.success(`导入 ${items.length} 个群`);
   }
 

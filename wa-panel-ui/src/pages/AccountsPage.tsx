@@ -21,7 +21,6 @@ import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
 import { getWsId, wsKey } from "../lib/workspace";
 import type { Role, WaAccountRow } from "../lib/types";
-import { loadRoles } from "../lib/storage";
 
 function statusColor(s: string) {
   if (s === "READY") return "green";
@@ -56,7 +55,7 @@ type BatchResult =
 
 export default function AccountsPage() {
   const [rows, setRows] = useState<AccRow[]>([]);
-  const [roles, setRoles] = useState<Role[]>(() => loadRoles());
+  const [roles, setRoles] = useState<Role[]>([]);
   const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
   const [remarks, setRemarks] = useState<Record<string, string>>({});
   const [bindFilter, setBindFilter] = useState<"all" | "bound" | "unbound">("all");
@@ -77,8 +76,11 @@ export default function AccountsPage() {
   }, [remarksStorageKey]);
 
   async function refresh() {
-    const r = await http.get(`/api/accounts`);
-    const list = (r.data.data || []) as AccRow[];
+    const [accountsResp, rolesResp] = await Promise.all([
+      http.get(`/api/accounts`),
+      http.get(`/api/roles`),
+    ]);
+    const list = (accountsResp.data.data || []) as AccRow[];
 
     // 没账号时显示 A1 占位
     if (!list.length) {
@@ -87,7 +89,8 @@ export default function AccountsPage() {
       setRows(list);
     }
 
-    setRoles(loadRoles());
+    const roleList = Array.isArray(rolesResp.data?.roles) ? (rolesResp.data.roles as Role[]) : [];
+    setRoles(roleList);
   }
 
   useEffect(() => {

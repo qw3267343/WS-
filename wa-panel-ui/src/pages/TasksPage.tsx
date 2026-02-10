@@ -19,11 +19,10 @@ import type { MenuProps } from "antd";
 import { MoreOutlined, PlusOutlined, ReloadOutlined, DeleteOutlined, DragOutlined, CloseOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
-import { getWsId, wsKey } from "../lib/workspace";
+import { getWsId } from "../lib/workspace";
 import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
-import { loadGroups, loadRoles, saveRoles, uid } from "../lib/storage";
+import { loadGroups, uid } from "../lib/storage";
 
-const K_HIS = "wa_send_history_v2";
 type HisItem = {
   id: string;
   ts: number;
@@ -85,12 +84,6 @@ type ScheduledJob = {
   };
 };
 
-function loadHis(): HisItem[] {
-  try { return JSON.parse(localStorage.getItem(wsKey(K_HIS)) || "[]"); } catch { return []; }
-}
-function saveHis(arr: HisItem[]) {
-  localStorage.setItem(wsKey(K_HIS), JSON.stringify(arr.slice(-500)));
-}
 function fmtTime(ts: number) {
   const d = new Date(ts);
   const p2 = (n: number) => String(n).padStart(2, "0");
@@ -149,9 +142,9 @@ export default function TasksPage() {
   }
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
-  const [roles, setRoles] = useState<Role[]>(() => loadRoles());
+  const [roles, setRoles] = useState<Role[]>([]);
   const [groups, setGroups] = useState<GroupTarget[]>(() => loadGroups());
-  const [activeRoleId, setActiveRoleId] = useState<string | null>(roles[0]?.id || null);
+  const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
 
   const [mode, setMode] = useState<"enabled_groups" | "single_group" | "single_contact">("enabled_groups");
   const [singleTo, setSingleTo] = useState("");
@@ -165,7 +158,7 @@ export default function TasksPage() {
   const enabledGroups = useMemo(() => groups.filter(g => g.enabled), [groups]);
   const nextGroup = enabledGroups[runIdx] || null;
 
-  const [history, setHistory] = useState<HisItem[]>(() => loadHis());
+  const [history, setHistory] = useState<HisItem[]>([]);
   const hisBottomRef = useRef<HTMLDivElement>(null);
 
   const [scheduledJobs, setScheduledJobs] = useState<ScheduledJob[]>([]);
@@ -179,6 +172,9 @@ export default function TasksPage() {
   // ✅ 绑定/替换账号弹窗（新）
   const [bindModal, setBindModal] = useState<{ open: boolean; role: Role | null }>({ open: false, role: null });
   const [bindSlot, setBindSlot] = useState<string>("");
+
+  const rolesLoadedRef = useRef(false);
+  const rolesSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 媒体附件（图片/视频）
   const [files, setFiles] = useState<File[]>([]);
@@ -264,7 +260,6 @@ export default function TasksPage() {
       const [draggedRole] = newRoles.splice(draggedIndex, 1);
       newRoles.splice(targetIndex, 0, draggedRole);
       setRoles(newRoles);
-      saveRoles(newRoles);
       message.success("角色顺序已调整");
     }
 
@@ -288,6 +283,14 @@ export default function TasksPage() {
       return;
     }
     setAccounts(list);
+  }
+
+  async function refreshRoles() {
+    const r = await http.get("/api/roles");
+    const list = Array.isArray(r.data?.roles) ? (r.data.roles as Role[]) : [];
+    rolesLoadedRef.current = true;
+    setRoles(list);
+    setActiveRoleId((prev) => (prev && list.find((item) => item.id === prev) ? prev : (list[0]?.id || null)));
   }
 
   function slotLabel(a: AccRow) {
@@ -324,6 +327,7 @@ export default function TasksPage() {
 
   useEffect(() => {
     (async () => {
+      await refreshRoles();
       await refreshAccounts();
       await refreshRoleNicknames();
     })();
@@ -354,11 +358,43 @@ export default function TasksPage() {
   }, []);
 
   useEffect(() => {
-    saveRoles(roles);
     if (activeRoleId && !roles.find(r => r.id === activeRoleId)) {
       setActiveRoleId(roles[0]?.id || null);
     }
+  }, [roles, activeRoleId]);
+
+  useEffect(() => {
+    if (!rolesLoadedRef.current) return;
+    if (rolesSaveTimerRef.current) clearTimeout(rolesSaveTimerRef.current);
+    rolesSaveTimerRef.current = setTimeout(() => {
+      void http.post("/api/roles/batch", { roles }).catch((e: any) => {
+        message.error("保存角色失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+      });
+    }, 300);
+
+    return () => {
+      if (rolesSaveTimerRef.current) clearTimeout(rolesSaveTimerRef.current);
+    };
   }, [roles]);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const r = await http.get("/api/history", { params: { limit: 500 } });
+        if (!alive) return;
+        const rows = Array.isArray(r.data?.rows) ? (r.data.rows as HisItem[]) : [];
+        setHistory(rows);
+      } catch (e: any) {
+        if (!alive) return;
+        message.error("加载历史失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     hisBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -407,22 +443,28 @@ export default function TasksPage() {
   }
 
   function pushHistory(item: HisItem) {
-    setHistory(prev => {
-      const next = [...prev, item].slice(-500);
-      saveHis(next);
-      return next;
+    setHistory(prev => [...prev, item].slice(-500));
+    void http.post("/api/history/append", { row: item }).catch((e: any) => {
+      message.error("保存历史失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
     });
   }
 
   function patchHistory(id: string, updater: (h: HisItem) => HisItem) {
-    setHistory(prev => {
-      const next = prev.map(h => (h.id === id ? updater(h) : h));
-      saveHis(next);
-      return next;
+    let patchPayload: Partial<HisItem> | null = null;
+    setHistory(prev => prev.map(h => {
+      if (h.id !== id) return h;
+      const updated = updater(h);
+      patchPayload = updated;
+      return updated;
+    }));
+    if (!patchPayload) return;
+    void http.post("/api/history/patch", { id, patch: patchPayload }).catch((e: any) => {
+      message.error("更新历史失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
     });
   }
 
   function syncScheduledHistory(active: ScheduledJob[], historyList: ScheduledJob[]) {
+    const changedRows: HisItem[] = [];
     setHistory(prev => {
       let changed = false;
       const next = prev.map(item => {
@@ -443,7 +485,10 @@ export default function TasksPage() {
             total: item.total ?? activeJob.targets?.length ?? item.total,
             lastTs: status === "RUNNING" ? Date.now() : item.lastTs
           };
-          if (updated.status !== item.status || updated.runAt !== item.runAt) changed = true;
+          if (updated.status !== item.status || updated.runAt !== item.runAt) {
+            changed = true;
+            changedRows.push(updated);
+          }
           return updated;
         }
 
@@ -474,6 +519,7 @@ export default function TasksPage() {
             updated.lastErr !== item.lastErr
           ) {
             changed = true;
+            changedRows.push(updated);
           }
           return updated;
         }
@@ -481,9 +527,13 @@ export default function TasksPage() {
         return item;
       });
 
-      if (!changed) return prev;
-      saveHis(next);
-      return next;
+      return changed ? next : prev;
+    });
+
+    changedRows.forEach((row) => {
+      void http.post("/api/history/patch", { id: row.id, patch: row }).catch((e: any) => {
+        message.error("更新历史失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+      });
     });
   }
 
@@ -786,7 +836,6 @@ export default function TasksPage() {
           const [roleToMove] = newRoles.splice(index, 1);
           newRoles.unshift(roleToMove);
           setRoles(newRoles);
-          saveRoles(newRoles);
         }
       }
 
@@ -797,7 +846,6 @@ export default function TasksPage() {
           const [roleToMove] = newRoles.splice(index, 1);
           newRoles.push(roleToMove);
           setRoles(newRoles);
-          saveRoles(newRoles);
         }
       }
 
@@ -816,8 +864,7 @@ export default function TasksPage() {
     onClick: async ({ key }) => {
       if (key === "add") setRoleModal({ open: true, editing: null });
       if (key === "refresh") {
-        const reloaded = loadRoles();
-        setRoles(reloaded);
+        await refreshRoles();
         setGroups(loadGroups());
         await refreshAccounts();
         await refreshRoleNicknames();
@@ -827,7 +874,6 @@ export default function TasksPage() {
       if (key === "sort_by_name") {
         const newRoles = [...roles].sort((a, b) => a.remark.toLowerCase().localeCompare(b.remark.toLowerCase()));
         setRoles(newRoles);
-        saveRoles(newRoles);
         message.success("已按名称排序");
       }
 
@@ -842,7 +888,6 @@ export default function TasksPage() {
         };
         const newRoles = [...roles].sort((a, b) => score(a.boundSlot) - score(b.boundSlot));
         setRoles(newRoles);
-        saveRoles(newRoles);
         message.success("已按状态排序");
       }
     }
@@ -1004,13 +1049,18 @@ export default function TasksPage() {
   }
 
   function patchScheduledHistoryStatus(jobId: string, status: "WAITING" | "RUNNING" | "DONE" | "CANCELED") {
-    setHistory(prev => {
-      const next = prev.map(item => {
-        if (item.kind !== "scheduled" || item.jobId !== jobId) return item;
-        return { ...item, status, lastTs: Date.now() };
+    const now = Date.now();
+    const changedIds: string[] = [];
+    setHistory(prev => prev.map(item => {
+      if (item.kind !== "scheduled" || item.jobId !== jobId) return item;
+      changedIds.push(item.id);
+      return { ...item, status, lastTs: now };
+    }));
+
+    changedIds.forEach((id) => {
+      void http.post("/api/history/patch", { id, patch: { status, lastTs: now } }).catch((e: any) => {
+        message.error("更新历史失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
       });
-      saveHis(next);
-      return next;
     });
   }
 
@@ -1269,13 +1319,13 @@ export default function TasksPage() {
 
               <Card
                 size="small"
-                title="发送记录（本机存档）"
+                title="发送记录"
                 extra={
                   <Button
                     size="small"
                     danger
                     icon={<DeleteOutlined />}
-                    onClick={() => { setHistory([]); saveHis([]); }}
+                    onClick={() => { setHistory([]); void http.post("/api/history/clear").catch((e: any) => message.error("清空历史失败：" + (e?.response?.data?.error || e?.message || "unknown error"))); }}
                   >
                     清空
                   </Button>
