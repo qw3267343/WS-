@@ -901,6 +901,7 @@ app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
   const slot = normalizeSlot(req.body?.slot);
   const mode = String(req.body?.mode || '').trim();
   const text = String(req.body?.text || '');
+  const roleName = String(req.body?.roleName || '').trim();
   const minutes = Number(req.body?.minutes || 0);
   const targetsRaw = req.body?.targets;
 
@@ -953,6 +954,7 @@ app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
     mode,
     targets,
     text,
+    roleName,
     attachments,
     status: 'pending',
     createdAt: Date.now(),

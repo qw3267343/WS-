@@ -32,7 +32,7 @@ type HisItem = {
   kind: "single" | "batch" | "scheduled";
 
   roleRemark: string;
-  roleName: string;
+  roleName?: string;
   slot?: string;
 
   mode: "enabled_groups" | "single_group" | "single_contact";
@@ -74,6 +74,7 @@ type ScheduledJob = {
   targets: string[];
   text: string;
   status: "pending" | "running" | "done" | "cancelled" | "failed";
+  roleName?: string;
   createdAt?: number;
   startedAt?: number;
   finishedAt?: number;
@@ -436,6 +437,8 @@ export default function TasksPage() {
           const updated: HisItem = {
             ...item,
             status,
+            roleName: item.roleName || activeJob.roleName,
+
             runAt: activeJob.runAt ?? item.runAt,
             total: item.total ?? activeJob.targets?.length ?? item.total,
             lastTs: status === "RUNNING" ? Date.now() : item.lastTs
@@ -456,6 +459,8 @@ export default function TasksPage() {
             ok,
             okCount,
             total,
+            roleName: item.roleName || archivedJob.roleName,
+
             lastErr: archivedJob.result?.lastErr ?? item.lastErr,
             lastTs: archivedJob.finishedAt ?? item.lastTs
           };
@@ -484,6 +489,10 @@ export default function TasksPage() {
     return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   }
 
+  function getRoleNameForHistory(role?: Role | null) {
+    return role?.name ?? role?.id ?? "未知角色";
+  }
+
   function startBatchHistory(batchId: string, total: number) {
     if (!activeRole?.boundSlot) return;
 
@@ -495,7 +504,7 @@ export default function TasksPage() {
       lastTs: Date.now(),
       kind: "batch",
       roleRemark: activeRole.remark,
-      roleName: activeRole.name || "未知",
+      roleName: getRoleNameForHistory(activeRole),
       slot: activeRole.boundSlot,
       mode: "enabled_groups",
       text,
@@ -602,7 +611,7 @@ export default function TasksPage() {
         lastTs: Date.now(),
         kind: "single",
         roleRemark: activeRole.remark,
-        roleName: activeRole.name || "未知",
+        roleName: getRoleNameForHistory(activeRole),
         slot,
         mode,
         to,
@@ -637,7 +646,7 @@ export default function TasksPage() {
         lastTs: Date.now(),
         kind: "single",
         roleRemark: activeRole.remark,
-        roleName: activeRole.name || "未知",
+        roleName: getRoleNameForHistory(activeRole),
         slot,
         mode,
         to,
@@ -890,6 +899,7 @@ export default function TasksPage() {
     fd.append("minutes", String(minutes));
     fd.append("targets", JSON.stringify(targets));
     fd.append("text", text || "");
+    fd.append("roleName", getRoleNameForHistory(activeRole));
     files.forEach(f => fd.append("files", f, f.name));
 
     try {
@@ -913,7 +923,7 @@ export default function TasksPage() {
           lastTs: Date.now(),
           kind: "scheduled",
           roleRemark: activeRole.remark,
-          roleName: activeRole.name || activeRole.remark || "未知",
+          roleName: getRoleNameForHistory(activeRole),
           slot: activeRole.boundSlot,
           mode,
           text: textPreview,
@@ -925,6 +935,7 @@ export default function TasksPage() {
           runAt: created.runAt,
           createdAt: created.createdAt || Date.now()
         });
+
       } else {
         // 如果后端没返回 job（或没 id），就拉一次全量保证可见
         const r = await http.get("/api/schedules");
@@ -1282,7 +1293,7 @@ export default function TasksPage() {
                           : { text: "NO", color: "red" };
 
                     const timeText = fmtTime(h.lastTs || h.ts);
-                    const roleLabel = isScheduled ? h.roleName : h.roleRemark;
+                    const roleLabel = h.roleName || h.roleRemark || "未知角色";
                     const total = h.total || 0;
                     const okCount = h.okCount || 0;
                     const countdown = h.runAt ? formatCountdown(h.runAt - nowTs) : "--:--";
@@ -1298,7 +1309,7 @@ export default function TasksPage() {
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                             <div style={{ fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                              备注：{roleLabel}
+                              发送角色：{roleLabel}
                               {(h.kind === "batch" || isScheduled) && (
                                 <span style={{ marginLeft: 8, fontWeight: 500, color: "#666" }}>
                                   {okCount}/{total}{h.failCount ? `（失败${h.failCount}）` : ""}
