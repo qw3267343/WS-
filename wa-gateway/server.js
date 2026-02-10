@@ -1,28 +1,111 @@
-﻿// wa-gateway/server.js  （整文件覆盖）
+﻿// wa-gateway/server.js（把“文件开头”到 ensureDataFiles(); 这一段，整段替换成下面）
 
-const express = require('express');
-const cors = require('cors');
-const http = require('http');
-const { Server } = require('socket.io');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const { Server } = require("socket.io");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
 
-const fs = require('fs');
-const path = require('path');
-const multer = require('multer');
-// randomUUID 导入将在最后删除
+// =====================================================
+// ✅ 统一数据根目录：Electron 会传 DATA_DIR
+//    例如：C:\Users\Administrator\AppData\Roaming\@ws-manager\wa-gateway-data
+// =====================================================
+const DATA_ROOT = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, "data_runtime"); // 没传时 fallback（开发/直跑也不炸）
 
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+  return p;
+}
+
+// 统一把最终根写回 env（后面你其他模块/函数也可直接用）
+process.env.DATA_DIR = DATA_ROOT;
+ensureDir(DATA_ROOT);
+console.log("[gateway] DATA_ROOT =", DATA_ROOT);
+
+// 你迁移过来的目录结构就是放在 DATA_ROOT 下：
+//   .wwebjs_auth / .wwebjs_cache / data / _uploads
+const AUTH_ROOT = ensureDir(path.join(DATA_ROOT, ".wwebjs_auth"));
+const CACHE_ROOT = ensureDir(path.join(DATA_ROOT, ".wwebjs_cache"));
+const DATA_DIR = ensureDir(path.join(DATA_ROOT, "data"));
+const UPLOADS_DIR = ensureDir(path.join(DATA_ROOT, "_uploads"));
+
+// ---------- 持久化（统一放 DATA_DIR 下） ----------
+const WORKSPACES_DIR = ensureDir(path.join(DATA_DIR, "workspaces"));
+const PROJECTS_FILE = path.join(DATA_DIR, "projects.json");
+const SCHEDULED_HISTORY_LIMIT = 200;
+const HISTORY_LIMIT = 5000;
+
+// UID 计数文件
+const UID_COUNTER_FILE = path.join(DATA_DIR, "uid_counter.txt");
+const UID_START = 100001;
+
+// ② ensureDataFiles()：创建必要文件/目录（不会再碰 __dirname/data）
+function ensureDataFiles() {
+  ensureDir(DATA_ROOT);
+  ensureDir(AUTH_ROOT);
+  ensureDir(CACHE_ROOT);
+  ensureDir(DATA_DIR);
+  ensureDir(WORKSPACES_DIR);
+  ensureDir(UPLOADS_DIR);
+
+  if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, "[]", "utf-8");
+  if (!fs.existsSync(UID_COUNTER_FILE))
+    fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), "utf-8");
+}
+ensureDataFiles();
+
+// ===============================
+// ✅ Workspace 路径统一（全部落在 DATA_DIR/workspaces/...）
+// ===============================
+function normalizeWs(ws) {
+  const s = String(ws || "default").trim();
+  return s.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function getWorkspaceDir(ws) {
+  return ensureDir(path.join(WORKSPACES_DIR, normalizeWs(ws)));
+}
+
+function ensureSchedulesUploadDir(ws, jobId) {
+  const base = ensureDir(path.join(getWorkspaceDir(ws), "scheduled_uploads"));
+  if (jobId) return ensureDir(path.join(base, String(jobId)));
+  return base;
+}
+
+// ✅ 登录态根目录：直接使用你迁移过来的 AUTH_ROOT（最稳）
+// 如果你后面有 const authDir = ...，就改成这一句即可：
+function getAuthDir() {
+  return AUTH_ROOT;
+}
+
+// =====================================================
+// Express / Socket.IO
+// =====================================================
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: "*" } });
 
-const upload = multer({
-  dest: path.join(__dirname, '_uploads'),
-  limits: { fileSize: 64 * 1024 * 1024 } // 64MB
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
 });
 
+// =====================================================
+// Upload（统一写到 DATA_ROOT/_uploads）
+// =====================================================
+const upload = multer({
+  dest: UPLOADS_DIR,
+  limits: { fileSize: 64 * 1024 * 1024 }, // 64MB
+});
+
+// scheduleUpload：你原本的逻辑不动，但它最终写入的目录建议也基于 WORKSPACES_DIR / DATA_DIR
 const scheduleUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
@@ -33,33 +116,12 @@ const scheduleUpload = multer({
       cb(null, dir);
     },
     filename: (req, file, cb) => {
-      const safeName = String(file.originalname || 'file').replace(/[^A-Za-z0-9._-]/g, '_');
+      const safeName = String(file.originalname || "file").replace(/[^A-Za-z0-9._-]/g, "_");
       cb(null, `${Date.now()}_${Math.random().toString(16).slice(2)}_${safeName}`);
-    }
+    },
   }),
-  limits: { fileSize: 64 * 1024 * 1024 }
+  limits: { fileSize: 64 * 1024 * 1024 },
 });
-
-// ---------- 持久化 ----------
-const DATA_DIR = path.join(__dirname, 'data');
-const WORKSPACES_DIR = path.join(DATA_DIR, 'workspaces');
-const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
-const SCHEDULED_HISTORY_LIMIT = 200;
-const HISTORY_LIMIT = 5000;
-// ① 新增一个计数文件常量
-const UID_COUNTER_FILE = path.join(DATA_DIR, 'uid_counter.txt'); // 只记录最后一次使用的uid数字
-const UID_START = 100001;
-
-// ② 覆盖 ensureDataFiles()（让它创建 uid_counter.txt）
-function ensureDataFiles() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(WORKSPACES_DIR)) fs.mkdirSync(WORKSPACES_DIR, { recursive: true });
-  if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, '[]', 'utf-8');
-
-  // 从 100000 起步（下一次分配会变成 100001）
-  if (!fs.existsSync(UID_COUNTER_FILE)) fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), 'utf-8');
-}
-ensureDataFiles();
 
 // ===== JSON helpers (atomic) =====
 function readJson(file, fallback) {
@@ -458,7 +520,7 @@ function ensureClient(ws, slot) {
   const client = new Client({
     authStrategy: new LocalAuth({
       clientId: uid,      // ✅ 唯一身份
-      dataPath: authDir   // ✅ 统一存到 data/workspaces/<ws>/wwebjs_auth
+      dataPath: getAuthDir()   // ✅ 统一存到 data/workspaces/<ws>/wwebjs_auth
     }),
     puppeteer: {
       headless: false, // 如果你不想弹浏览器，把这里改 true

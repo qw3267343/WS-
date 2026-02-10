@@ -13,6 +13,7 @@ import {
 } from "antd";
 import { PlusOutlined, ReloadOutlined } from "@ant-design/icons";
 import { http } from "../lib/api";
+import { requestWithRetry, isNetErr } from "../lib/retry";
 
 const { Header, Content } = Layout;
 
@@ -44,10 +45,15 @@ export default function MasterPage() {
   async function fetchProjects() {
     setLoading(true);
     try {
-      const res = await http.get("/api/projects");
+      const res = await requestWithRetry(() => http.get("/api/projects"), {
+        retries: 10,
+        baseDelayMs: 400,
+        maxDelayMs: 2000,
+      });
       setRows(res.data?.data || []);
-    } catch (e) {
-      message.error(String(e));
+    } catch (e: any) {
+      // ✅ 启动阶段网关未就绪：静默，不弹红色报错
+      if (!isNetErr(e)) message.error(String(e));
     } finally {
       setLoading(false);
     }
@@ -103,11 +109,16 @@ export default function MasterPage() {
     }
   };
 
+  // ✅ 修复：file:// 下 window.location.origin 可能是 "null"
+  // 用 href.split("#")[0] 拿到真实的 index.html 基础路径
   const handleOpen = (row: ProjectRow) => {
-    const url = `/w/${row.id}/tasks`;
+    const hash = `#/w/${row.id}/tasks`;
+    const base = window.location.href.split("#")[0]; // ✅ 兼容 file:// / http://
+    const url = `${base}${hash}`;
+
     const name = `wa_ws_${row.id}`;
-    const win = window.open(url, name, "popup,width=1200,height=800");
-    if (win) win.focus();
+    const popup = window.open(url, name, "popup,width=1200,height=800");
+    if (popup) popup.focus();
   };
 
   return (
@@ -125,6 +136,7 @@ export default function MasterPage() {
           </Button>
         </Space>
       </Header>
+
       <Content style={{ padding: 16 }}>
         <Table<ProjectRow>
           rowKey="id"
@@ -159,6 +171,7 @@ export default function MasterPage() {
           ]}
         />
       </Content>
+
       <Modal
         open={modalOpen}
         title={titleText}

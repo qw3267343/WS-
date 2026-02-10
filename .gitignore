@@ -1,9 +1,13 @@
 ﻿# Node / Vite
 **/node_modules/
 **/dist/
+**/release/
+**/out/
+**/build/
 **/.vite/
 **/.cache/
 **/*.log
+**/*.tmp
 
 # Env
 **/.env
@@ -14,11 +18,29 @@
 .DS_Store
 Thumbs.db
 
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+
 # WhatsApp-web.js auth/session/cache (敏感!)
 **/.wwebjs_auth/
 **/.wwebjs_cache/
 **/wwebjs_auth/
 **/wwebjs_cache/
 
+# Uploads / runtime cache (敏感/大文件)
+**/_uploads/
+**/data_runtime/
+
 # Your local data (按需)
 **/data/
+
+# Electron builder outputs (不要提交)
+electron/dist/
+electron/release/
+
+# WAStack local user data (不要提交)
+**/@ws-manager/

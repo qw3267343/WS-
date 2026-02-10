@@ -1,0 +1,65 @@
+{
+  "name": "wastack-desktop",
+  "version": "1.0.0",
+  "description": "WAStack Desktop",
+  "author": "WAStack",
+  "main": "main.cjs",
+  "scripts": {
+    "dist": "electron-builder --publish never",
+    "dist:dir": "electron-builder --win --x64 --dir"
+  },
+  "build": {
+    "appId": "com.wastack.desktop",
+    "productName": "WAStack",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "asar": false,
+    "files": [
+      "**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../wa-panel-ui/dist",
+        "to": "wa-panel-ui/dist",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../wa-gateway",
+        "to": "wa-gateway",
+        "filter": [
+          "**/*",
+          "!data/**",
+          "!_uploads/**",
+          "!.wwebjs_cache/**",
+          "!.wwebjs_auth/**",
+          "!**/*.log",
+          "!**/*.tmp"
+        ]
+      },
+      {
+        "from": "./vendor/node",
+        "to": "vendor/node",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "WAStack"
+    },
+    "publish": []
+  }
+}

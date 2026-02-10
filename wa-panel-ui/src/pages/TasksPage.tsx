@@ -153,7 +153,7 @@ export default function TasksPage() {
   const [inputAreaH, setInputAreaH] = useState(BASE_INPUT_AREA_H);
 
   const [runIdx, setRunIdx] = useState(0);
-  const [batchId, setBatchId] = useState<string | null>(null);
+  const [, setBatchId] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const enabledGroups = useMemo(() => groups.filter(g => g.enabled), [groups]);
   const nextGroup = enabledGroups[runIdx] || null;
@@ -1805,7 +1805,7 @@ type RoleModalProps = {
   onOk: (payload: { remark: string; name: string }) => void;
 };
 
-function RoleModal(props: RoleModalProps): JSX.Element {
+function RoleModal(props: RoleModalProps) {
   const [remark, setRemark] = useState(props.editing?.remark || "");
   const [name, setName] = useState(props.editing?.name || "未知");
 
