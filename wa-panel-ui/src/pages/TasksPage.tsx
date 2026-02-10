@@ -438,6 +438,7 @@ export default function TasksPage() {
             ...item,
             status,
             roleName: item.roleName || activeJob.roleName,
+
             runAt: activeJob.runAt ?? item.runAt,
             total: item.total ?? activeJob.targets?.length ?? item.total,
             lastTs: status === "RUNNING" ? Date.now() : item.lastTs
@@ -459,6 +460,7 @@ export default function TasksPage() {
             okCount,
             total,
             roleName: item.roleName || archivedJob.roleName,
+
             lastErr: archivedJob.result?.lastErr ?? item.lastErr,
             lastTs: archivedJob.finishedAt ?? item.lastTs
           };
@@ -933,6 +935,7 @@ export default function TasksPage() {
           runAt: created.runAt,
           createdAt: created.createdAt || Date.now()
         });
+
       } else {
         // 如果后端没返回 job（或没 id），就拉一次全量保证可见
         const r = await http.get("/api/schedules");
@@ -1290,7 +1293,7 @@ export default function TasksPage() {
                           : { text: "NO", color: "red" };
 
                     const timeText = fmtTime(h.lastTs || h.ts);
-                    const roleLabel = h.roleName || "未知角色";
+                    const roleLabel = h.roleName || h.roleRemark || "未知角色";
                     const total = h.total || 0;
                     const okCount = h.okCount || 0;
                     const countdown = h.runAt ? formatCountdown(h.runAt - nowTs) : "--:--";
