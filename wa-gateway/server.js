@@ -45,6 +45,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 const WORKSPACES_DIR = path.join(DATA_DIR, 'workspaces');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const SCHEDULED_HISTORY_LIMIT = 200;
+const HISTORY_LIMIT = 5000;
 // ① 新增一个计数文件常量
 const UID_COUNTER_FILE = path.join(DATA_DIR, 'uid_counter.txt'); // 只记录最后一次使用的uid数字
 const UID_START = 100001;
@@ -95,6 +96,12 @@ function getWorkspaceAccountsFile(ws) {
 function getWorkspaceGroupsFile(ws) {
   return path.join(getWorkspaceDir(ws), 'groups.json');
 }
+function getWorkspaceRolesFile(ws) {
+  return path.join(getWorkspaceDir(ws), 'roles.json');
+}
+function getWorkspaceHistoryFile(ws) {
+  return path.join(getWorkspaceDir(ws), 'history.json');
+}
 function getWorkspaceSchedulesFile(ws) {
   return path.join(getWorkspaceDir(ws), 'scheduled_jobs.json');
 }
@@ -111,6 +118,46 @@ function getWorkspaceAuthDir(ws) {
 function ensureWorkspace(ws) {
   const dir = getWorkspaceDir(ws);
   fs.mkdirSync(dir, { recursive: true });
+  const groupsFile = getWorkspaceGroupsFile(ws);
+  if (!fs.existsSync(groupsFile)) writeJson(groupsFile, []);
+  const rolesFile = getWorkspaceRolesFile(ws);
+  if (!fs.existsSync(rolesFile)) writeJson(rolesFile, []);
+  const historyFile = getWorkspaceHistoryFile(ws);
+  if (!fs.existsSync(historyFile)) writeJson(historyFile, []);
+}
+
+function loadGroups(ws) {
+  const file = getWorkspaceGroupsFile(ws);
+  const data = readJson(file, []);
+  return Array.isArray(data) ? data : [];
+}
+
+function saveGroups(ws, list) {
+  const file = getWorkspaceGroupsFile(ws);
+  writeJson(file, Array.isArray(list) ? list : []);
+}
+
+function loadRoles(ws) {
+  const file = getWorkspaceRolesFile(ws);
+  const data = readJson(file, []);
+  return Array.isArray(data) ? data : [];
+}
+
+function saveRoles(ws, list) {
+  const file = getWorkspaceRolesFile(ws);
+  writeJson(file, Array.isArray(list) ? list : []);
+}
+
+function loadHistory(ws) {
+  const file = getWorkspaceHistoryFile(ws);
+  const data = readJson(file, []);
+  return Array.isArray(data) ? data : [];
+}
+
+function saveHistory(ws, list) {
+  const file = getWorkspaceHistoryFile(ws);
+  const rows = Array.isArray(list) ? list.slice(-HISTORY_LIMIT) : [];
+  writeJson(file, rows);
 }
 
 function loadProjects() {
@@ -617,6 +664,204 @@ app.get('/api/accounts/:slot/groups', async (req, res) => {
       .sort((a, b) => String(a.name).localeCompare(String(b.name), 'zh-Hans-CN', { numeric: true }));
 
     return res.json({ ok: true, data: groups });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get('/api/groups', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const rows = loadGroups(ws);
+    return res.json({ ok: true, rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/groups', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const list = loadGroups(ws);
+
+    const id = String(req.body?.id || '').trim();
+    const name = String(req.body?.name || '').trim();
+    if (!id) return res.status(400).json({ ok: false, error: 'id is required' });
+    if (!/@g\.us$/.test(id)) return res.status(400).json({ ok: false, error: 'id must end with @g.us' });
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    if (list.some(item => String(item?.id || '') === id)) {
+      return res.status(409).json({ ok: false, error: 'group already exists' });
+    }
+
+    const row = {
+      id,
+      name,
+      note: req.body?.note ? String(req.body.note).trim() || undefined : undefined,
+      enabled: req.body?.enabled !== false,
+      link: req.body?.link ? String(req.body.link).trim() || undefined : undefined,
+    };
+    list.unshift(row);
+    saveGroups(ws, list);
+    return res.json({ ok: true, row, rows: list });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.put('/api/groups/:id', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const currentId = String(req.params.id || '').trim();
+    const list = loadGroups(ws);
+    const idx = list.findIndex(item => String(item?.id || '') === currentId);
+    if (idx < 0) return res.status(404).json({ ok: false, error: 'group not found' });
+
+    const nextId = req.body?.id == null ? currentId : String(req.body.id || '').trim();
+    if (!nextId) return res.status(400).json({ ok: false, error: 'id is required' });
+    if (!/@g\.us$/.test(nextId)) return res.status(400).json({ ok: false, error: 'id must end with @g.us' });
+    const name = req.body?.name == null ? String(list[idx]?.name || '') : String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+
+    const duplicate = list.findIndex((item, i) => i !== idx && String(item?.id || '') === nextId);
+    if (duplicate >= 0) return res.status(409).json({ ok: false, error: 'group id already exists' });
+
+    const updated = {
+      ...list[idx],
+      id: nextId,
+      name,
+      note: req.body?.note == null ? list[idx]?.note : (String(req.body.note || '').trim() || undefined),
+      enabled: req.body?.enabled == null ? Boolean(list[idx]?.enabled) : Boolean(req.body.enabled),
+      link: req.body?.link == null ? list[idx]?.link : (String(req.body.link || '').trim() || undefined),
+    };
+
+    list[idx] = updated;
+    saveGroups(ws, list);
+    return res.json({ ok: true, row: updated, rows: list });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/groups/batch', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!rows) return res.status(400).json({ ok: false, error: 'rows must be an array' });
+
+    const cleaned = [];
+    const seen = new Set();
+    for (const item of rows) {
+      const id = String(item?.id || '').trim();
+      const name = String(item?.name || '').trim();
+      if (!id || !/@g\.us$/.test(id)) {
+        return res.status(400).json({ ok: false, error: `invalid group id: ${id || '<empty>'}` });
+      }
+      if (!name) return res.status(400).json({ ok: false, error: `name is required for ${id}` });
+      if (seen.has(id)) return res.status(400).json({ ok: false, error: `duplicate id in rows: ${id}` });
+      seen.add(id);
+      cleaned.push({
+        id,
+        name,
+        note: item?.note ? String(item.note).trim() || undefined : undefined,
+        enabled: item?.enabled !== false,
+        link: item?.link ? String(item.link).trim() || undefined : undefined,
+      });
+    }
+
+    saveGroups(ws, cleaned);
+    return res.json({ ok: true, rows: cleaned });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get('/api/roles', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const roles = loadRoles(ws);
+    return res.json({ ok: true, roles });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/roles/batch', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const roles = Array.isArray(req.body?.roles) ? req.body.roles : null;
+    if (!roles) return res.status(400).json({ ok: false, error: 'roles must be an array' });
+    saveRoles(ws, roles);
+    return res.json({ ok: true, roles });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get('/api/history', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const limitRaw = Number(req.query?.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), HISTORY_LIMIT) : 500;
+    const all = loadHistory(ws);
+    const rows = all.slice(-limit);
+    return res.json({ ok: true, rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/history/append', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const payload = req.body?.rows ?? req.body?.row ?? req.body;
+    const items = Array.isArray(payload) ? payload : (payload ? [payload] : []);
+    if (!items.length) return res.status(400).json({ ok: false, error: 'row(s) is required' });
+
+    const current = loadHistory(ws);
+    const next = [...current, ...items];
+    saveHistory(ws, next);
+    return res.json({ ok: true, added: items.length });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/history/patch', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const id = String(req.body?.id || '').trim();
+    const patch = req.body?.patch;
+    if (!id) return res.status(400).json({ ok: false, error: 'id is required' });
+    if (!patch || typeof patch !== 'object') return res.status(400).json({ ok: false, error: 'patch object is required' });
+
+    const list = loadHistory(ws);
+    const idx = list.findIndex(item => String(item?.id || '') === id);
+    if (idx < 0) return res.status(404).json({ ok: false, error: 'history item not found' });
+
+    const updated = { ...list[idx], ...patch };
+    list[idx] = updated;
+    saveHistory(ws, list);
+    return res.json({ ok: true, row: updated });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/history/clear', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    saveHistory(ws, []);
+    return res.json({ ok: true, rows: [] });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
