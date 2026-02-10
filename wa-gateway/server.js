@@ -121,7 +121,7 @@ function ensureWorkspace(ws) {
   const groupsFile = getWorkspaceGroupsFile(ws);
   if (!fs.existsSync(groupsFile)) writeJson(groupsFile, []);
   const rolesFile = getWorkspaceRolesFile(ws);
-  if (!fs.existsSync(rolesFile)) writeJson(rolesFile, []);
+  if (!fs.existsSync(rolesFile)) writeJson(rolesFile, defaultRoles());
   const historyFile = getWorkspaceHistoryFile(ws);
   if (!fs.existsSync(historyFile)) writeJson(historyFile, []);
 }
@@ -137,10 +137,24 @@ function saveGroups(ws, list) {
   writeJson(file, Array.isArray(list) ? list : []);
 }
 
+function defaultRoles() {
+  const roles = [];
+  const push = (remark) => roles.push({ id: remark, remark, name: '', boundSlot: '' });
+
+  push('admin');
+  push('老师');
+  push('助理');
+  for (let i = 1; i <= 15; i++) push(`老手${i}`);
+  for (let i = 1; i <= 15; i++) push(`新手${i}`);
+
+  return roles;
+}
+
 function loadRoles(ws) {
+  ensureWorkspace(ws);
   const file = getWorkspaceRolesFile(ws);
-  const data = readJson(file, []);
-  return Array.isArray(data) ? data : [];
+  const data = readJson(file, null);
+  return Array.isArray(data) ? data : defaultRoles();
 }
 
 function saveRoles(ws, list) {
@@ -537,6 +551,7 @@ app.post('/api/projects', (req, res) => {
     list.push(project);
     saveProjects(list);
     ensureWorkspaceDir(id);
+    ensureWorkspace(id);
     return res.json({ ok: true, data: { id } });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
