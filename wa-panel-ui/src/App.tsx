@@ -1,5 +1,5 @@
 ﻿import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Layout, Menu } from "antd";
+import { Button, Layout, Menu } from "antd";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import MasterPage from "./pages/MasterPage";
@@ -7,7 +7,9 @@ import TasksPage from "./pages/TasksPage";
 import GroupsPage from "./pages/GroupsPage";
 import AccountsPage from "./pages/AccountsPage";
 import SettingsPage from "./pages/SettingsPage";
-import { setActiveWs } from "./lib/api";
+import LoginPage from "./pages/LoginPage";
+import { http, setActiveWs } from "./lib/api";
+import { clearAuth, isLoggedIn } from "./lib/auth";
 import { getSocket } from "./lib/socket";
 
 function getWsFromSearch(search: string) {
@@ -31,6 +33,7 @@ type WorkspaceLayoutProps = {
 
 function WorkspaceLayout({ ws, buildPath, children }: WorkspaceLayoutProps) {
   const location = useLocation();
+  const navigate = useNavigate();
   const selectedKey = location.pathname.includes("/groups")
     ? "groups"
     : location.pathname.includes("/accounts")
@@ -46,24 +49,38 @@ function WorkspaceLayout({ ws, buildPath, children }: WorkspaceLayoutProps) {
     { key: "settings", label: <Link to={buildPath("/settings")}>设置</Link> },
   ];
 
+  const handleLogout = () => {
+    clearAuth();
+    navigate("/login", { replace: true });
+  };
+
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <Layout.Header style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        {/* 左：固定标题 */}
-        <div style={{ color: "#fff", fontWeight: 800, fontSize: 16 }}>
-          WS中控-
-        </div>
+        <div style={{ color: "#fff", fontWeight: 800, fontSize: 16 }}>WS中控-</div>
 
-        {/* ✅ 中：当前任务名（放在 Workspace 和菜单之间） */}
         <WorkspaceTitle ws={ws} />
 
-        {/* 中：菜单 */}
         <Menu theme="dark" mode="horizontal" selectedKeys={[selectedKey]} items={items} style={{ flex: 1 }} />
+
+        <Button danger onClick={handleLogout}>
+          退出
+        </Button>
       </Layout.Header>
 
       <Layout.Content style={{ padding: 16 }}>{children}</Layout.Content>
     </Layout>
   );
+}
+
+function ProtectedRoute({ children }: { children: ReactNode }) {
+  if (!isLoggedIn()) return <Navigate to="/login" replace />;
+  return children;
+}
+
+function LoginRoute() {
+  if (isLoggedIn()) return <Navigate to="/" replace />;
+  return <LoginPage />;
 }
 
 function WorkspaceTitle({ ws }: { ws: string }) {
@@ -74,10 +91,11 @@ function WorkspaceTitle({ ws }: { ws: string }) {
     async function loadProjectName() {
       if (!ws) return;
       try {
-        const r = await fetch(`/api/projects/${encodeURIComponent(ws)}`);
-        const j = await r.json();
+        const r = await http.get(`/api/projects/${encodeURIComponent(ws)}`);
+        const data = r.data;
         if (!alive) return;
-        if (j?.ok && j?.data?.name) setTaskName(String(j.data.name));
+        if (data?.ok && data?.data?.name) setTaskName(String(data.data.name));
+        else if (data?.data?.name) setTaskName(String(data.data.name));
         else setTaskName(ws);
       } catch {
         if (!alive) return;
@@ -129,7 +147,6 @@ function LegacyWorkspaceApp() {
     }
   }, [ws]);
 
-  // 兜底：workspace 窗口丢了 ws 时补回
   useEffect(() => {
     if (!wsUrl) {
       const saved = sessionStorage.getItem("ws");
@@ -191,8 +208,23 @@ function WorkspaceApp() {
 export default function App() {
   return (
     <Routes>
-      <Route path="/w/:wid/*" element={<WorkspaceApp />} />
-      <Route path="/*" element={<LegacyWorkspaceApp />} />
+      <Route path="/login" element={<LoginRoute />} />
+      <Route
+        path="/w/:wid/*"
+        element={
+          <ProtectedRoute>
+            <WorkspaceApp />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/*"
+        element={
+          <ProtectedRoute>
+            <LegacyWorkspaceApp />
+          </ProtectedRoute>
+        }
+      />
     </Routes>
   );
 }
