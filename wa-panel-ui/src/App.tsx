@@ -8,7 +8,8 @@ import GroupsPage from "./pages/GroupsPage";
 import AccountsPage from "./pages/AccountsPage";
 import SettingsPage from "./pages/SettingsPage";
 import LoginPage from "./pages/LoginPage";
-import { http, setActiveWs } from "./lib/api";
+import { http } from "./lib/api";
+import { setActiveWs } from "./lib/workspace";
 import { clearAuth, isLoggedIn } from "./lib/auth";
 import { getSocket } from "./lib/socket";
 
@@ -57,7 +58,7 @@ function WorkspaceLayout({ ws, buildPath, children }: WorkspaceLayoutProps) {
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <Layout.Header style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        <div style={{ color: "#fff", fontWeight: 800, fontSize: 16 }}>WS中控-</div>
+        <div style={{ color: "#fff", fontWeight: 800, fontSize: 16 }}>WS中控 - </div>
 
         <WorkspaceTitle ws={ws} />
 
@@ -110,7 +111,7 @@ function WorkspaceTitle({ ws }: { ws: string }) {
 
   return (
     <div
-      title={taskName || ws}
+      title={`${taskName || ws} (${ws})`}
       style={{
         color: "#fff",
         fontWeight: 800,
@@ -122,7 +123,7 @@ function WorkspaceTitle({ ws }: { ws: string }) {
         opacity: 0.95,
       }}
     >
-      {taskName || ws}
+      {`${taskName || ws} (${ws})`}
     </div>
   );
 }

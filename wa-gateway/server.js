@@ -36,13 +36,19 @@ const UPLOADS_DIR = ensureDir(path.join(DATA_ROOT, "_uploads"));
 
 // ---------- 持久化（统一放 DATA_DIR 下） ----------
 const WORKSPACES_DIR = ensureDir(path.join(DATA_DIR, "workspaces"));
+const AUTH_DATA_DIR = ensureDir(path.join(DATA_DIR, "wwebjs_auth"));
+const CACHE_DATA_DIR = ensureDir(path.join(DATA_DIR, ".wwebjs_cache"));
+const TRASH_DIR = ensureDir(path.join(DATA_DIR, "_trash"));
 const PROJECTS_FILE = path.join(DATA_DIR, "projects.json");
+const PROJECT_COUNTER_FILE = path.join(DATA_DIR, "project_counter.txt");
 const SCHEDULED_HISTORY_LIMIT = 200;
 const HISTORY_LIMIT = 5000;
 
 // UID 计数文件
 const UID_COUNTER_FILE = path.join(DATA_DIR, "uid_counter.txt");
 const UID_START = 100001;
+const TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TRASH_CLEAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 // ② ensureDataFiles()：创建必要文件/目录（不会再碰 __dirname/data）
 function ensureDataFiles() {
@@ -51,9 +57,13 @@ function ensureDataFiles() {
   ensureDir(CACHE_ROOT);
   ensureDir(DATA_DIR);
   ensureDir(WORKSPACES_DIR);
+  ensureDir(AUTH_DATA_DIR);
+  ensureDir(CACHE_DATA_DIR);
+  ensureDir(TRASH_DIR);
   ensureDir(UPLOADS_DIR);
 
   if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, "[]", "utf-8");
+  if (!fs.existsSync(PROJECT_COUNTER_FILE)) fs.writeFileSync(PROJECT_COUNTER_FILE, "100000", "utf-8");
   if (!fs.existsSync(UID_COUNTER_FILE))
     fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), "utf-8");
 }
@@ -80,7 +90,7 @@ function ensureSchedulesUploadDir(ws, jobId) {
 // ✅ 登录态根目录：直接使用你迁移过来的 AUTH_ROOT（最稳）
 // 如果你后面有 const authDir = ...，就改成这一句即可：
 function getAuthDir() {
-  return AUTH_ROOT;
+  return AUTH_DATA_DIR;
 }
 
 // =====================================================
@@ -132,6 +142,79 @@ function writeJson(file, data) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
   fs.renameSync(tmp, file);
+}
+function formatTrashTs(d = new Date()) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+}
+function removeDirSafe(target) {
+  try {
+    if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+  } catch {}
+}
+function copyDir(src, dst) {
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  if (typeof fs.cpSync === 'function') {
+    fs.cpSync(src, dst, { recursive: true, force: true });
+    return;
+  }
+
+  const st = fs.statSync(src);
+  if (st.isDirectory()) {
+    fs.mkdirSync(dst, { recursive: true });
+    for (const name of fs.readdirSync(src)) {
+      copyDir(path.join(src, name), path.join(dst, name));
+    }
+    return;
+  }
+  fs.copyFileSync(src, dst);
+}
+function safeMoveToTrash(src, type, id) {
+  if (!src || !fs.existsSync(src)) return null;
+  const stamp = formatTrashTs();
+  const dst = path.join(TRASH_DIR, safeId(type) || 'misc', stamp, safeId(id) || 'unknown');
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+
+  try {
+    fs.renameSync(src, dst);
+    return dst;
+  } catch (e) {
+    if (e?.code !== 'EXDEV') throw e;
+    copyDir(src, dst);
+    removeDirSafe(src);
+    return dst;
+  }
+}
+function collectTrashLeafDirs(base, list = []) {
+  if (!fs.existsSync(base)) return list;
+  for (const typeName of fs.readdirSync(base)) {
+    const typeDir = path.join(base, typeName);
+    if (!fs.statSync(typeDir).isDirectory()) continue;
+    for (const tsName of fs.readdirSync(typeDir)) {
+      const tsDir = path.join(typeDir, tsName);
+      if (!fs.statSync(tsDir).isDirectory()) continue;
+      for (const idName of fs.readdirSync(tsDir)) {
+        const idDir = path.join(tsDir, idName);
+        if (!fs.statSync(idDir).isDirectory()) continue;
+        list.push({ typeDir, tsDir, idDir });
+      }
+    }
+  }
+  return list;
+}
+function cleanupTrash() {
+  const now = Date.now();
+  const leaves = collectTrashLeafDirs(TRASH_DIR);
+  for (const item of leaves) {
+    try {
+      const st = fs.statSync(item.idDir);
+      if (now - st.mtimeMs > TRASH_RETENTION_MS) {
+        fs.rmSync(item.idDir, { recursive: true, force: true });
+      }
+      if (fs.existsSync(item.tsDir) && fs.readdirSync(item.tsDir).length === 0) fs.rmdirSync(item.tsDir);
+      if (fs.existsSync(item.typeDir) && fs.readdirSync(item.typeDir).length === 0) fs.rmdirSync(item.typeDir);
+    } catch {}
+  }
 }
 function safeId(raw) {
   const s = String(raw || '').trim();
@@ -254,22 +337,118 @@ function getCountsForWorkspace(id) {
     groupsCount: Array.isArray(groups) ? groups.length : 0,
   };
 }
-function generateProjectId(name, list) {
-  const base = safeId(name) || 'project';
-  const existing = new Set((list || []).map(item => item.id));
-  let candidate = base;
-  let i = 1;
-  while (existing.has(candidate)) {
-    candidate = `${base}-${i}`;
-    i += 1;
+function parseProjectNumber(id) {
+  const m = String(id || '').match(/^p_(\d{6,})$/);
+  return m ? Number(m[1]) : null;
+}
+function readProjectCounter() {
+  try {
+    const n = Number(String(fs.readFileSync(PROJECT_COUNTER_FILE, 'utf-8') || '').trim());
+    return Number.isFinite(n) ? n : 100000;
+  } catch {
+    return 100000;
   }
-  return candidate;
+}
+function writeProjectCounter(n) {
+  fs.writeFileSync(PROJECT_COUNTER_FILE, String(n), 'utf-8');
+}
+function allocateProjectId() {
+  const next = Math.max(readProjectCounter() + 1, 100001);
+  writeProjectCounter(next);
+  return `p_${String(next).padStart(6, '0')}`;
+}
+
+function migrateProjects() {
+  const rawList = loadProjects();
+  const list = Array.isArray(rawList) ? rawList : [];
+  if (!list.length) {
+    const counter = readProjectCounter();
+    if (counter < 100000) writeProjectCounter(100000);
+    return;
+  }
+
+  const oldNameCount = new Map();
+  for (const item of list) {
+    const idAsName = String(item?.name || item?.id || '').trim();
+    if (!idAsName) continue;
+    oldNameCount.set(idAsName, (oldNameCount.get(idAsName) || 0) + 1);
+  }
+
+  const inheritedByOldName = new Set();
+  const migrated = [];
+  let changed = false;
+
+  for (const item of list) {
+    const currentId = String(item?.id || '').trim();
+    const hasNewId = /^p_\d{6,}$/.test(currentId);
+    const oldName = String(item?.name || item?.id || '').trim() || '未命名任务';
+
+    const now = nowIso();
+    const next = {
+      ...item,
+      id: hasNewId ? currentId : allocateProjectId(),
+      name: oldName,
+      note: item?.note != null ? String(item.note) : '',
+      createdAt: item?.createdAt || now,
+      updatedAt: now,
+    };
+
+    if (!hasNewId) {
+      changed = true;
+      const oldDir = path.join(WORKSPACES_DIR, oldName);
+      const newDir = path.join(WORKSPACES_DIR, next.id);
+      const duplicated = (oldNameCount.get(oldName) || 0) > 1;
+
+      if (fs.existsSync(oldDir) && !inheritedByOldName.has(oldName)) {
+        inheritedByOldName.add(oldName);
+        if (oldDir !== newDir) {
+          if (!fs.existsSync(newDir)) {
+            fs.renameSync(oldDir, newDir);
+          } else {
+            ensureWorkspaceDir(next.id);
+          }
+        }
+      } else {
+        ensureWorkspaceDir(next.id);
+        if (duplicated) next.migratedFromName = oldName;
+      }
+    }
+
+    ensureWorkspace(next.id);
+    migrated.push(next);
+  }
+
+  // 去重防异常：同 id 仅保留第一个
+  const unique = [];
+  const seen = new Set();
+  for (const item of migrated) {
+    if (seen.has(item.id)) {
+      changed = true;
+      continue;
+    }
+    seen.add(item.id);
+    unique.push(item);
+  }
+
+  const maxNum = unique.reduce((mx, item) => {
+    const n = parseProjectNumber(item.id);
+    return n && n > mx ? n : mx;
+  }, 100000);
+  const currentCounter = readProjectCounter();
+  if (currentCounter < maxNum) writeProjectCounter(maxNum);
+
+  if (changed) saveProjects(unique);
 }
 
 function loadAccounts(ws) {
   const file = getWorkspaceAccountsFile(ws);
   const data = readJson(file, []);
-  return Array.isArray(data) ? data : [];
+  const list = Array.isArray(data) ? data : [];
+  return list.map((x) => {
+    const uid = String(x?.uid || '').trim();
+    const sessionDir = String(x?.sessionDir || '').trim() || (uid ? `session-${uid}` : '');
+    return { ...x, uid, sessionDir };
+  });
 }
 function saveAccounts(ws, list) {
   const file = getWorkspaceAccountsFile(ws);
@@ -322,6 +501,11 @@ function allocateNextUid(currentAccountsList) {
   return String(next); // uid 一律用字符串更稳
 }
 
+function buildSessionDir(uid) {
+  const v = String(uid || '').trim();
+  return v ? `session-${v}` : '';
+}
+
 function ensureAccount(ws, slot) {
   slot = normalizeSlot(slot);
   if (!slot) throw new Error('slot empty');
@@ -333,7 +517,7 @@ function ensureAccount(ws, slot) {
   if (!acc) {
     // ④A) 改 ensureAccount(slot) 里新建账号时：把 randomUUID() 换成 allocateNextUid(list)
     const uid = allocateNextUid(list);
-    acc = { slot, uid, createdAt: Date.now() };
+    acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now() };
     list.push(acc);
     saveAccounts(ws, list);
   }
@@ -582,6 +766,10 @@ function ensureClient(ws, slot) {
 
 // ---------- APIs ----------
 
+migrateProjects();
+cleanupTrash();
+setInterval(() => cleanupTrash(), TRASH_CLEAN_INTERVAL_MS);
+
 io.on('connection', (socket) => {
   const ws = safeId(socket.handshake.query?.ws) || 'default';
   socket.join(ws);
@@ -607,14 +795,14 @@ app.post('/api/projects', (req, res) => {
     if (!name) return res.status(400).json({ ok: false, error: 'name required' });
 
     const list = loadProjects();
-    const id = generateProjectId(name, list);
+    const id = allocateProjectId();
     const now = nowIso();
     const project = { id, name, note, createdAt: now, updatedAt: now };
     list.push(project);
     saveProjects(list);
     ensureWorkspaceDir(id);
     ensureWorkspace(id);
-    return res.json({ ok: true, data: { id } });
+    return res.json({ ok: true, data: project });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -668,9 +856,7 @@ app.delete('/api/projects/:id', (req, res) => {
     saveProjects(list);
 
     const workspaceDir = path.join(WORKSPACES_DIR, id);
-    if (fs.existsSync(workspaceDir)) {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
+    safeMoveToTrash(workspaceDir, 'workspaces', id);
     return res.json({ ok: true, data: { id } });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -692,7 +878,7 @@ app.post('/api/accounts/create', (req, res) => {
 
     // ④B) /api/accounts/create 里新建账号时：把 randomUUID() 换成 allocateNextUid(list)
     const uid = allocateNextUid(list);
-    const acc = { slot, uid, createdAt: Date.now() };
+    const acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now() };
     list.push(acc);
     saveAccounts(ws, list);
     return res.json({ ok: true, data: acc });
@@ -1105,11 +1291,10 @@ app.post('/api/accounts/:slot/openChat', async (req, res) => {
   }
 });
 
-// 删除账号（会删除 accounts.json 的记录 + 删除 LocalAuth 缓存目录）
-app.post('/api/accounts/:slot/delete', async (req, res) => {
+async function deleteAccountHandler(req, res) {
   const ws = getWs(req);
   const { clients, statuses, profiles } = ctx(ws);
-  const { slot } = req.params;
+  const slot = normalizeSlot(req.params.slot);
 
   try {
     // 1) 停掉运行中的 client
@@ -1124,25 +1309,29 @@ app.post('/api/accounts/:slot/delete', async (req, res) => {
 
     // 2) 删除账号记录
     const list = loadAccounts(ws);
-    const idx = list.findIndex(x => x.slot === slot);
+    const idx = list.findIndex(x => normalizeSlot(x.slot) === slot);
     if (idx < 0) return res.json({ ok: true });
 
     const acc = list[idx];
     list.splice(idx, 1);
     saveAccounts(ws, list);
 
-    // 3) 删除 LocalAuth 会话目录（clientId = uid 时：session-<uid>）
-    const uid = String(acc.uid || '').trim();
-    if (uid) {
-      const dir = path.join(getWorkspaceAuthDir(ws), `session-${uid}`);
-      try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    // 3) 账号会话目录仅按 accounts.json 里的精确 sessionDir 回收
+    const sessionDir = String(acc.sessionDir || '').trim();
+    if (sessionDir) {
+      const abs = path.join(getAuthDir(), sessionDir);
+      safeMoveToTrash(abs, 'sessions', `${ws}_${slot}`);
     }
 
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
-});
+}
+
+// 删除账号（会删除 accounts.json 的记录 + 回收 LocalAuth 会话目录）
+app.delete('/api/accounts/:slot', deleteAccountHandler);
+app.post('/api/accounts/:slot/delete', deleteAccountHandler);
 
 // 纯文本发送
 app.post('/api/accounts/:slot/send', async (req, res) => {
