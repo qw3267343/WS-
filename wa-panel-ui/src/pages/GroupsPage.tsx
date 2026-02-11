@@ -16,7 +16,6 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { GroupTarget } from "../lib/types";
-import { withWs, getWsId } from "../lib/workspace";
 import { http } from "../lib/api";
 
 type ResolveResp =
@@ -29,26 +28,17 @@ function normalizeLink(s: string) {
 }
 
 async function postJSON<T>(url: string, body: any): Promise<T> {
-  const wsId = getWsId();
-  const r = await fetch(withWs(url), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-ws": wsId,
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await r.text();
-  let json: any = null;
   try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!r.ok) {
-    throw new Error(json?.error || json?.message || `HTTP ${r.status}`);
+    const r = await http.post(url, body);
+    return (r.data ?? {}) as T;
+  } catch (e: any) {
+    const msg =
+      e?.response?.data?.error ||
+      e?.response?.data?.message ||
+      e?.message ||
+      "unknown error";
+    throw new Error(msg);
   }
-  return (json ?? {}) as T;
 }
 
 export default function GroupsPage() {
