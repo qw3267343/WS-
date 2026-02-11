@@ -88,12 +88,16 @@ export default function MasterPage() {
       if (editing) {
         await http.put(`/api/projects/${editing.id}`, values);
         message.success("任务已更新");
+        setModalOpen(false);
+        await fetchProjects();
       } else {
-        await http.post("/api/projects", values);
+        const res = await http.post("/api/projects", values);
+        const id = String(res.data?.data?.id || "").trim();
         message.success("任务已创建");
+        setModalOpen(false);
+        await fetchProjects();
+        if (id) navigate(`/w/${encodeURIComponent(id)}/tasks`);
       }
-      setModalOpen(false);
-      await fetchProjects();
     } catch (e) {
       if (e && (e as { errorFields?: unknown }).errorFields) return;
       message.error(String(e));
@@ -155,6 +159,7 @@ export default function MasterPage() {
           dataSource={rows}
           pagination={{ pageSize: 10 }}
           columns={[
+            { title: "任务ID", dataIndex: "id", key: "id", width: 160 },
             { title: "任务名字", dataIndex: "name", key: "name" },
             { title: "任务备注", dataIndex: "note", key: "note" },
             { title: "账号数量", dataIndex: "accountsCount", key: "accountsCount", width: 120 },

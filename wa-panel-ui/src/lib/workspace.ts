@@ -26,11 +26,21 @@ export function getWsId(): string {
   return (saved || "").trim() || "default";
 }
 
+const ACTIVE_WS_KEY = "wa_active_ws";
+
+export function setActiveWs(wsId: string) {
+  const next = String(wsId || "").trim();
+  if (next) localStorage.setItem(ACTIVE_WS_KEY, next);
+  else localStorage.removeItem(ACTIVE_WS_KEY);
+}
+
 export function wsKey(key: string): string {
   return `ws:${getWsId()}:${key}`;
 }
 
 export function withWs(url: string): string {
+  if (!url || !url.startsWith("/")) return url;
+
   const ws = getWsId();
   if (!ws) return url;
 

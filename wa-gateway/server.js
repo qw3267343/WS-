@@ -37,6 +37,7 @@ const UPLOADS_DIR = ensureDir(path.join(DATA_ROOT, "_uploads"));
 // ---------- 持久化（统一放 DATA_DIR 下） ----------
 const WORKSPACES_DIR = ensureDir(path.join(DATA_DIR, "workspaces"));
 const PROJECTS_FILE = path.join(DATA_DIR, "projects.json");
+const PROJECT_COUNTER_FILE = path.join(DATA_DIR, "project_counter.txt");
 const SCHEDULED_HISTORY_LIMIT = 200;
 const HISTORY_LIMIT = 5000;
 
@@ -54,6 +55,7 @@ function ensureDataFiles() {
   ensureDir(UPLOADS_DIR);
 
   if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, "[]", "utf-8");
+  if (!fs.existsSync(PROJECT_COUNTER_FILE)) fs.writeFileSync(PROJECT_COUNTER_FILE, "100000", "utf-8");
   if (!fs.existsSync(UID_COUNTER_FILE))
     fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), "utf-8");
 }
@@ -254,16 +256,107 @@ function getCountsForWorkspace(id) {
     groupsCount: Array.isArray(groups) ? groups.length : 0,
   };
 }
-function generateProjectId(name, list) {
-  const base = safeId(name) || 'project';
-  const existing = new Set((list || []).map(item => item.id));
-  let candidate = base;
-  let i = 1;
-  while (existing.has(candidate)) {
-    candidate = `${base}-${i}`;
-    i += 1;
+function parseProjectNumber(id) {
+  const m = String(id || '').match(/^p_(\d{6,})$/);
+  return m ? Number(m[1]) : null;
+}
+function readProjectCounter() {
+  try {
+    const n = Number(String(fs.readFileSync(PROJECT_COUNTER_FILE, 'utf-8') || '').trim());
+    return Number.isFinite(n) ? n : 100000;
+  } catch {
+    return 100000;
   }
-  return candidate;
+}
+function writeProjectCounter(n) {
+  fs.writeFileSync(PROJECT_COUNTER_FILE, String(n), 'utf-8');
+}
+function allocateProjectId() {
+  const next = Math.max(readProjectCounter() + 1, 100001);
+  writeProjectCounter(next);
+  return `p_${String(next).padStart(6, '0')}`;
+}
+
+function migrateProjects() {
+  const rawList = loadProjects();
+  const list = Array.isArray(rawList) ? rawList : [];
+  if (!list.length) {
+    const counter = readProjectCounter();
+    if (counter < 100000) writeProjectCounter(100000);
+    return;
+  }
+
+  const oldNameCount = new Map();
+  for (const item of list) {
+    const idAsName = String(item?.name || item?.id || '').trim();
+    if (!idAsName) continue;
+    oldNameCount.set(idAsName, (oldNameCount.get(idAsName) || 0) + 1);
+  }
+
+  const inheritedByOldName = new Set();
+  const migrated = [];
+  let changed = false;
+
+  for (const item of list) {
+    const currentId = String(item?.id || '').trim();
+    const hasNewId = /^p_\d{6,}$/.test(currentId);
+    const oldName = String(item?.name || item?.id || '').trim() || '未命名任务';
+
+    const now = nowIso();
+    const next = {
+      ...item,
+      id: hasNewId ? currentId : allocateProjectId(),
+      name: oldName,
+      note: item?.note != null ? String(item.note) : '',
+      createdAt: item?.createdAt || now,
+      updatedAt: now,
+    };
+
+    if (!hasNewId) {
+      changed = true;
+      const oldDir = path.join(WORKSPACES_DIR, oldName);
+      const newDir = path.join(WORKSPACES_DIR, next.id);
+      const duplicated = (oldNameCount.get(oldName) || 0) > 1;
+
+      if (fs.existsSync(oldDir) && !inheritedByOldName.has(oldName)) {
+        inheritedByOldName.add(oldName);
+        if (oldDir !== newDir) {
+          if (!fs.existsSync(newDir)) {
+            fs.renameSync(oldDir, newDir);
+          } else {
+            ensureWorkspaceDir(next.id);
+          }
+        }
+      } else {
+        ensureWorkspaceDir(next.id);
+        if (duplicated) next.migratedFromName = oldName;
+      }
+    }
+
+    ensureWorkspace(next.id);
+    migrated.push(next);
+  }
+
+  // 去重防异常：同 id 仅保留第一个
+  const unique = [];
+  const seen = new Set();
+  for (const item of migrated) {
+    if (seen.has(item.id)) {
+      changed = true;
+      continue;
+    }
+    seen.add(item.id);
+    unique.push(item);
+  }
+
+  const maxNum = unique.reduce((mx, item) => {
+    const n = parseProjectNumber(item.id);
+    return n && n > mx ? n : mx;
+  }, 100000);
+  const currentCounter = readProjectCounter();
+  if (currentCounter < maxNum) writeProjectCounter(maxNum);
+
+  if (changed) saveProjects(unique);
 }
 
 function loadAccounts(ws) {
@@ -582,6 +675,8 @@ function ensureClient(ws, slot) {
 
 // ---------- APIs ----------
 
+migrateProjects();
+
 io.on('connection', (socket) => {
   const ws = safeId(socket.handshake.query?.ws) || 'default';
   socket.join(ws);
@@ -607,14 +702,14 @@ app.post('/api/projects', (req, res) => {
     if (!name) return res.status(400).json({ ok: false, error: 'name required' });
 
     const list = loadProjects();
-    const id = generateProjectId(name, list);
+    const id = allocateProjectId();
     const now = nowIso();
     const project = { id, name, note, createdAt: now, updatedAt: now };
     list.push(project);
     saveProjects(list);
     ensureWorkspaceDir(id);
     ensureWorkspace(id);
-    return res.json({ ok: true, data: { id } });
+    return res.json({ ok: true, data: project });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
