@@ -2,6 +2,7 @@ import { Button, Card, Form, Input, Typography, message } from "antd";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { saveAuth } from "../lib/auth";
+import { http } from "../lib/api";
 
 type LoginForm = {
   username: string;
@@ -21,23 +22,15 @@ export default function LoginPage() {
   const handleSubmit = async (values: LoginForm) => {
     try {
       setLoading(true);
-      const res = await fetch("https://auth.tg自动化.xyz/api/login", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          username: values.username,
-          password: values.password,
-          device_id: null,
-        }),
+
+      const r = await http.post("/api/auth/login", {
+        username: values.username,
+        password: values.password,
+        device_id: null,
       });
 
-      if (!res.ok) {
-        throw new Error(`status:${res.status}`);
-      }
+      const data = r.data as LoginResponse;
 
-      const data = (await res.json()) as LoginResponse;
       if (!data?.access_token || !data?.refresh_token) {
         throw new Error("invalid login response");
       }
@@ -45,7 +38,7 @@ export default function LoginPage() {
       saveAuth(data);
       message.success("登录成功");
       navigate("/", { replace: true });
-    } catch {
+    } catch (e: any) {
       message.error("登录失败，请检查用户名和密码后重试");
     } finally {
       setLoading(false);

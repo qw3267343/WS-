@@ -107,6 +107,106 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: Date.now() });
 });
 
+// =========================
+// Auth proxy (avoid CORS)
+// Frontend -> http://127.0.0.1:3001/api/auth/login
+// Gateway  -> https://auth.tg自动化.xyz/api/login
+// =========================
+const https = require("https");
+
+const AUTH_BASE_URL = process.env.AUTH_BASE_URL || "https://auth.tg自动化.xyz"; 
+// 如果你担心中文域名兼容，可改成：
+// const AUTH_BASE_URL = process.env.AUTH_BASE_URL || "https://auth.xn--tg-2r5c9pp74q.xyz";
+
+function httpsPostJson(urlStr, payload, extraHeaders = {}) {
+  const u = new URL(urlStr);
+  const body = Buffer.from(JSON.stringify(payload || {}), "utf-8");
+
+  const opts = {
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port || 443,
+    path: u.pathname + (u.search || ""),
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "Content-Length": body.length,
+      ...extraHeaders,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        let json = null;
+        try {
+          json = data ? JSON.parse(data) : null;
+        } catch {}
+        resolve({ status: res.statusCode || 0, json, text: data });
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { username, password, device_id } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ ok: false, error: "missing username/password" });
+    }
+
+    const upstream = `${AUTH_BASE_URL}/api/login`;
+    const r = await httpsPostJson(upstream, {
+      username: String(username).trim(),
+      password: String(password),
+      device_id: device_id ?? null,
+    });
+
+    // 透传上游返回
+    if (r.status >= 200 && r.status < 300) {
+      return res.json(r.json || {});
+    }
+
+    return res.status(r.status || 502).json({
+      ok: false,
+      error: r.json?.detail || r.json?.message || r.text || `upstream status ${r.status}`,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/auth/refresh", async (req, res) => {
+  try {
+    const { refresh_token } = req.body || {};
+    if (!refresh_token) {
+      return res.status(400).json({ ok: false, error: "missing refresh_token" });
+    }
+
+    const upstream = `${AUTH_BASE_URL}/api/refresh`;
+    const r = await httpsPostJson(upstream, { refresh_token: String(refresh_token) });
+
+    if (r.status >= 200 && r.status < 300) {
+      return res.json(r.json || {});
+    }
+
+    return res.status(r.status || 502).json({
+      ok: false,
+      error: r.json?.detail || r.json?.message || r.text || `upstream status ${r.status}`,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 // =====================================================
 // Upload（统一写到 DATA_ROOT/_uploads）
 // =====================================================
