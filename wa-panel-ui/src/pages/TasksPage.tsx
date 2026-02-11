@@ -21,7 +21,7 @@ import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
 import { getWsId } from "../lib/workspace";
 import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
-import { loadGroups, uid } from "../lib/storage";
+import { uid } from "../lib/storage";
 
 type HisItem = {
   id: string;
@@ -143,7 +143,8 @@ export default function TasksPage() {
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
-  const [groups, setGroups] = useState<GroupTarget[]>(() => loadGroups());
+  const [groups, setGroups] = useState<GroupTarget[]>([]);
+  const [groupsLoading, setGroupsLoading] = useState(false);
   const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
 
   const [mode, setMode] = useState<"enabled_groups" | "single_group" | "single_contact">("enabled_groups");
@@ -285,6 +286,20 @@ export default function TasksPage() {
     setAccounts(list);
   }
 
+  async function loadGroupsRemote() {
+    setGroupsLoading(true);
+    try {
+      const r = await http.get("/api/groups");
+      const rows = Array.isArray(r.data?.rows) ? (r.data.rows as GroupTarget[]) : [];
+      setGroups(rows);
+    } catch (e: any) {
+      message.error("加载群列表失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+      setGroups([]);
+    } finally {
+      setGroupsLoading(false);
+    }
+  }
+
   async function refreshRoles() {
     const r = await http.get("/api/roles");
     const list = Array.isArray(r.data?.roles) ? (r.data.roles as Role[]) : [];
@@ -327,6 +342,7 @@ export default function TasksPage() {
 
   useEffect(() => {
     (async () => {
+      await loadGroupsRemote();
       await refreshRoles();
       await refreshAccounts();
       await refreshRoleNicknames();
@@ -865,7 +881,7 @@ export default function TasksPage() {
       if (key === "add") setRoleModal({ open: true, editing: null });
       if (key === "refresh") {
         await refreshRoles();
-        setGroups(loadGroups());
+        await loadGroupsRemote();
         await refreshAccounts();
         await refreshRoleNicknames();
         message.success("已刷新");
@@ -1313,7 +1329,7 @@ export default function TasksPage() {
                   <Tag color="blue">启用群：{enabledGroups.length} 个</Tag>
                   <Tag>进度：{Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}</Tag>
                   {nextGroup && <Tag color="geekblue">下一群：{nextGroup.name}</Tag>}
-                  <Button size="small" onClick={() => setGroups(loadGroups())}>刷新群列表</Button>
+                  <Button size="small" loading={groupsLoading} onClick={() => void loadGroupsRemote()}>刷新群列表</Button>
                 </div>
               )}
 
