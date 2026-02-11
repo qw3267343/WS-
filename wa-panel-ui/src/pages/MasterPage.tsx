@@ -12,7 +12,9 @@ import {
   message,
 } from "antd";
 import { PlusOutlined, ReloadOutlined } from "@ant-design/icons";
+import { useNavigate } from "react-router-dom";
 import { http } from "../lib/api";
+import { clearAuth } from "../lib/auth";
 import { requestWithRetry, isNetErr } from "../lib/retry";
 
 const { Header, Content } = Layout;
@@ -33,6 +35,7 @@ type ProjectFormValues = {
 };
 
 export default function MasterPage() {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState<ProjectRow[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
@@ -121,6 +124,11 @@ export default function MasterPage() {
     if (popup) popup.focus();
   };
 
+  const handleLogout = () => {
+    clearAuth();
+    navigate("/login", { replace: true });
+  };
+
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <Header style={{ background: "#0b1d2a", display: "flex", alignItems: "center", gap: 16 }}>
@@ -133,6 +141,9 @@ export default function MasterPage() {
           </Button>
           <Button icon={<ReloadOutlined />} onClick={fetchProjects}>
             刷新
+          </Button>
+          <Button danger onClick={handleLogout}>
+            退出
           </Button>
         </Space>
       </Header>
