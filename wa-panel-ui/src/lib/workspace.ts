@@ -1,32 +1,33 @@
+const ACTIVE_WS_KEY = "wa_active_ws";
+
 export function getWsId(): string {
-  // ✅ 1) HashRouter（Electron/HashRouter）：#/w/6688/tasks
-  const hash = (window.location.hash || "").trim();
-  const hashMatch = hash.match(/^#\/w\/([^\/?#]+)/);
-  if (hashMatch?.[1]) return decodeURIComponent(hashMatch[1]);
+  const hash = String(window.location.hash || "").trim();
 
-  // ✅ 2) BrowserRouter：/w/6688/tasks
-  const pathMatch = window.location.pathname.match(/^\/w\/([^\/?#]+)/);
-  if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
-
-  // ✅ 3) URL query：?ws=6688
-  const params = new URLSearchParams(window.location.search);
-  const wsFromQuery = (params.get("ws") || "").trim();
-  if (wsFromQuery) return wsFromQuery;
-
-  // ✅ 4) hash 内也可能带 query：#/xxx?ws=6688
-  const hashQuery = hash.includes("?") ? hash.split("?")[1] : "";
-  if (hashQuery) {
-    const hp = new URLSearchParams(hashQuery);
+  // ✅ 1) hash 内 query：#/xxx?ws=...
+  if (hash.includes("?")) {
+    const q = hash.split("?").slice(1).join("?"); // 防止多 '?'
+    const hp = new URLSearchParams(q);
     const wsFromHashQuery = (hp.get("ws") || "").trim();
     if (wsFromHashQuery) return wsFromHashQuery;
   }
 
+  // ✅ 2) HashRouter path：#/w/<wsId>/...
+  const hashMatch = hash.match(/#\/w\/([^\/?#]+)/);
+  if (hashMatch?.[1]) return decodeURIComponent(hashMatch[1]);
+
+  // ✅ 3) BrowserRouter：/w/<wsId>/...
+  const pathMatch = String(window.location.pathname || "").match(/^\/w\/([^\/?#]+)/);
+  if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
+
+  // ✅ 4) URL query：?ws=...
+  const params = new URLSearchParams(window.location.search);
+  const wsFromQuery = (params.get("ws") || "").trim();
+  if (wsFromQuery) return wsFromQuery;
+
   // ✅ 5) localStorage fallback
-  const saved = localStorage.getItem("wa_active_ws");
+  const saved = localStorage.getItem(ACTIVE_WS_KEY);
   return (saved || "").trim() || "default";
 }
-
-const ACTIVE_WS_KEY = "wa_active_ws";
 
 export function setActiveWs(wsId: string) {
   const next = String(wsId || "").trim();
@@ -39,27 +40,21 @@ export function wsKey(key: string): string {
 }
 
 export function withWs(url: string): string {
-  if (!url || !url.startsWith("/")) return url;
+  if (!url) return url;
 
   const ws = getWsId();
   if (!ws) return url;
 
-  // 不改域名，只追加 ?ws=
+  // 允许传 "/api/xxx"、"api/xxx"、"http://127.0.0.1:3001/api/xxx"
   const [base, hash] = url.split("#");
 
-  // 已有 ws 参数就不重复追加
   const qIndex = base.indexOf("?");
   const pathPart = qIndex >= 0 ? base.slice(0, qIndex) : base;
   const queryPart = qIndex >= 0 ? base.slice(qIndex + 1) : "";
 
   const params = new URLSearchParams(queryPart);
-  if (params.has("ws")) return url;
+  if (!params.has("ws")) params.set("ws", ws);
 
-  params.set("ws", ws);
-
-  const rebuiltBase = params.toString()
-    ? `${pathPart}?${params.toString()}`
-    : pathPart;
-
+  const rebuiltBase = params.toString() ? `${pathPart}?${params.toString()}` : pathPart;
   return hash ? `${rebuiltBase}#${hash}` : rebuiltBase;
 }
