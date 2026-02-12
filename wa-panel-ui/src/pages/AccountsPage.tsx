@@ -6,6 +6,7 @@ import {
   Input,
   Modal,
   Progress,
+  Pagination,
   Select,
   Space,
   Switch,
@@ -66,7 +67,8 @@ export default function AccountsPage() {
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchAction, setBatchAction] = useState<"connect" | "logout" | null>(null);
   const [enabledMap, setEnabledMap] = useState<Record<string, boolean>>(loadEnabledMap());
-
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
 
   useEffect(() => {
@@ -262,6 +264,7 @@ export default function AccountsPage() {
   const rowSelection: TableProps<AccRow>['rowSelection'] = {
     selectedRowKeys: selectedKeys,
     onChange: (keys: React.Key[]) => setSelectedKeys(keys),
+    preserveSelectedRowKeys: true,
     getCheckboxProps: (record) => ({ disabled: record.enabled === false })
   };
 
@@ -383,6 +386,18 @@ export default function AccountsPage() {
     });
   }, [rows, bindFilter, remarkQuery, remarks, roles]);
 
+  const total = filteredRows.length;
+  const maxPage = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, maxPage);
+
+  const start = (safePage - 1) * pageSize;
+  const pageRows = filteredRows.slice(start, start + pageSize);
+
+  useEffect(() => {
+    const max = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+    if (page > max) setPage(max);
+  }, [filteredRows.length, pageSize, page]);
+
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
       <Card
@@ -443,10 +458,39 @@ export default function AccountsPage() {
         <Table
           rowKey="slot"
           columns={columns}
-          dataSource={filteredRows}
+          dataSource={pageRows}
           rowSelection={rowSelection}
           pagination={false}
         />
+        <div
+          style={{
+            position: "sticky",
+            bottom: 0,
+            zIndex: 20,
+            background: "#fff",
+            padding: "8px 12px",
+            borderTop: "1px solid #f0f0f0",
+            display: "flex",
+            justifyContent: "flex-end",
+          }}
+        >
+          <Pagination
+            current={safePage}
+            pageSize={pageSize}
+            total={total}
+            showSizeChanger
+            pageSizeOptions={["5", "10", "20", "50", "100"]}
+            showTotal={(t, range) => `${range[0]}-${range[1]} / ${t}`}
+            onChange={(p, ps) => {
+              if (ps !== pageSize) {
+                setPageSize(ps);
+                setPage(1);
+              } else {
+                setPage(p);
+              }
+            }}
+          />
+        </div>
       </Card>
 
       <BatchProgressModal
