@@ -25,4 +25,5 @@ export type WaAccountRow = {
 
   phone?: string | null;
   nickname?: string | null;
+  enabled?: boolean;
 };

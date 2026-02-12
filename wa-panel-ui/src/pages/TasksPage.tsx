@@ -22,6 +22,7 @@ import { getSocket } from "../lib/socket";
 import { getWsId } from "../lib/workspace";
 import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
 import { uid } from "../lib/storage";
+import { isSlotEnabled } from "../utils/enabledSlots";
 
 type HisItem = {
   id: string;
@@ -109,6 +110,7 @@ type AccRow = WaAccountRow & {
   phone?: string | null;
   nickname?: string | null;
   uid?: string | null;
+  enabled?: boolean;
 };
 
 export default function TasksPage() {
@@ -802,6 +804,10 @@ export default function TasksPage() {
     if (!role) return;
     if (!v) return message.error("请选择一个账号坑位");
 
+    if (!isSlotEnabled(v)) {
+      return message.error("该账号已停用，不能分配给角色");
+    }
+
     // 默认一个账号只绑定一个角色：先解绑其他用同 slot 的
     setRoles(prev =>
       prev
@@ -833,15 +839,17 @@ export default function TasksPage() {
         setRoles(prev => prev.map(r => (r.id === role.id ? { ...r, boundSlot: undefined } : r)));
       }
       if (key === "open_chat") {
-        if (!role.boundSlot) {
-          message.error("该角色未绑定账号");
-        } else {
-          try {
-            await http.post(`/api/accounts/${role.boundSlot}/open`);
-            message.success("已置顶打开");
-          } catch (e) {
-            message.error(String(e));
-          }
+        if (!role.boundSlot) return message.error("该角色未绑定账号");
+
+        const ext = role as any;
+        const to = String(ext?.phone || ext?.waId || ext?.chatId || "").trim();
+        if (!to) return message.error("该角色缺少手机号/waId，无法打开聊天");
+
+        try {
+          await http.post(`/api/accounts/${role.boundSlot}/openChat`, { to });
+          message.success("已打开聊天");
+        } catch (e: any) {
+          message.error(e?.response?.data?.error || e?.message || "打开失败");
         }
       }
 
@@ -1092,11 +1100,13 @@ export default function TasksPage() {
         <Space size={8} wrap>
           <b style={{ width: 44, display: "inline-block" }}>{a.slot}</b>
           <Tag color={statusColor(a.status)}>{a.status}</Tag>
+          {a.enabled === false && <Tag color="default">停用</Tag>}
           <span style={{ opacity: 0.9 }}>{a.phone || "-"}</span>
           <span style={{ opacity: 0.9 }}>{a.nickname || "-"}</span>
         </Space>
       ),
       rawLabel: slotLabel(a),
+      disabled: a.enabled === false,
     }));
   }, [accounts]);
 
@@ -1791,7 +1801,7 @@ export default function TasksPage() {
           </div>
 
           <div style={{ opacity: 0.75 }}>
-            小提示：如果 slot 不是 READY，也能绑定，但发送可能失败；你可以先去账号页「打开 → 登录/扫码」。
+            小提示：停用账号不可绑定；如果 slot 不是 READY，也能绑定，但发送可能失败；你可以先去账号页「打开 → 登录/扫码」。
           </div>
         </Space>
       </Modal>
