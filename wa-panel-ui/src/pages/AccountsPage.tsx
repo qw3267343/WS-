@@ -69,7 +69,6 @@ export default function AccountsPage() {
   const [enabledMap, setEnabledMap] = useState<Record<string, boolean>>(loadEnabledMap());
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
-
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
 
   useEffect(() => {
