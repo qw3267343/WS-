@@ -8,6 +8,7 @@ import {
   Progress,
   Select,
   Space,
+  Switch,
   Table,
   Tag,
   Typography,
@@ -21,6 +22,7 @@ import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
 import { getWsId, wsKey } from "../lib/workspace";
 import type { Role, WaAccountRow } from "../lib/types";
+import { loadEnabledMap, saveEnabledMap } from "../utils/enabledSlots";
 
 function statusColor(s: string) {
   if (s === "READY") return "green";
@@ -47,6 +49,7 @@ type AccRow = WaAccountRow & {
   uid?: string | null;
   phone?: string | null;
   nickname?: string | null;
+  enabled?: boolean;
 };
 
 type BatchResult =
@@ -62,6 +65,7 @@ export default function AccountsPage() {
   const [remarkQuery, setRemarkQuery] = useState("");
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchAction, setBatchAction] = useState<"connect" | "logout" | null>(null);
+  const [enabledMap, setEnabledMap] = useState<Record<string, boolean>>(loadEnabledMap());
 
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
 
@@ -75,7 +79,12 @@ export default function AccountsPage() {
     }
   }, [remarksStorageKey]);
 
+
+  useEffect(() => {
+    saveEnabledMap(enabledMap);
+  }, [enabledMap]);
   async function refresh() {
+    const currentEnabledMap = loadEnabledMap();
     const [accountsResp, rolesResp] = await Promise.all([
       http.get(`/api/accounts`),
       http.get(`/api/roles`),
@@ -84,9 +93,9 @@ export default function AccountsPage() {
 
     // 没账号时显示 A1 占位
     if (!list.length) {
-      setRows([{ slot: "A1", status: "NEW", lastQr: null, uid: null, phone: null, nickname: null }]);
+      setRows([{ slot: "A1", status: "NEW", lastQr: null, uid: null, phone: null, nickname: null, enabled: currentEnabledMap["A1"] !== false }]);
     } else {
-      setRows(list);
+      setRows(list.map(r => ({ ...r, enabled: currentEnabledMap[r.slot] !== false })));
     }
 
     const roleList = Array.isArray(rolesResp.data?.roles) ? (rolesResp.data.roles as Role[]) : [];
@@ -115,12 +124,31 @@ export default function AccountsPage() {
           };
           return next;
         }
-        return [{ slot, status: p.status || "NEW", lastQr: null, uid: p.uid ?? null, phone: p.phone ?? null, nickname: p.nickname ?? null }, ...prev];
+        return [{ slot, status: p.status || "NEW", lastQr: null, uid: p.uid ?? null, phone: p.phone ?? null, nickname: p.nickname ?? null, enabled: loadEnabledMap()[slot] !== false }, ...prev];
       });
     };
 
     s.on("wa:status", onStatus);
     return () => { s.off("wa:status", onStatus); };
+  }, []);
+
+
+  useEffect(() => {
+    let stopped = false;
+    let t: any;
+
+    async function tick() {
+      if (stopped) return;
+      const delay = document.hidden ? 5000 : 1500;
+      try { await refresh(); } catch {}
+      t = setTimeout(tick, delay);
+    }
+
+    tick();
+    return () => {
+      stopped = true;
+      if (t) clearTimeout(t);
+    };
   }, []);
 
   function boundRole(slot: string) {
@@ -151,8 +179,13 @@ export default function AccountsPage() {
   }
 
   async function connect(slot: string) {
+    const row = rows.find((x) => x.slot === slot);
+    if (row?.enabled === false) {
+      message.warning("账号已停用，跳过登录");
+      return;
+    }
     try {
-      await http.post(`/api/accounts/${slot}/connect`);
+      await http.post(`/api/accounts/${slot}/connect?force=1`);
       message.success("已触发连接/扫码（等待二维码/浏览器窗口）");
     } catch (e: any) {
       message.error("连接失败：" + (e?.response?.data?.error || e.message));
@@ -229,10 +262,7 @@ export default function AccountsPage() {
   const rowSelection: TableProps<AccRow>['rowSelection'] = {
     selectedRowKeys: selectedKeys,
     onChange: (keys: React.Key[]) => setSelectedKeys(keys),
-    // 占位 A1 且没有 uid 的不允许勾选（可选）
-    getCheckboxProps: (r) => ({
-      disabled: r.status === "NEW" && !r.uid && r.slot === "A1" && rows.length === 1
-    })
+    getCheckboxProps: (record) => ({ disabled: record.enabled === false })
   };
 
   const columns: ColumnsType<AccRow> = [
@@ -273,6 +303,26 @@ export default function AccountsPage() {
           }}
           onBlur={(e) => commitRemark(r.slot, e.currentTarget.value)}
           onPressEnter={(e) => commitRemark(r.slot, e.currentTarget.value)}
+        />
+      )
+    },
+
+    {
+      title: "启用",
+      dataIndex: "enabled",
+      width: 90,
+      render: (_: any, r) => (
+        <Switch
+          checked={r.enabled !== false}
+          onChange={(v) => {
+            setEnabledMap(m => ({ ...m, [r.slot]: v }));
+            setRows(prev => prev.map(item => (item.slot === r.slot ? { ...item, enabled: v } : item)));
+            setSelectedKeys(prev => prev.filter(k => k !== r.slot));
+            if (v === false) {
+              void http.post(`/api/accounts/${r.slot}/destroy`).catch(() => {});
+            }
+          }}
+          size="small"
         />
       )
     },
@@ -458,13 +508,55 @@ function BatchProgressModal(props: {
     }
   }, [props.open, props.action, props.slots]);
 
+  function sleep(ms: number) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  async function waitSlotReady(slot: string, timeoutMs: number) {
+    const start = Date.now();
+    while (true) {
+      const { data } = await http.get(`/api/accounts/${slot}/status`);
+      const st = data?.status;
+
+      if (st === "READY") return;
+      if (st === "AUTH_FAILURE") throw new Error("AUTH_FAILURE");
+      if (st === "DISCONNECTED") throw new Error("DISCONNECTED");
+
+      if (Date.now() - start > timeoutMs) throw new Error("TIMEOUT");
+      await sleep(800);
+    }
+  }
+
+  async function waitCpuBelow(
+    threshold = 30,
+    stableChecks = 3,
+    intervalMs = 2000,
+    maxWaitMs = 120000,
+  ) {
+    const start = Date.now();
+    let okStreak = 0;
+
+    while (true) {
+      const { data } = await http.get(`/api/system/cpu`);
+      const cpu = Number(data?.cpu ?? 100);
+
+      if (cpu < threshold) okStreak++;
+      else okStreak = 0;
+
+      if (okStreak >= stableChecks) return;
+      if (Date.now() - start > maxWaitMs) return;
+      await sleep(intervalMs);
+    }
+  }
+
   async function onRun() {
     if (!props.slots.length || !props.action) {
       message.warning("请先勾选账号");
       return;
     }
-
-    const rowMap = new Map(props.rows.map((r) => [r.slot, r]));
+    const cooldownMs = 8000;
+    const waitTimeoutMs = 10 * 60 * 1000;
+    const cpuThreshold = 30;
 
     setRunning(true);
     setTotal(props.slots.length);
@@ -475,27 +567,38 @@ function BatchProgressModal(props: {
 
     await runPool(props.slots, concurrency, async (slot) => {
       try {
+        const row = props.rows.find(r => r.slot === slot);
+        if (row?.enabled === false) {
+          setResults(prev => [...prev, { ok: true, slot }]);
+          setOkCount(x => x + 1);
+          return;
+        }
+
         if (props.action === "connect") {
-          const row = rowMap.get(slot);
-          if (row?.status === "READY") {
-            setResults((prev) => [...prev, { ok: true, slot }]);
-            setOkCount((x) => x + 1);
-            return;
-          }
-          await http.post(`/api/accounts/${slot}/connect`);
+          await waitCpuBelow(cpuThreshold);
+
+          await sleep(300 + Math.random() * 700);
+
+          await http.post(`/api/accounts/${slot}/connect?force=1`);
+
+          await waitSlotReady(slot, waitTimeoutMs);
+
+          await sleep(cooldownMs);
+          await waitCpuBelow(cpuThreshold);
         } else {
           await http.post(`/api/accounts/${slot}/logout`);
+          await sleep(300);
         }
-        setResults((prev) => [...prev, { ok: true, slot }]);
-        setOkCount((x) => x + 1);
+        setResults(prev => [...prev, { ok: true, slot }]);
+        setOkCount(x => x + 1);
       } catch (e: any) {
-        setResults((prev) => [
+        setResults(prev => [
           ...prev,
           { ok: false, slot, error: String(e?.response?.data?.error || e?.message || "unknown error") },
         ]);
-        setFailCount((x) => x + 1);
+        setFailCount(x => x + 1);
       } finally {
-        setDone((x) => x + 1);
+        setDone(x => x + 1);
       }
     });
 
