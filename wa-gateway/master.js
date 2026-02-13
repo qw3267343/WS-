@@ -585,7 +585,7 @@ app.post('/api/accounts/create', (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
-});
+
 app.get('/api/roles', (req, res) => {
   const ws = getWsFromReq(req);
   const running = ensureProjectRunning(ws);
@@ -780,6 +780,7 @@ server.listen(PORT_MASTER, () => {
   if (!fs.existsSync(PROJECTS_FILE)) writeJson(PROJECTS_FILE, []);
   if (!fs.existsSync(PROJECT_COUNTER_FILE)) fs.writeFileSync(PROJECT_COUNTER_FILE, '100000', 'utf-8');
   if (!fs.existsSync(UID_COUNTER_FILE)) fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), 'utf-8');
+
   migrateProjects();
   loadWorkersPool();
   log('info', 'master_listen', { port: PORT_MASTER, workerPoolSize: WORKER_POOL_SIZE });
