@@ -7,14 +7,12 @@ const http = require("http");
 
 let win = null;
 let isQuitting = false;
-let masterProc = null;  // 改为 master 进程
+let masterProc = null;
 
-// ✅ 统一数据目录到 Roaming\@ws-manager（你想要的方案）
 const WS_HOME = path.join(app.getPath("appData"), "@ws-manager");
 app.setPath("userData", WS_HOME);
 fs.mkdirSync(app.getPath("userData"), { recursive: true });
 
-// ✅ 单实例，避免误点多开
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
 app.on("second-instance", () => {
@@ -26,12 +24,15 @@ app.on("second-instance", () => {
 
 function safeKill(proc) {
   try {
-    if (!proc) return;
+    if (!proc || proc.exitCode !== null) return;
     if (process.platform === "win32") {
       spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { windowsHide: true });
-    } else {
-      proc.kill("SIGKILL");
+      return;
     }
+    proc.kill("SIGTERM");
+    setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+    }, 1000);
   } catch {}
 }
 
@@ -50,52 +51,79 @@ function getUiIndexPath() {
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
-// ✅ 修改：启动 master.js 而非 server.js，强制使用 AppData
-function startMaster() {
-  // 防重复启动
-  if (masterProc && masterProc.exitCode === null) return;
+function isBackendDisabled() {
+  return String(process.env.DISABLE_BACKEND_AUTOSTART || "").trim() === "1";
+}
 
-  const isDev = !app.isPackaged;
+function waitForHealth({ host = "127.0.0.1", port = 3000, timeoutMs = 15000 } = {}) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const req = http.get({ host, port, path: "/health", timeout: 1500 }, (res) => {
+        const ok = res.statusCode === 200;
+        res.resume();
+        if (ok) return resolve(true);
+        if (Date.now() - start >= timeoutMs) return reject(new Error(`health returned ${res.statusCode}`));
+        setTimeout(tick, 350);
+      });
 
-  const gatewayDir = isDev
-    ? path.join(__dirname, "..", "wa-gateway")
-    : path.join(process.resourcesPath, "wa-gateway");
+      req.on("timeout", () => req.destroy(new Error("timeout")));
+      req.on("error", () => {
+        if (Date.now() - start >= timeoutMs) {
+          reject(new Error("master not ready (timeout)"));
+        } else {
+          setTimeout(tick, 350);
+        }
+      });
+    };
+    tick();
+  });
+}
 
-  const entry = path.join(gatewayDir, "master.js");  // 改为 master.js
+async function startBackend() {
+  if (isBackendDisabled()) {
+    console.log("[backend] autostart disabled by DISABLE_BACKEND_AUTOSTART=1");
+    return;
+  }
 
-  // 运行数据目录：统一放在 userData 下
-  const rootDir = path.join(app.getPath("userData"), "wa-gateway-data");
-  fs.mkdirSync(rootDir, { recursive: true });
+  const rootDir = path.join(app.getPath("appData"), "@ws-manager", "wa-gateway-data");
   const configDir = path.join(rootDir, "data");
   const workDir = path.join(rootDir, "work");
   fs.mkdirSync(configDir, { recursive: true });
-  fs.mkdirSync(workDir, { recursive: true });
+  fs.mkdirSync(path.join(workDir, "w1"), { recursive: true });
+  fs.mkdirSync(path.join(workDir, "w2"), { recursive: true });
 
-  // 日志文件
-  const logDir = app.getPath("userData");
-  const out = fs.openSync(path.join(logDir, "master.out.log"), "a");
-  const err = fs.openSync(path.join(logDir, "master.err.log"), "a");
+  try {
+    await waitForHealth({ port: 3000, timeoutMs: 1200 });
+    console.log("[backend] reusing running master on :3000");
+    return;
+  } catch {}
 
-  // 构建环境变量
+  if (masterProc && masterProc.exitCode === null) return;
+
+  const isDev = !app.isPackaged;
+  const gatewayDir = isDev
+    ? path.join(__dirname, "..", "wa-gateway")
+    : path.join(process.resourcesPath, "wa-gateway");
+  const entry = path.join(gatewayDir, "master.js");
+
+  const out = fs.openSync(path.join(app.getPath("userData"), "master.out.log"), "a");
+  const err = fs.openSync(path.join(app.getPath("userData"), "master.err.log"), "a");
+
   const env = {
     ...process.env,
     PORT_MASTER: "3000",
     PREWARM: "2",
     LOG_LEVEL: "info",
+    DATA_DIR: rootDir,
     CONFIGDIR: configDir,
     SHARDS_JSON: JSON.stringify([
       { id: 1, port: 3001, from: "A1", to: "A30", workdir: path.join(workDir, "w1") },
       { id: 2, port: 3002, from: "A31", to: "A60", workdir: path.join(workDir, "w2") },
     ]),
-    // 让 Electron 以 Node 模式运行脚本（避免弹出新窗口）
     ELECTRON_RUN_AS_NODE: "1",
   };
 
-  console.log("[master] entry=", entry);
-  console.log("[master] CONFIGDIR=", configDir);
-  console.log("[master] workDir=", workDir);
-
-  // 使用 process.execPath 启动（Electron 自带的 Node）
   masterProc = spawn(process.execPath, [entry], {
     cwd: gatewayDir,
     windowsHide: true,
@@ -103,37 +131,10 @@ function startMaster() {
     stdio: ["ignore", out, err],
   });
 
-  masterProc.on("exit", (code) => console.log("[master] exited", code));
-  masterProc.on("error", (e) => console.error("[master] spawn error", e));
-}
+  masterProc.on("exit", (code) => console.log("[backend] master exited", code));
+  masterProc.on("error", (e) => console.error("[backend] master spawn error", e));
 
-// ✅ 修改默认端口为 3000（master 的端口）
-function waitForMaster({ host = "127.0.0.1", port = 3000, timeoutMs = 20000 } = {}) {
-  const start = Date.now();
-
-  return new Promise((resolve, reject) => {
-    const tick = () => {
-      const req = http.get(
-        { host, port, path: "/health", timeout: 1500 },
-        (res) => {
-          // 只要能连上并返回（200/404都行），基本说明服务已起来
-          res.resume();
-          resolve(true);
-        }
-      );
-
-      req.on("timeout", () => req.destroy(new Error("timeout")));
-      req.on("error", () => {
-        if (Date.now() - start >= timeoutMs) {
-          reject(new Error("master not ready (timeout)"));
-        } else {
-          setTimeout(tick, 400);
-        }
-      });
-    };
-
-    tick();
-  });
+  await waitForHealth({ port: 3000, timeoutMs: 15000 });
 }
 
 function createMainWindow() {
@@ -156,9 +157,6 @@ function createMainWindow() {
   }
 
   win.loadFile(uiIndex);
-
-  // 调试用
-  // win.webContents.openDevTools();
 
   win.on("close", async (e) => {
     if (isQuitting) return;
@@ -198,27 +196,19 @@ function openProjectWindow(projectId) {
     },
   });
 
-  // ✅ HashRouter：用 loadFile 的 hash 选项跳转到 #/w/:id/tasks
   child.loadFile(uiIndex, { hash: `/w/${projectId}/tasks` });
-
-  // 调试用
-  // child.webContents.openDevTools();
 }
 
 app.whenReady().then(async () => {
-  startMaster();  // 启动 master
-
   try {
-    await waitForMaster({ port: 3000, timeoutMs: 20000 });  // 等待 master 就绪
+    await startBackend();
   } catch (e) {
-    console.error("[master] not ready:", e);
-    // 不中断启动：UI 依然打开，前端会自动重试
+    console.error("[backend] failed to start", e);
   }
 
   createMainWindow();
 });
 
-// ✅ 前端请求打开新窗口
 ipcMain.handle("ws:openProjectWindow", async (_event, projectId) => {
   openProjectWindow(projectId);
   return true;

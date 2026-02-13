@@ -15,7 +15,7 @@
       "output": "dist",
       "buildResources": "build"
     },
-    "asar": false,
+    "asar": true,
     "files": [
       "**/*"
     ],
@@ -28,16 +28,22 @@
         ]
       },
       {
-        "from": "../wa-gateway",
-        "to": "wa-gateway",
+        "from": "../wa-gateway/master.js",
+        "to": "wa-gateway/master.js"
+      },
+      {
+        "from": "../wa-gateway/server.js",
+        "to": "wa-gateway/server.js"
+      },
+      {
+        "from": "../wa-gateway/package.json",
+        "to": "wa-gateway/package.json"
+      },
+      {
+        "from": "../wa-gateway/docs",
+        "to": "wa-gateway/docs",
         "filter": [
-          "**/*",
-          "!data/**",
-          "!_uploads/**",
-          "!.wwebjs_cache/**",
-          "!.wwebjs_auth/**",
-          "!**/*.log",
-          "!**/*.tmp"
+          "**/*"
         ]
       },
       {
@@ -60,6 +66,9 @@
       "createStartMenuShortcut": true,
       "shortcutName": "WAStack"
     },
-    "publish": []
+    "publish": [],
+    "asarUnpack": [
+      "**/wa-gateway/**"
+    ]
   }
 }

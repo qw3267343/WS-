@@ -68,14 +68,14 @@ const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
 // ✅ CONFIG_ROOT：共享配置根（读写 accounts/roles/groups/...）
 const CONFIG_ROOT = path.resolve(
   process.env.CONFIGDIR ||
-  (process.env.DATA_DIR ? path.join(process.env.DATA_DIR, "data") : DEFAULT_CONFIG_ROOT)
+  path.join(DATA_ROOT, "data")
 );
 
 // ✅ WORK_ROOT：运行态根（wwebjs_auth/浏览器 profile 等）
 // worker 模式下 master 会传 WORKDIR（例如 ...\work\w1）；单 worker 模式可用 DEFAULT_WORK_ROOT
 const WORK_ROOT = path.resolve(
   process.env.WORKDIR ||
-  (process.env.DATA_DIR ? path.join(process.env.DATA_DIR, "work") : DEFAULT_WORK_ROOT)
+  path.join(DATA_ROOT, "work")
 );
 
 const RECENT_LOG_LIMIT = Math.max(10, Number(process.env.RECENT_LOG_LIMIT || 200));
