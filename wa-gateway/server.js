@@ -139,6 +139,53 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ====== M5 guard: enforce slot ownership at the framework level ======
+function parseSlotNumber(slot) {
+  const m = String(slot || '').trim().toUpperCase().match(/^A(\d+)$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getWorkerRange() {
+  const fromRaw = process.env.SLOT_FROM;
+  const toRaw = process.env.SLOT_TO;
+  const from = fromRaw != null && String(fromRaw).trim() !== '' ? Number(fromRaw) : null;
+  const to   = toRaw   != null && String(toRaw).trim()   !== '' ? Number(toRaw)   : null;
+  return {
+    from: Number.isFinite(from) ? from : null,
+    to: Number.isFinite(to) ? to : null,
+  };
+}
+
+function isSlotInWorkerRange(slot) {
+  const { from, to } = getWorkerRange();
+  // 未设置分段 => 视为不限制（兼容单 worker）
+  if (from == null || to == null) return true;
+  const n = parseSlotNumber(slot);
+  if (n == null) return false;
+  return n >= from && n <= to;
+}
+
+// ⚠️ 全局拦截所有带 :slot 的路由（connect/status/open/openChat/logout/...）
+app.param('slot', (req, res, next, raw) => {
+  const slot = String(raw || '').trim().toUpperCase();
+  req.params.slot = slot;
+
+  // 你的项目里已有 isValidSlot(slot) / normalizeSlot(slot) 也行
+  if (!/^A\d+$/i.test(slot)) {
+    return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
+  }
+
+  if (!isSlotInWorkerRange(slot)) {
+    return res.status(409).json({ ok: false, error: 'slot not in this worker' });
+  }
+
+  return next();
+});
+// ====== end guard ======
+
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 

@@ -37,24 +37,49 @@ function resolveWs(raw) {
   const s = String(raw || 'default').trim().replace(/[^A-Za-z0-9_-]/g, '_');
   return s || 'default';
 }
-function slotToNumber(slot) {
-  const m = /^A(\d+)$/i.exec(String(slot || '').trim());
-  return m ? Number(m[1]) : null;
+function slotToNumber(v) {
+  if (v == null) return null;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+
+  const s = String(v).trim().toUpperCase();
+  // 支持 A123
+  let m = /^A(\d+)$/.exec(s);
+  if (m) return Number(m[1]);
+  // 支持 123
+  m = /^(\d+)$/.exec(s);
+  if (m) return Number(m[1]);
+
+  return null;
 }
 function shardForSlot(slot) {
   const n = slotToNumber(slot);
   if (!Number.isFinite(n)) return null;
-  return shards.find((s) => {
-    const from = slotToNumber(s.from);
-    const to = slotToNumber(s.to);
-    return (!Number.isFinite(from) || n >= from) && (!Number.isFinite(to) || n <= to);
-  }) || null;
+
+  return (
+    shards.find((s) => {
+      const from = slotToNumber(s.from);
+      const to = slotToNumber(s.to);
+      if (Number.isFinite(from) && n < from) return false;
+      if (Number.isFinite(to) && n > to) return false;
+      return true;
+    }) || null
+  );
 }
 function parseSlot(req) {
-  const m = /^\/api\/accounts\/([^/]+)/.exec(req.path);
+  const fullPath = `${req.baseUrl || ''}${req.path || ''}`; // 例如 /api/accounts/A61/connect 或 /api + /accounts/A61/connect
+  let m = /\/accounts\/(A\d+)(\/|$)/i.exec(fullPath);
   if (m) return String(m[1]).toUpperCase();
+
+  // 兜底：有些场景 baseUrl/path 不好用，直接用 originalUrl
+  const ou = String(req.originalUrl || req.url || '');
+  m = /\/accounts\/(A\d+)(\/|$)/i.exec(ou);
+  if (m) return String(m[1]).toUpperCase();
+
+  // body 兜底（roles/batch 等）
   const body = req.body || {};
-  return String(body.slot || body.boundSlot || body?.role?.boundSlot || '').trim().toUpperCase() || null;
+  const cand = body.slot || body.boundSlot || body?.role?.boundSlot || '';
+  const s = String(cand).trim().toUpperCase();
+  return /^A\d+$/.test(s) ? s : null;
 }
 
 function readJson(file, fallback) {
@@ -90,15 +115,18 @@ async function ensureWorkerRunning(shard) {
     return workers.get(shard.id);
   }
 
-  const env = {
-    ...process.env,
-    PORT: String(shard.port),
-    CONFIGDIR: CONFIG_ROOT,
-    WORKDIR: path.resolve(shard.workdir || `./data_${shard.id}`),
-    SLOT_FROM: String(shard.from),
-    SLOT_TO: String(shard.to),
-    MASTER_INTERNAL_URL: `http://127.0.0.1:${PORT_MASTER}`,
-  };
+const fromN = slotToNumber(shard.from);
+const toN   = slotToNumber(shard.to);
+
+const env = {
+  ...process.env,
+  PORT: String(shard.port),
+  CONFIGDIR: CONFIG_ROOT,
+  WORKDIR: path.resolve(shard.workdir || `./data_${shard.id}`),
+  SLOT_FROM: fromN == null ? '' : String(fromN),
+  SLOT_TO:   toN == null ? '' : String(toN),
+  MASTER_INTERNAL_URL: `http://127.0.0.1:${PORT_MASTER}`,
+};
   if (MASTER_TOKEN) env.MASTER_TOKEN = MASTER_TOKEN;
   if (MAX_ACTIVE) env.MAX_ACTIVE = String(MAX_ACTIVE);
   if (MAX_INIT) env.MAX_INIT = String(MAX_INIT);
@@ -210,9 +238,14 @@ app.get('/api/groups', (req, res, next) => {
 
 app.use('/api', async (req, res) => {
   try {
+    // 这些由 master 本地读已经有 app.get('/api/accounts|roles|groups') 覆盖了
+    // 其它 /api 请求：必须能解析到 slot 才能路由
     const slot = parseSlot(req);
-    let shard = slot ? shardForSlot(slot) : shards[0];
-    if (!shard) return res.status(400).json({ ok: false, error: 'slot required for routing' });
+    if (!slot) return res.status(400).json({ ok: false, error: 'slot required for routing' });
+
+    const shard = shardForSlot(slot);
+    if (!shard) return res.status(404).json({ ok: false, error: 'no shard for slot' });
+
     await ensureWorkerRunning(shard);
     await proxyToShard(req, res, shard);
   } catch (e) {
