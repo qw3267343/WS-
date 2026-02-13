@@ -24,6 +24,8 @@ const MAX_ACTIVE = 13;
 const UNBIND_COOLDOWN_MS = Math.max(0, Number(process.env.UNBIND_COOLDOWN_MS || 120000));
 const PROJECTS_FILE = path.join(CONFIG_ROOT, 'projects.json');
 const PROJECT_COUNTER_FILE = path.join(CONFIG_ROOT, 'project_counter.txt');
+const UID_COUNTER_FILE = path.join(CONFIG_ROOT, 'uid_counter.txt');
+const UID_START = 100001;
 
 const RECENT_LOGS = [];
 const workers = new Map(); // workerId -> {child,state,startingPromise,ws}
@@ -95,6 +97,49 @@ function loadLease(ws) {
 function saveLease(ws) { writeJson(wsLeaseFile(ws), loadLease(ws)); }
 function setLeaseWorker(ws, slot, workerId) { const lease = loadLease(ws); lease[slot] = workerId; saveLease(ws); }
 function releaseLease(ws, slot) { const lease = loadLease(ws); delete lease[slot]; saveLease(ws); }
+
+function isValidSlot(slot) { return /^A\d+$/i.test(String(slot || '').trim()); }
+function normalizeSlot(slot) {
+  const m = /^A(\d+)$/i.exec(String(slot || '').trim());
+  return m ? `A${Number(m[1])}` : '';
+}
+function accountsFile(ws) { return path.join(wsDir(ws), 'accounts.json'); }
+function accountsLockFile(ws) { return `${accountsFile(ws)}.lock`; }
+function readLastUid() {
+  try {
+    const n = Number(String(fs.readFileSync(UID_COUNTER_FILE, 'utf-8') || '').trim());
+    return Number.isFinite(n) ? n : (UID_START - 1);
+  } catch {
+    return (UID_START - 1);
+  }
+}
+function writeLastUid(n) { fs.writeFileSync(UID_COUNTER_FILE, String(n), 'utf-8'); }
+function allocateNextUid(currentAccountsList) {
+  const used = new Set((currentAccountsList || []).map((x) => String(x?.uid || '').trim()).filter(Boolean));
+  return withFileLockSync(`${UID_COUNTER_FILE}.lock`, () => {
+    let last = readLastUid();
+    for (const u of used) {
+      const n = Number(u);
+      if (Number.isFinite(n) && n > last) last = n;
+    }
+    let next = Math.max(last + 1, UID_START);
+    while (used.has(String(next))) next++;
+    writeLastUid(next);
+    return String(next);
+  });
+}
+function buildSessionDir(uid) {
+  const v = String(uid || '').trim();
+  return v ? `session-${v}` : '';
+}
+function nextSlotLabel(list) {
+  let max = 0;
+  for (const a of (list || [])) {
+    const m = /^A(\d+)$/i.exec(String(a?.slot || ''));
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `A${max + 1}`;
+}
 
 function safeProjectId(raw) {
   const s = String(raw || '').trim();
@@ -500,11 +545,47 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/accounts', (req, res) => {
   const ws = getWsFromReq(req);
-  const running = ensureProjectRunning(ws);
-  if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
-  const rows = readJson(path.join(wsDir(ws), 'accounts.json'), []);
-  return res.json({ ok: true, data: rows });
+  const rows = readJson(accountsFile(ws), []);
+  return res.json({ ok: true, data: Array.isArray(rows) ? rows : [] });
 });
+app.post('/api/accounts/create', (req, res) => {
+  try {
+    const ws = getWsFromReq(req);
+    ensureDir(wsDir(ws));
+    const requestedSlot = normalizeSlot(req.body?.slot);
+    const enabled = req.body?.enabled !== false;
+    let result = null;
+    let invalid = false;
+
+    withFileLockSync(accountsLockFile(ws), () => {
+      const listRaw = readJson(accountsFile(ws), []);
+      const list = Array.isArray(listRaw) ? listRaw : [];
+      let slot = requestedSlot || nextSlotLabel(list);
+      slot = normalizeSlot(slot);
+      if (!isValidSlot(slot)) {
+        invalid = true;
+        return;
+      }
+
+      const existed = list.find((x) => String(x?.slot || '').toUpperCase() === slot);
+      if (existed) {
+        result = existed;
+        return;
+      }
+
+      const uid = allocateNextUid(list);
+      const acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now(), enabled };
+      list.push(acc);
+      writeJson(accountsFile(ws), list);
+      result = acc;
+    });
+
+    if (invalid) return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
+    return res.json({ ok: true, data: result });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+
 app.get('/api/roles', (req, res) => {
   const ws = getWsFromReq(req);
   const running = ensureProjectRunning(ws);
@@ -698,6 +779,8 @@ server.listen(PORT_MASTER, () => {
   ensureDir(WORK_ROOT);
   if (!fs.existsSync(PROJECTS_FILE)) writeJson(PROJECTS_FILE, []);
   if (!fs.existsSync(PROJECT_COUNTER_FILE)) fs.writeFileSync(PROJECT_COUNTER_FILE, '100000', 'utf-8');
+  if (!fs.existsSync(UID_COUNTER_FILE)) fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), 'utf-8');
+
   migrateProjects();
   loadWorkersPool();
   log('info', 'master_listen', { port: PORT_MASTER, workerPoolSize: WORKER_POOL_SIZE });
