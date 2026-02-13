@@ -237,12 +237,44 @@ const scheduleUpload = multer({
 
 // ===== JSON helpers (atomic) =====
 function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return fallback; }
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch {
+    const bak = file + '.bak';
+    try {
+      const recovered = JSON.parse(fs.readFileSync(bak, 'utf-8'));
+      // 备份可读时，尝试恢复主文件
+      try {
+        const tmp = file + '.tmp';
+        const fd = fs.openSync(tmp, 'w');
+        try {
+          fs.writeFileSync(fd, JSON.stringify(recovered, null, 2), 'utf-8');
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        fs.renameSync(tmp, file);
+      } catch {}
+      return recovered;
+    } catch {
+      return fallback;
+    }
+  }
 }
 function writeJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  const bak = file + '.bak';
+  if (fs.existsSync(file)) {
+    try { fs.copyFileSync(file, bak); } catch {}
+  }
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    fs.writeFileSync(fd, JSON.stringify(data, null, 2), 'utf-8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, file);
 }
 function formatTrashTs(d = new Date()) {
@@ -328,10 +360,14 @@ function newId() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function getWs(req) {
-  const raw = req.query?.ws || req.headers['x-ws'] || 'default';
+function resolveWs(raw) {
   const ws = safeId(raw);
   return ws || 'default';
+}
+
+function getWs(req) {
+  const raw = req.query?.ws || req.headers['x-ws'] || 'default';
+  return resolveWs(raw);
 }
 
 function getWorkspaceDir(ws) {
@@ -682,11 +718,22 @@ function cleanupScheduledUploads(ws, jobId) {
 // ---------- 运行态：按 ws 分桶 ----------
 const contexts = new Map(); // ws -> { clients, statuses, profiles }
 const CONNECT_INFLIGHT = new Map();
+const SLOT_QUEUES = new Map();
 let initRunning = 0;
 const initQueue = [];
 
 function inflightKey(ws, slot) {
   return `${ws}::${slot}`;
+}
+
+function enqueueSlot(ws, slot, fn) {
+  const key = inflightKey(ws, slot);
+  const prev = SLOT_QUEUES.get(key) || Promise.resolve();
+  const run = prev.catch(() => {}).then(() => fn());
+  SLOT_QUEUES.set(key, run.finally(() => {
+    if (SLOT_QUEUES.get(key) === run) SLOT_QUEUES.delete(key);
+  }));
+  return run;
 }
 
 async function singleflight(ws, slot, fn) {
@@ -958,7 +1005,8 @@ cleanupTrash();
 setInterval(() => cleanupTrash(), TRASH_CLEAN_INTERVAL_MS);
 
 io.on('connection', (socket) => {
-  const ws = safeId(socket.handshake.query?.ws) || 'default';
+  const raw = socket.handshake.query?.ws || socket.handshake.headers?.['x-ws'] || 'default';
+  const ws = resolveWs(Array.isArray(raw) ? raw[0] : raw);
   socket.join(ws);
 });
 
@@ -1096,10 +1144,20 @@ app.get('/api/accounts/:slot/status', (req, res) => {
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
 
+  const acc = getAccountBySlot(ws, slot);
   const { statuses, profiles } = ctx(ws);
   const st = statuses.get(slot) || { status: 'NONE', lastQr: null };
-  const pf = profiles.get(slot) || null;
-  return res.json({ ok: true, slot, ...st, profile: pf });
+  const pf = profiles.get(slot) || { phone: null, nickname: null };
+  return res.json({
+    ok: true,
+    slot,
+    enabled: acc?.enabled !== false,
+    uid: acc?.uid || null,
+    status: st?.status || 'NONE',
+    lastQr: st?.lastQr ?? null,
+    phone: pf?.phone ?? null,
+    nickname: pf?.nickname ?? null,
+  });
 });
 
 app.post('/api/accounts/:slot/enabled', async (req, res) => {
@@ -1115,6 +1173,7 @@ app.post('/api/accounts/:slot/enabled', async (req, res) => {
   saveAccounts(ws, list);
   if (!enabled) {
     await destroyClient(ws, slot);
+    io.to(ws).emit('wa:status', { slot, uid: list[idx]?.uid || null, status: 'DISCONNECTED' });
   }
   return res.json({ ok: true, slot, enabled });
 });
@@ -1131,18 +1190,20 @@ function cpuAverage() {
   return { idle, total };
 }
 
-app.get('/api/system/cpu', async (_req, res) => {
+let cpuSnapshotPrev = cpuAverage();
+let cpuLast = 0;
+setInterval(() => {
   try {
-    const start = cpuAverage();
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    const end = cpuAverage();
-    const idle = end.idle - start.idle;
-    const total = end.total - start.total;
-    const cpu = total <= 0 ? 0 : Number(((1 - idle / total) * 100).toFixed(1));
-    return res.json({ ok: true, cpu });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+    const now = cpuAverage();
+    const idle = now.idle - cpuSnapshotPrev.idle;
+    const total = now.total - cpuSnapshotPrev.total;
+    cpuLast = total <= 0 ? 0 : Number(((1 - idle / total) * 100).toFixed(1));
+    cpuSnapshotPrev = now;
+  } catch {}
+}, 1000).unref();
+
+app.get('/api/system/cpu', (_req, res) => {
+  return res.json({ ok: true, cpu: cpuLast });
 });
 
 app.get('/api/accounts/:slot/groups', async (req, res) => {
@@ -1300,6 +1361,15 @@ app.post('/api/roles/batch', (req, res) => {
     ensureWorkspace(ws);
     const roles = Array.isArray(req.body?.roles) ? req.body.roles : null;
     if (!roles) return res.status(400).json({ ok: false, error: 'roles must be an array' });
+
+    for (const role of roles) {
+      const slot = normalizeSlot(role?.boundSlot);
+      if (!slot) continue;
+      const acc = getAccountBySlot(ws, slot);
+      if (!acc) return res.status(400).json({ ok: false, error: `bound slot not found: ${slot}` });
+      if (acc.enabled === false) return res.status(400).json({ ok: false, error: `bound slot disabled: ${slot}` });
+    }
+
     saveRoles(ws, roles);
     return res.json({ ok: true, roles });
   } catch (e) {
@@ -1442,98 +1512,136 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
 
-  const { statuses } = ctx(ws);
-  const force = req.query.force === '1' || req.body?.force === true;
-  const st = statuses.get(slot)?.status;
-  if (force || st === 'AUTH_FAILURE' || st === 'DISCONNECTED') {
-    await destroyClient(ws, slot);
-  }
-
-  const acc = ensureAccount(ws, slot);
-  if (acc.enabled === false) return res.status(400).json({ ok: false, error: 'account disabled' });
-
-  try {
-    await singleflight(ws, slot, async () => {
+  return enqueueSlot(ws, slot, async () => {
+    const { statuses } = ctx(ws);
+    const force = req.query.force === '1' || req.body?.force === true;
+    const st = statuses.get(slot)?.status;
+    if (force || st === 'AUTH_FAILURE' || st === 'DISCONNECTED') {
       await destroyClient(ws, slot);
-      const client = ensureClient(ws, slot);
+    }
 
-      await withInitLimit(async () => {
-        await client.initialize();
+    const acc = ensureAccount(ws, slot);
+    if (acc.enabled === false) return res.status(400).json({ ok: false, error: 'account disabled' });
+
+    try {
+      await singleflight(ws, slot, async () => {
+        await destroyClient(ws, slot);
+        const client = ensureClient(ws, slot);
+
+        await withInitLimit(async () => {
+          await client.initialize();
+        });
+
+        const page = await getPupPage(client).catch(() => null);
+        await restoreAndFocus(page);
       });
-
-      const page = await getPupPage(client).catch(() => null);
-      await restoreAndFocus(page);
-    });
-    res.json({ ok: true, data: acc });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+      res.json({ ok: true, data: acc });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  }).catch((e) => {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  });
 });
+
+async function rebuildClientAndGetPage(ws, slot) {
+  const acc = ensureAccount(ws, slot);
+  if (acc.enabled === false) throw new Error('account disabled');
+  await destroyClient(ws, slot);
+  const client = ensureClient(ws, slot);
+  await withInitLimit(async () => {
+    await client.initialize();
+  });
+  return getPupPage(client);
+}
 
 // 登出：不会删掉 slot->uid（以后可重复登录同一个坑位）
 app.post('/api/accounts/:slot/logout', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
-  const uid = getAccountBySlot(ws, slot)?.uid || null;
-  const { clients } = ctx(ws);
-  const client = clients.get(slot);
+  return enqueueSlot(ws, slot, async () => {
+    const uid = getAccountBySlot(ws, slot)?.uid || null;
+    const { clients } = ctx(ws);
+    const client = clients.get(slot);
 
-  try { await client?.logout?.(); } catch {}
-  await destroyClient(ws, slot);
+    try { await client?.logout?.(); } catch {}
+    await destroyClient(ws, slot);
 
-  const { statuses } = ctx(ws);
-  statuses.set(slot, { status: 'LOGGED_OUT', lastQr: null });
-  io.to(ws).emit('wa:status', { slot, uid, status: 'LOGGED_OUT' });
-  res.json({ ok: true });
+    const { statuses } = ctx(ws);
+    statuses.set(slot, { status: 'LOGGED_OUT', lastQr: null });
+    io.to(ws).emit('wa:status', { slot, uid, status: 'LOGGED_OUT' });
+    res.json({ ok: true });
+  }).catch((e) => {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  });
 });
 
 app.post('/api/accounts/:slot/destroy', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
-  await destroyClient(ws, slot);
-  const uid = getAccountBySlot(ws, slot)?.uid || null;
-  io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED' });
-  return res.json({ ok: true });
+  return enqueueSlot(ws, slot, async () => {
+    await destroyClient(ws, slot);
+    const uid = getAccountBySlot(ws, slot)?.uid || null;
+    io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED' });
+    return res.json({ ok: true });
+  }).catch((e) => {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  });
 });
 
 // 打开窗口（前置浏览器窗口）
 app.post('/api/accounts/:slot/open', async (req, res) => {
   const ws = getWs(req);
-  const { clients } = ctx(ws);
   const slot = normalizeSlot(req.params.slot);
-  const client = clients.get(slot);
-  if (!client) return res.status(400).json({ ok: false, error: 'client not initialized' });
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
 
-  const page = await getPupPage(client);
-  if (!page) return res.status(400).json({ ok: false, error: '当前版本无法获取页面对象（无法打开窗口）' });
+  return enqueueSlot(ws, slot, async () => {
+    const acc = ensureAccount(ws, slot);
+    if (acc.enabled === false) return res.status(400).json({ ok: false, error: 'account disabled' });
 
-  await restoreAndFocus(page);
-  return res.json({ ok: true });
+    const { clients } = ctx(ws);
+    let client = clients.get(slot);
+    let page = client ? await getPupPage(client) : null;
+
+    if (!page) page = await rebuildClientAndGetPage(ws, slot);
+    if (!page) return res.status(400).json({ ok: false, error: '当前版本无法获取页面对象（无法打开窗口）' });
+
+    try {
+      await restoreAndFocus(page);
+    } catch (e) {
+      if (!isDetachedErr(e)) throw e;
+      page = await rebuildClientAndGetPage(ws, slot);
+      if (!page) return res.status(400).json({ ok: false, error: '当前版本无法获取页面对象（无法打开窗口）' });
+      await restoreAndFocus(page);
+    }
+
+    return res.json({ ok: true });
+  }).catch((e) => {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  });
 });
 
 // 打开聊天（bringToFront + 跳到 phone 聊天页面）
 // body: { phone: "9477xxxxxxx", text?: "hello" } 也兼容 { to, text }
 app.post('/api/accounts/:slot/openChat', async (req, res) => {
   const ws = getWs(req);
-  const { clients, statuses } = ctx(ws);
-
   const slot = normalizeSlot(req.params.slot);
-  const client = clients.get(slot);
-  if (!client) return res.status(400).json({ ok: false, error: 'client not initialized' });
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
 
-  const st = statuses.get(slot)?.status;
-  if (st !== 'READY') return res.status(400).json({ ok: false, error: `slot not READY: ${st}` });
+  return enqueueSlot(ws, slot, async () => {
+    const { clients, statuses } = ctx(ws);
+    const acc = ensureAccount(ws, slot);
+    if (acc.enabled === false) return res.status(400).json({ ok: false, error: 'account disabled' });
 
-  const phoneRaw = String(req.body?.phone ?? req.body?.to ?? '').trim();
-  const text = String(req.body?.text ?? '').trim();
+    const st = statuses.get(slot)?.status;
+    if (st !== 'READY') return res.status(400).json({ ok: false, error: `slot not READY: ${st}` });
 
-  const phone = phoneRaw.replace(/[^\d]/g, '');
-  if (!phone) return res.status(400).json({ ok: false, error: 'phone required (digits only)' });
+    const phoneRaw = String(req.body?.phone ?? req.body?.to ?? '').trim();
+    const text = String(req.body?.text ?? '').trim();
 
-  try {
-    const page = await getPupPage(client);
-    if (!page?.goto) return res.status(400).json({ ok: false, error: 'cannot access browser page' });
+    const phone = phoneRaw.replace(/[^\d]/g, '');
+    if (!phone) return res.status(400).json({ ok: false, error: 'phone required (digits only)' });
 
     const url =
       'https://web.whatsapp.com/send?phone=' +
@@ -1542,13 +1650,26 @@ app.post('/api/accounts/:slot/openChat', async (req, res) => {
       encodeURIComponent(text) +
       '&app_absent=0';
 
-    await restoreAndFocus(page);
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    let client = clients.get(slot);
+    let page = client ? await getPupPage(client) : null;
+    if (!page?.goto) page = await rebuildClientAndGetPage(ws, slot);
+    if (!page?.goto) return res.status(400).json({ ok: false, error: 'cannot access browser page' });
+
+    try {
+      await restoreAndFocus(page);
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+    } catch (e) {
+      if (!isDetachedErr(e)) throw e;
+      page = await rebuildClientAndGetPage(ws, slot);
+      if (!page?.goto) return res.status(400).json({ ok: false, error: 'cannot access browser page' });
+      await restoreAndFocus(page);
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+    }
 
     return res.json({ ok: true, data: { slot, phone, url } });
-  } catch (e) {
+  }).catch((e) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+  });
 });
 
 async function deleteAccountHandler(req, res) {
