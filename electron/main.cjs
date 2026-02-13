@@ -1,5 +1,5 @@
 ﻿// electron/main.cjs
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { spawn } = require("child_process");
@@ -50,6 +50,87 @@ function getUiIndexPath() {
       ];
 
   return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
+function getAppBaseUrl() {
+  const fromEnv = String(process.env.APP_URL || "").trim();
+  if (fromEnv) return fromEnv.replace(/\/$/, "");
+  const uiIndex = getUiIndexPath();
+  if (!uiIndex) return null;
+  return `file://${uiIndex.replace(/\\/g, "/")}`;
+}
+
+function normalizeHash(hash) {
+  const raw = String(hash || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("#")) return raw;
+  if (raw.startsWith("/")) return `#${raw}`;
+  return `#/${raw}`;
+}
+
+function parseProjectIdFromUrl(urlStr) {
+  const str = String(urlStr || "").trim();
+  if (!str) return null;
+  let hash = "";
+
+  try {
+    const u = new URL(str);
+    hash = String(u.hash || "");
+  } catch {
+    const idx = str.indexOf("#");
+    hash = idx >= 0 ? str.slice(idx) : "";
+  }
+
+  if (!hash) return null;
+  const normalizedHash = normalizeHash(hash);
+  const m = normalizedHash.match(/^#\/w\/([^/?#]+)(?:[/?#].*)?$/i);
+  if (!m) return null;
+
+  const id = String(m[1] || "").trim();
+  if (!id) return null;
+  return { id, hash: normalizedHash };
+}
+
+function showAndFocus(targetWin) {
+  if (!targetWin || targetWin.isDestroyed()) return;
+  if (targetWin.isMinimized()) targetWin.restore();
+  targetWin.show();
+  targetWin.focus();
+}
+
+function loadProjectRoute(targetWin, targetHash) {
+  if (!targetWin || targetWin.isDestroyed()) return;
+  const base = getAppBaseUrl();
+  if (!base) return;
+  const nextHash = normalizeHash(targetHash);
+  targetWin.loadURL(`${base}${nextHash || ""}`);
+}
+
+function openOrFocusProjectWindow(id, targetHash) {
+  const projectId = String(id || "").trim();
+  if (!projectId) return null;
+
+  const existing = projectWindows.get(projectId);
+  if (existing && !existing.isDestroyed()) {
+    showAndFocus(existing);
+    if (targetHash) loadProjectRoute(existing, targetHash);
+    return existing;
+  }
+
+  const child = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    show: true,
+    webPreferences: {
+      contextIsolation: true,
+      preload: path.join(__dirname, "preload.cjs"),
+    },
+  });
+
+  child.on("closed", () => projectWindows.delete(projectId));
+  projectWindows.set(projectId, child);
+  loadProjectRoute(child, targetHash || `#/w/${projectId}/tasks`);
+  return child;
 }
 
 function isBackendDisabled() {
@@ -153,7 +234,21 @@ function createMainWindow() {
     return;
   }
 
-  win.loadFile(uiIndex);
+  const appBaseUrl = getAppBaseUrl();
+  win.loadURL(appBaseUrl);
+
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    const p = parseProjectIdFromUrl(url);
+    if (p?.id) {
+      openOrFocusProjectWindow(p.id, p.hash);
+      return { action: "deny" };
+    }
+
+    if (/^https?:\/\//i.test(String(url || ""))) {
+      shell.openExternal(url).catch(() => {});
+    }
+    return { action: "deny" };
+  });
 
   win.on("close", async (e) => {
     if (isQuitting) return;
@@ -180,30 +275,9 @@ function createMainWindow() {
 }
 
 function openProjectWindow(projectId) {
-  const uiIndex = getUiIndexPath();
-  if (!uiIndex) return;
-
-  const key = String(projectId || '').trim();
-  const exists = projectWindows.get(key);
-  if (exists && !exists.isDestroyed()) {
-    if (exists.isMinimized()) exists.restore();
-    exists.focus();
-    return;
-  }
-
-  const child = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    show: true,
-    webPreferences: {
-      contextIsolation: true,
-      preload: path.join(__dirname, "preload.cjs"),
-    },
-  });
-
-  projectWindows.set(key, child);
-  child.on('closed', () => projectWindows.delete(key));
-  child.loadFile(uiIndex, { hash: `/w/${key}/tasks` });
+  const key = String(projectId || "").trim();
+  if (!key) return null;
+  return openOrFocusProjectWindow(key, `#/w/${key}/tasks`);
 }
 
 app.whenReady().then(async () => {
@@ -219,6 +293,14 @@ app.whenReady().then(async () => {
 ipcMain.handle("ws:openProjectWindow", async (_event, projectId) => {
   openProjectWindow(projectId);
   return true;
+});
+
+ipcMain.handle("openProjectWindow", async (_event, payload = {}) => {
+  const id = typeof payload === "string" ? payload : payload.id;
+  const hash = typeof payload === "object" && payload ? payload.hash : undefined;
+  const targetHash = hash || `#/w/${String(id || "").trim()}/tasks`;
+  const opened = openOrFocusProjectWindow(id, targetHash);
+  return Boolean(opened);
 });
 
 app.on("window-all-closed", () => {
