@@ -585,6 +585,7 @@ app.post('/api/accounts/create', (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
+}); 
 
 app.get('/api/roles', (req, res) => {
   const ws = getWsFromReq(req);
