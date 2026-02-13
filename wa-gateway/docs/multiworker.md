@@ -1,45 +1,94 @@
-# 多 worker 配置说明（方案 A）
+# 多 worker / master 模式说明
 
-## 目录职责
+## Worker 模式（`server.js`）
 
-- `CONFIGDIR`：共享配置根目录（默认 `DATA_DIR/data`）。
-  - 共享：`workspaces/<ws>/accounts.json`、`roles.json`、`groups.json`、`history.json`、`scheduled_jobs*.json`。
-- `WORKDIR`：运行态根目录（默认等于 `CONFIGDIR`）。
-  - 隔离：`workspaces/<ws>/wwebjs_auth`、`scheduled_uploads` 等运行时目录。
+### 关键环境变量
 
-当 `CONFIGDIR` 与 `WORKDIR` 不同时：
-- 账号/角色/群组等配置由所有 worker 共享。
-- WhatsApp LocalAuth 会话目录按 worker 隔离，避免浏览器态互相影响。
+- `SLOT_FROM` / `SLOT_TO`：当前 worker 负责的 slot 区间（例如 `A1`~`A50`）。
+- `MAX_ACTIVE`：当前 worker 最大活跃 client 数（`clients Map` 中存在即计入，含 INIT/QR/READY）。
+- `MAX_INIT`：初始化并发上限。
+- `WARMUP_LIMIT`：启动 warmup 的最大尝试数，默认 `10`。
+- `CONFIGDIR`：共享配置目录（账号/角色/群组/历史等 JSON）。
+- `WORKDIR`：worker 运行态目录（LocalAuth/session/uploads 等）。
+- `MASTER_INTERNAL_URL` / `MASTER_TOKEN`：master 事件汇聚内部上报地址与鉴权。
 
-## 两个 worker 启动示例
+### 行为说明
 
-```bash
-# worker 1
-PORT=3001 CONFIGDIR=./data_shared WORKDIR=./data_w1 node server.js
+- 任何操作 slot 的入口（connect/open/openChat/logout/destroy/status/send/schedule）会先校验是否在 `SLOT_FROM~SLOT_TO`。
+  - 不在本段返回：`409 { ok:false, error:"slot not in this worker" }`。
+- 容量保护：
+  - connect / rebuild 等会触发 client 初始化的路径统一受 `MAX_ACTIVE` 限制。
+  - 超限返回 `429 { ok:false, error:"worker capacity full" }`。
+  - recentLogs 记录：`worker_capacity_full`。
+- `/health` 返回：
+  - `{ ok:true, worker:{ port, slotFrom, slotTo, active, maxActive } }`。
 
-# worker 2
-PORT=3002 CONFIGDIR=./data_shared WORKDIR=./data_w2 node server.js
+### 启动 warmup
+
+worker `listen` 成功后异步启动 warmup：
+
+1. 读取 `roles.json` 的 `boundSlot`。
+2. 仅保留落在本 worker 区间的 slot。
+3. 与 `accounts.json` 中 `enabled=true` 交集。
+4. 取 `min(MAX_ACTIVE-当前active, WARMUP_LIMIT, MAX_ACTIVE)` 个，按 slot 数字升序。
+5. 复用 connect/ensureClient 初始化链路，低速串行预热。
+
+日志事件：
+
+- `warmup_start {ws,count,slots}`
+- `warmup_done {ws,ok,fail}`
+- `warmup_skip_disabled {ws,slot}`
+- `warmup_capacity_full {ws,active,maxActive}`
+
+## Master 模式（`master.js`）
+
+### 关键环境变量
+
+- `PORT_MASTER`：master 对前端暴露端口，默认 `3000`。
+- `PREWARM`：master 启动时预热 worker 数量，默认 `2`。
+- `SHARDS_JSON`：worker 分片定义数组，例如：
+
+```json
+[
+  {"id":"w1","port":3001,"from":"A1","to":"A50","workdir":"./data_w1"},
+  {"id":"w2","port":3002,"from":"A51","to":"A100","workdir":"./data_w2"}
+]
 ```
 
-或使用 package scripts（仅示例）：
+### 行为说明
+
+- master 接收全部 `/api/*` 请求并按 slot 路由：
+  - URL: `/api/accounts/:slot/...`
+  - body: `slot / boundSlot / role.boundSlot`
+- 若目标 worker 未启动：`ensureWorkerRunning` 懒启动 + 轮询 `/health`。
+- 未携带 slot：
+  - `GET /api/accounts`、`GET /api/roles`、`GET /api/groups` 由 master 直接读取 `CONFIGDIR`。
+  - 其他默认转发到首个 shard。
+- master `/health`：
+  - `{ ok:true, master:{port}, workers:[{id,port,from,to,running}] }`
+
+## 实时事件汇聚（前端只连 master）
+
+- master 提供 `POST /internal/emit`（可选 `x-master-token` 鉴权）。
+- worker 在本地 `wa:status`/`wa:qr` emit 的同时，向 master `/internal/emit` 上报。
+- master 收到后转发到 `io.to(ws).emit(event,payload)`。
+- recentLogs 记录：`worker_event_forwarded`；worker 上报失败记录 `master_emit_failed`（不影响主流程）。
+
+## 启动示例
+
+### 2 worker + master（懒启动 + PREWARM=2）
 
 ```bash
-npm run start:worker1
-npm run start:worker2
+# worker（可手动）
+PORT=3001 SLOT_FROM=A1 SLOT_TO=A50 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w1 node server.js
+PORT=3002 SLOT_FROM=A51 SLOT_TO=A100 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w2 node server.js
+
+# master（推荐前端只连接此端口）
+PORT_MASTER=3000 PREWARM=2 CONFIGDIR=./data_shared \
+SHARDS_JSON='[{"id":"w1","port":3001,"from":"A1","to":"A50","workdir":"./data_w1"},{"id":"w2","port":3002,"from":"A51","to":"A100","workdir":"./data_w2"}]' \
+node master.js
 ```
 
-## 并发一致性
+### 7 worker 示例
 
-`accounts.json` / `roles.json` / `groups.json` 等共享配置写入使用 `*.lock` 文件锁（`openSync(lock, "wx")`），并在 15s 超时前轮询重试，保证跨进程 `read+modify+write` 原子性，避免并发覆盖写。
-
-## 可观测性
-
-- JSON 自愈：
-  - `json_recover_from_bak`
-  - `json_recover_restored`
-- 自愈重建：
-  - `rebuild_start`
-  - `rebuild_done`
-  - `rebuild_fail`
-  - `puppeteer_detached_retry`
-- 最近日志接口：`GET /api/system/recentLogs`
+按区间扩展 shard：`A1-50`、`A51-100` ... `A301-350`，每个 worker 使用独立 `WORKDIR`，共享同一个 `CONFIGDIR`。
