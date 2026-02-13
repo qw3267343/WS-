@@ -63,6 +63,7 @@ const WARMUP_LIMIT = Math.max(0, Number(process.env.WARMUP_LIMIT || 10));
 const SLOT_FROM = String(process.env.SLOT_FROM || '').trim().toUpperCase();
 const SLOT_TO = String(process.env.SLOT_TO || '').trim().toUpperCase();
 const MASTER_INTERNAL_URL = String(process.env.MASTER_INTERNAL_URL || '').trim();
+const IS_MASTER_MODE = !!MASTER_INTERNAL_URL;
 const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
 
 // ✅ CONFIG_ROOT：共享配置根（读写 accounts/roles/groups/...）
@@ -1071,7 +1072,9 @@ function postJson(urlStr, payload, headers = {}) {
 function emitWsEvent(ws, event, payload) {
   io.to(ws).emit(event, payload);
   if (!MASTER_INTERNAL_URL) return;
-  postJson(`${MASTER_INTERNAL_URL}/internal/emit`, { ws, event, payload }, MASTER_TOKEN ? { 'x-master-token': MASTER_TOKEN } : {})
+  const headers = MASTER_TOKEN ? { 'x-master-token': MASTER_TOKEN } : {};
+  if (process.env.WORKER_ID) headers['x-worker-id'] = String(process.env.WORKER_ID);
+  postJson(`${MASTER_INTERNAL_URL}/internal/emit`, { ws, event, payload }, headers)
     .catch((e) => {
       log('warn', 'master_emit_failed', { ws, event, err: String(e?.message || e) });
     });
@@ -1913,6 +1916,19 @@ app.post('/api/accounts/:slot/destroy', async (req, res) => {
   });
 });
 
+app.post('/api/accounts/:slot/stop', async (req, res) => {
+  const ws = getWs(req);
+  const slot = normalizeSlot(req.params.slot);
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
+  return enqueueSlot(ws, slot, async () => {
+    await destroyClient(ws, slot);
+    return res.json({ ok: true });
+  }).catch((e) => {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  });
+});
+
 // 打开窗口（前置浏览器窗口）
 app.post('/api/accounts/:slot/open', async (req, res) => {
   const ws = getWs(req);
@@ -2361,5 +2377,9 @@ setInterval(async () => {
 const PORT = Number(process.env.PORT || 3001);
 server.listen(PORT, () => {
   log('info', 'server_listen', { url: `http://127.0.0.1:${PORT}` });
+  if (IS_MASTER_MODE) {
+    log('info', 'warmup_skipped_master_mode', { port: PORT, slotFrom: SLOT_FROM || null, slotTo: SLOT_TO || null });
+    return;
+  }
   setTimeout(() => { runWarmup(); }, 0);
 });
