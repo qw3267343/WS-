@@ -8,6 +8,7 @@ const http = require("http");
 let win = null;
 let isQuitting = false;
 let masterProc = null;
+const projectWindows = new Map();
 
 const WS_HOME = path.join(app.getPath("appData"), "@ws-manager");
 app.setPath("userData", WS_HOME);
@@ -90,8 +91,6 @@ async function startBackend() {
   const configDir = path.join(rootDir, "data");
   const workDir = path.join(rootDir, "work");
   fs.mkdirSync(configDir, { recursive: true });
-  fs.mkdirSync(path.join(workDir, "w1"), { recursive: true });
-  fs.mkdirSync(path.join(workDir, "w2"), { recursive: true });
 
   try {
     await waitForHealth({ port: 3000, timeoutMs: 1200 });
@@ -113,14 +112,12 @@ async function startBackend() {
   const env = {
     ...process.env,
     PORT_MASTER: "3000",
-    PREWARM: "2",
+    PREWARM: "0",
     LOG_LEVEL: "info",
     DATA_DIR: rootDir,
     CONFIGDIR: configDir,
-    SHARDS_JSON: JSON.stringify([
-      { id: 1, port: 3001, from: "A1", to: "A30", workdir: path.join(workDir, "w1") },
-      { id: 2, port: 3002, from: "A31", to: "A60", workdir: path.join(workDir, "w2") },
-    ]),
+    WORKDIR: workDir,
+    WORKER_POOL_SIZE: "60",
     ELECTRON_RUN_AS_NODE: "1",
   };
 
@@ -186,6 +183,14 @@ function openProjectWindow(projectId) {
   const uiIndex = getUiIndexPath();
   if (!uiIndex) return;
 
+  const key = String(projectId || '').trim();
+  const exists = projectWindows.get(key);
+  if (exists && !exists.isDestroyed()) {
+    if (exists.isMinimized()) exists.restore();
+    exists.focus();
+    return;
+  }
+
   const child = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -196,7 +201,9 @@ function openProjectWindow(projectId) {
     },
   });
 
-  child.loadFile(uiIndex, { hash: `/w/${projectId}/tasks` });
+  projectWindows.set(key, child);
+  child.on('closed', () => projectWindows.delete(key));
+  child.loadFile(uiIndex, { hash: `/w/${key}/tasks` });
 }
 
 app.whenReady().then(async () => {
