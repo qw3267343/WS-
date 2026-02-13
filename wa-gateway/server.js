@@ -26,7 +26,6 @@ function ensureDir(p) {
 // 统一把最终根写回 env（后面你其他模块/函数也可直接用）
 process.env.DATA_DIR = DATA_ROOT;
 ensureDir(DATA_ROOT);
-console.log("[gateway] DATA_ROOT =", DATA_ROOT);
 
 // 你迁移过来的目录结构就是放在 DATA_ROOT 下：
 //   .wwebjs_auth / .wwebjs_cache / data / _uploads
@@ -51,6 +50,48 @@ const UID_START = 100001;
 const TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TRASH_CLEAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_INIT = Math.max(1, Number(process.env.WA_INIT_CONCURRENCY || 3));
+const CONFIG_ROOT = path.resolve(process.env.CONFIGDIR || DATA_DIR);
+const WORK_ROOT = path.resolve(process.env.WORKDIR || CONFIG_ROOT);
+const RECENT_LOG_LIMIT = Math.max(10, Number(process.env.RECENT_LOG_LIMIT || 200));
+const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
+const LOG_LEVEL_WEIGHT = { debug: 10, info: 20, warn: 30, error: 40 };
+const RECENT_LOGS = [];
+
+function shouldLog(level) {
+  const current = LOG_LEVEL_WEIGHT[LOG_LEVEL] || LOG_LEVEL_WEIGHT.info;
+  const target = LOG_LEVEL_WEIGHT[level] || LOG_LEVEL_WEIGHT.info;
+  return target >= current;
+}
+
+function log(level, event, fields = {}) {
+  const row = { ts: new Date().toISOString(), level, event, ...fields };
+  RECENT_LOGS.push(row);
+  if (RECENT_LOGS.length > RECENT_LOG_LIMIT) RECENT_LOGS.splice(0, RECENT_LOGS.length - RECENT_LOG_LIMIT);
+  if (shouldLog(level)) process.stdout.write(`${JSON.stringify(row)}\n`);
+}
+
+function withFileLockSync(lockFile, fn, timeoutMs = 15000, pollMs = 40) {
+  const start = Date.now();
+  while (true) {
+    let fd = null;
+    try {
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fd = fs.openSync(lockFile, 'wx');
+      return fn();
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`lock timeout: ${lockFile}`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pollMs);
+    } finally {
+      if (fd != null) {
+        try { fs.closeSync(fd); } catch {}
+        try { fs.unlinkSync(lockFile); } catch {}
+      }
+    }
+  }
+}
 
 // ② ensureDataFiles()：创建必要文件/目录（不会再碰 __dirname/data）
 function ensureDataFiles() {
@@ -63,6 +104,10 @@ function ensureDataFiles() {
   ensureDir(CACHE_DATA_DIR);
   ensureDir(TRASH_DIR);
   ensureDir(UPLOADS_DIR);
+  ensureDir(CONFIG_ROOT);
+  ensureDir(WORK_ROOT);
+  ensureDir(path.join(CONFIG_ROOT, 'workspaces'));
+  ensureDir(path.join(WORK_ROOT, 'workspaces'));
 
   if (!fs.existsSync(PROJECTS_FILE)) fs.writeFileSync(PROJECTS_FILE, "[]", "utf-8");
   if (!fs.existsSync(PROJECT_COUNTER_FILE)) fs.writeFileSync(PROJECT_COUNTER_FILE, "100000", "utf-8");
@@ -70,6 +115,7 @@ function ensureDataFiles() {
     fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), "utf-8");
 }
 ensureDataFiles();
+log('info', 'gateway_paths_ready', { DATA_ROOT, CONFIG_ROOT, WORK_ROOT });
 
 // ===============================
 // ✅ Workspace 路径统一（全部落在 DATA_DIR/workspaces/...）
@@ -79,21 +125,6 @@ function normalizeWs(ws) {
   return s.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
-function getWorkspaceDir(ws) {
-  return ensureDir(path.join(WORKSPACES_DIR, normalizeWs(ws)));
-}
-
-function ensureSchedulesUploadDir(ws, jobId) {
-  const base = ensureDir(path.join(getWorkspaceDir(ws), "scheduled_uploads"));
-  if (jobId) return ensureDir(path.join(base, String(jobId)));
-  return base;
-}
-
-// ✅ 登录态根目录：直接使用你迁移过来的 AUTH_ROOT（最稳）
-// 如果你后面有 const authDir = ...，就改成这一句即可：
-function getAuthDir() {
-  return AUTH_DATA_DIR;
-}
 
 // =====================================================
 // Express / Socket.IO
@@ -239,11 +270,13 @@ const scheduleUpload = multer({
 function readJson(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf-8'));
-  } catch {
+  } catch (err) {
     const bak = file + '.bak';
+    if (fs.existsSync(bak)) {
+      log('warn', 'json_recover_from_bak', { file, bak, reason: String(err?.message || err || 'unknown') });
+    }
     try {
       const recovered = JSON.parse(fs.readFileSync(bak, 'utf-8'));
-      // 备份可读时，尝试恢复主文件
       try {
         const tmp = file + '.tmp';
         const fd = fs.openSync(tmp, 'w');
@@ -254,6 +287,7 @@ function readJson(file, fallback) {
           fs.closeSync(fd);
         }
         fs.renameSync(tmp, file);
+        log('info', 'json_recover_restored', { file, bak });
       } catch {}
       return recovered;
     } catch {
@@ -370,37 +404,87 @@ function getWs(req) {
   return resolveWs(raw);
 }
 
+function getWorkspaceConfigDir(ws) {
+  return path.join(CONFIG_ROOT, 'workspaces', safeId(ws) || 'default');
+}
+function getWorkspaceWorkDir(ws) {
+  return path.join(WORK_ROOT, 'workspaces', safeId(ws) || 'default');
+}
 function getWorkspaceDir(ws) {
-  return path.join(WORKSPACES_DIR, ws);
+  return getWorkspaceWorkDir(ws);
+}
+function getLegacyWorkspaceDir(ws) {
+  return path.join(WORKSPACES_DIR, safeId(ws) || 'default');
+}
+function maybeMigrateLegacyFile(primary, legacy) {
+  if (primary === legacy) return;
+  if (fs.existsSync(primary) || !fs.existsSync(legacy)) return;
+  fs.mkdirSync(path.dirname(primary), { recursive: true });
+  try { fs.copyFileSync(legacy, primary); } catch {}
 }
 function getWorkspaceAccountsFile(ws) {
-  return path.join(getWorkspaceDir(ws), 'accounts.json');
+  const file = path.join(getWorkspaceConfigDir(ws), 'accounts.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'accounts.json'));
+  return file;
 }
 function getWorkspaceGroupsFile(ws) {
-  return path.join(getWorkspaceDir(ws), 'groups.json');
+  const file = path.join(getWorkspaceConfigDir(ws), 'groups.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'groups.json'));
+  return file;
 }
 function getWorkspaceRolesFile(ws) {
-  return path.join(getWorkspaceDir(ws), 'roles.json');
+  const file = path.join(getWorkspaceConfigDir(ws), 'roles.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'roles.json'));
+  return file;
 }
 function getWorkspaceHistoryFile(ws) {
-  return path.join(getWorkspaceDir(ws), 'history.json');
+  const file = path.join(getWorkspaceConfigDir(ws), 'history.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'history.json'));
+  return file;
 }
 function getWorkspaceSchedulesFile(ws) {
-  return path.join(getWorkspaceDir(ws), 'scheduled_jobs.json');
+  const file = path.join(getWorkspaceConfigDir(ws), 'scheduled_jobs.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'scheduled_jobs.json'));
+  return file;
 }
 function getWorkspaceSchedulesHistoryFile(ws) {
-  return path.join(getWorkspaceDir(ws), 'scheduled_jobs_history.json');
+  const file = path.join(getWorkspaceConfigDir(ws), 'scheduled_jobs_history.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'scheduled_jobs_history.json'));
+  return file;
 }
 function getWorkspaceSchedulesUploadsDir(ws, jobId) {
-  if (jobId) return path.join(getWorkspaceDir(ws), 'scheduled_uploads', jobId);
-  return path.join(getWorkspaceDir(ws), 'scheduled_uploads');
+  if (jobId) return path.join(getWorkspaceWorkDir(ws), 'scheduled_uploads', jobId);
+  return path.join(getWorkspaceWorkDir(ws), 'scheduled_uploads');
 }
 function getWorkspaceAuthDir(ws) {
-  return path.join(getWorkspaceDir(ws), 'wwebjs_auth');
+  return path.join(getWorkspaceWorkDir(ws), 'wwebjs_auth');
+}
+function getWorkspaceConfigFileLock(file) {
+  return `${file}.lock`;
+}
+function ensureSessionCompat(ws, sessionDir) {
+  const sid = String(sessionDir || '').trim();
+  if (!sid) return;
+  const target = path.join(getWorkspaceAuthDir(ws), sid);
+  if (fs.existsSync(target)) return;
+  const candidates = [
+    path.join(getLegacyWorkspaceDir(ws), 'wwebjs_auth', sid),
+    path.join(AUTH_DATA_DIR, sid),
+  ];
+  for (const legacy of candidates) {
+    if (!fs.existsSync(legacy)) continue;
+    try {
+      copyDir(legacy, target);
+      log('info', 'auth_session_migrated', { ws, sessionDir: sid, from: legacy, to: target });
+      break;
+    } catch {}
+  }
 }
 function ensureWorkspace(ws) {
-  const dir = getWorkspaceDir(ws);
-  fs.mkdirSync(dir, { recursive: true });
+  const configDir = getWorkspaceConfigDir(ws);
+  const workDir = getWorkspaceWorkDir(ws);
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.mkdirSync(workDir, { recursive: true });
   const groupsFile = getWorkspaceGroupsFile(ws);
   if (!fs.existsSync(groupsFile)) writeJson(groupsFile, []);
   const rolesFile = getWorkspaceRolesFile(ws);
@@ -417,7 +501,9 @@ function loadGroups(ws) {
 
 function saveGroups(ws, list) {
   const file = getWorkspaceGroupsFile(ws);
-  writeJson(file, Array.isArray(list) ? list : []);
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, Array.isArray(list) ? list : []);
+  });
 }
 
 function defaultRoles() {
@@ -442,7 +528,9 @@ function loadRoles(ws) {
 
 function saveRoles(ws, list) {
   const file = getWorkspaceRolesFile(ws);
-  writeJson(file, Array.isArray(list) ? list : []);
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, Array.isArray(list) ? list : []);
+  });
 }
 
 function loadHistory(ws) {
@@ -454,7 +542,9 @@ function loadHistory(ws) {
 function saveHistory(ws, list) {
   const file = getWorkspaceHistoryFile(ws);
   const rows = Array.isArray(list) ? list.slice(-HISTORY_LIMIT) : [];
-  writeJson(file, rows);
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, rows);
+  });
 }
 
 function loadProjects() {
@@ -462,14 +552,17 @@ function loadProjects() {
   return Array.isArray(data) ? data : [];
 }
 function saveProjects(list) {
-  writeJson(PROJECTS_FILE, list);
+  withFileLockSync(`${PROJECTS_FILE}.lock`, () => {
+    writeJson(PROJECTS_FILE, list);
+  });
 }
 function ensureWorkspaceDir(id) {
-  fs.mkdirSync(path.join(WORKSPACES_DIR, id), { recursive: true });
+  fs.mkdirSync(getWorkspaceConfigDir(id), { recursive: true });
+  fs.mkdirSync(getWorkspaceWorkDir(id), { recursive: true });
 }
 function getCountsForWorkspace(id) {
-  const accounts = readJson(path.join(WORKSPACES_DIR, id, 'accounts.json'), []);
-  const groups = readJson(path.join(WORKSPACES_DIR, id, 'groups.json'), []);
+  const accounts = readJson(getWorkspaceAccountsFile(id), []);
+  const groups = readJson(getWorkspaceGroupsFile(id), []);
   return {
     accountsCount: Array.isArray(accounts) ? accounts.length : 0,
     groupsCount: Array.isArray(groups) ? groups.length : 0,
@@ -533,8 +626,8 @@ function migrateProjects() {
 
     if (!hasNewId) {
       changed = true;
-      const oldDir = path.join(WORKSPACES_DIR, oldName);
-      const newDir = path.join(WORKSPACES_DIR, next.id);
+      const oldDir = getWorkspaceConfigDir(oldName);
+      const newDir = getWorkspaceConfigDir(next.id);
       const duplicated = (oldNameCount.get(oldName) || 0) > 1;
 
       if (fs.existsSync(oldDir) && !inheritedByOldName.has(oldName)) {
@@ -590,7 +683,9 @@ function loadAccounts(ws) {
 }
 function saveAccounts(ws, list) {
   const file = getWorkspaceAccountsFile(ws);
-  writeJson(file, list);
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, list);
+  });
 }
 function normalizeSlot(s) {
   return String(s || '').trim();
@@ -650,16 +745,18 @@ function ensureAccount(ws, slot) {
   if (!isValidSlot(slot)) throw new Error('slot format must be A1/A2/...');
 
   ensureWorkspace(ws);
-  const list = loadAccounts(ws);
-  let acc = list.find(x => x.slot === slot);
-  if (!acc) {
-    // ④A) 改 ensureAccount(slot) 里新建账号时：把 randomUUID() 换成 allocateNextUid(list)
-    const uid = allocateNextUid(list);
-    acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now(), enabled: true };
-    list.push(acc);
-    saveAccounts(ws, list);
-  }
-  return acc;
+  const file = getWorkspaceAccountsFile(ws);
+  return withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    const list = loadAccounts(ws);
+    let acc = list.find(x => x.slot === slot);
+    if (!acc) {
+      const uid = allocateNextUid(list);
+      acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now(), enabled: true };
+      list.push(acc);
+      writeJson(file, list);
+    }
+    return acc;
+  });
 }
 function listAccountsSorted(ws) {
   const list = loadAccounts(ws);
@@ -681,7 +778,9 @@ function loadScheduledJobs(ws) {
 }
 function saveScheduledJobs(ws, list) {
   const file = getWorkspaceSchedulesFile(ws);
-  writeJson(file, list);
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, list);
+  });
 }
 function removeScheduledJob(ws, id) {
   const list = loadScheduledJobs(ws);
@@ -696,7 +795,9 @@ function loadScheduledHistory(ws) {
 }
 function saveScheduledHistory(ws, list) {
   const file = getWorkspaceSchedulesHistoryFile(ws);
-  writeJson(file, list.slice(0, SCHEDULED_HISTORY_LIMIT));
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, list.slice(0, SCHEDULED_HISTORY_LIMIT));
+  });
 }
 function archiveScheduledJob(ws, job) {
   const list = loadScheduledHistory(ws);
@@ -934,11 +1035,12 @@ function ensureClient(ws, slot) {
   ensureWorkspace(ws);
   const authDir = getWorkspaceAuthDir(ws);
   fs.mkdirSync(authDir, { recursive: true });
+  ensureSessionCompat(ws, acc.sessionDir || buildSessionDir(uid));
 
   const client = new Client({
     authStrategy: new LocalAuth({
-      clientId: uid,      // ✅ 唯一身份
-      dataPath: getAuthDir()   // ✅ 统一存到 data/workspaces/<ws>/wwebjs_auth
+      clientId: uid,
+      dataPath: authDir
     }),
     puppeteer: {
       headless: false, // 如果你不想弹浏览器，把这里改 true
@@ -1090,8 +1192,8 @@ app.delete('/api/projects/:id', (req, res) => {
     list.splice(idx, 1);
     saveProjects(list);
 
-    const workspaceDir = path.join(WORKSPACES_DIR, id);
-    safeMoveToTrash(workspaceDir, 'workspaces', id);
+    safeMoveToTrash(getWorkspaceConfigDir(id), 'workspaces', `${id}_config`);
+    safeMoveToTrash(getWorkspaceWorkDir(id), 'workspaces', `${id}_work`);
     return res.json({ ok: true, data: { id } });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1103,20 +1205,36 @@ app.delete('/api/projects/:id', (req, res) => {
 app.post('/api/accounts/create', (req, res) => {
   try {
     const ws = getWs(req);
-    const list = loadAccounts(ws);
-    let slot = normalizeSlot(req.body?.slot);
-    if (!slot) slot = nextSlotLabel(list);
-    if (!isValidSlot(slot)) return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
+    const file = getWorkspaceAccountsFile(ws);
+    const enabled = req.body?.enabled !== false;
+    const requestedSlot = normalizeSlot(req.body?.slot);
+    let result = null;
+    let invalid = false;
 
-    const existed = list.find(x => x.slot === slot);
-    if (existed) return res.json({ ok: true, data: existed });
+    withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+      const list = loadAccounts(ws);
+      let slot = requestedSlot;
+      if (!slot) slot = nextSlotLabel(list);
+      if (!isValidSlot(slot)) {
+        invalid = true;
+        return;
+      }
 
-    // ④B) /api/accounts/create 里新建账号时：把 randomUUID() 换成 allocateNextUid(list)
-    const uid = allocateNextUid(list);
-    const acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now(), enabled: req.body?.enabled !== false };
-    list.push(acc);
-    saveAccounts(ws, list);
-    return res.json({ ok: true, data: acc });
+      const existed = list.find(x => x.slot === slot);
+      if (existed) {
+        result = existed;
+        return;
+      }
+
+      const uid = allocateNextUid(list);
+      const acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now(), enabled };
+      list.push(acc);
+      writeJson(file, list);
+      result = acc;
+    });
+
+    if (invalid) return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
+    return res.json({ ok: true, data: result });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -1166,14 +1284,21 @@ app.post('/api/accounts/:slot/enabled', async (req, res) => {
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
 
   const enabled = req.body?.enabled !== false;
-  const list = loadAccounts(ws);
-  const idx = list.findIndex(item => item.slot === slot);
-  if (idx < 0) return res.status(404).json({ ok: false, error: 'account not found' });
-  list[idx] = { ...list[idx], enabled };
-  saveAccounts(ws, list);
+  const file = getWorkspaceAccountsFile(ws);
+  let uid = null;
+  const found = withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    const list = loadAccounts(ws);
+    const idx = list.findIndex(item => item.slot === slot);
+    if (idx < 0) return false;
+    list[idx] = { ...list[idx], enabled };
+    uid = list[idx]?.uid || null;
+    writeJson(file, list);
+    return true;
+  });
+  if (!found) return res.status(404).json({ ok: false, error: 'account not found' });
   if (!enabled) {
     await destroyClient(ws, slot);
-    io.to(ws).emit('wa:status', { slot, uid: list[idx]?.uid || null, status: 'DISCONNECTED' });
+    io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED' });
   }
   return res.json({ ok: true, slot, enabled });
 });
@@ -1204,6 +1329,10 @@ setInterval(() => {
 
 app.get('/api/system/cpu', (_req, res) => {
   return res.json({ ok: true, cpu: cpuLast });
+});
+
+app.get('/api/system/recentLogs', (_req, res) => {
+  return res.json({ ok: true, logs: RECENT_LOGS });
 });
 
 app.get('/api/accounts/:slot/groups', async (req, res) => {
@@ -1249,17 +1378,12 @@ app.post('/api/groups', (req, res) => {
   try {
     const ws = getWs(req);
     ensureWorkspace(ws);
-    const list = loadGroups(ws);
-
+    const file = getWorkspaceGroupsFile(ws);
     const id = String(req.body?.id || '').trim();
     const name = String(req.body?.name || '').trim();
     if (!id) return res.status(400).json({ ok: false, error: 'id is required' });
     if (!/@g\.us$/.test(id)) return res.status(400).json({ ok: false, error: 'id must end with @g.us' });
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    if (list.some(item => String(item?.id || '') === id)) {
-      return res.status(409).json({ ok: false, error: 'group already exists' });
-    }
-
     const row = {
       id,
       name,
@@ -1267,9 +1391,17 @@ app.post('/api/groups', (req, res) => {
       enabled: req.body?.enabled !== false,
       link: req.body?.link ? String(req.body.link).trim() || undefined : undefined,
     };
-    list.unshift(row);
-    saveGroups(ws, list);
-    return res.json({ ok: true, row, rows: list });
+    let next = null;
+    const ok = withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+      const list = loadGroups(ws);
+      if (list.some(item => String(item?.id || '') === id)) return false;
+      list.unshift(row);
+      writeJson(file, list);
+      next = list;
+      return true;
+    });
+    if (!ok) return res.status(409).json({ ok: false, error: 'group already exists' });
+    return res.json({ ok: true, row, rows: next });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -1280,31 +1412,37 @@ app.put('/api/groups/:id', (req, res) => {
     const ws = getWs(req);
     ensureWorkspace(ws);
     const currentId = String(req.params.id || '').trim();
-    const list = loadGroups(ws);
-    const idx = list.findIndex(item => String(item?.id || '') === currentId);
-    if (idx < 0) return res.status(404).json({ ok: false, error: 'group not found' });
-
+    const file = getWorkspaceGroupsFile(ws);
     const nextId = req.body?.id == null ? currentId : String(req.body.id || '').trim();
     if (!nextId) return res.status(400).json({ ok: false, error: 'id is required' });
     if (!/@g\.us$/.test(nextId)) return res.status(400).json({ ok: false, error: 'id must end with @g.us' });
-    const name = req.body?.name == null ? String(list[idx]?.name || '') : String(req.body.name || '').trim();
-    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-
-    const duplicate = list.findIndex((item, i) => i !== idx && String(item?.id || '') === nextId);
-    if (duplicate >= 0) return res.status(409).json({ ok: false, error: 'group id already exists' });
-
-    const updated = {
-      ...list[idx],
-      id: nextId,
-      name,
-      note: req.body?.note == null ? list[idx]?.note : (String(req.body.note || '').trim() || undefined),
-      enabled: req.body?.enabled == null ? Boolean(list[idx]?.enabled) : Boolean(req.body.enabled),
-      link: req.body?.link == null ? list[idx]?.link : (String(req.body.link || '').trim() || undefined),
-    };
-
-    list[idx] = updated;
-    saveGroups(ws, list);
-    return res.json({ ok: true, row: updated, rows: list });
+    let updated = null;
+    let rows = null;
+    const state = withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+      const list = loadGroups(ws);
+      const idx = list.findIndex(item => String(item?.id || '') === currentId);
+      if (idx < 0) return 'not_found';
+      const name = req.body?.name == null ? String(list[idx]?.name || '') : String(req.body.name || '').trim();
+      if (!name) return 'name_required';
+      const duplicate = list.findIndex((item, i) => i !== idx && String(item?.id || '') === nextId);
+      if (duplicate >= 0) return 'duplicate';
+      updated = {
+        ...list[idx],
+        id: nextId,
+        name,
+        note: req.body?.note == null ? list[idx]?.note : (String(req.body.note || '').trim() || undefined),
+        enabled: req.body?.enabled == null ? Boolean(list[idx]?.enabled) : Boolean(req.body.enabled),
+        link: req.body?.link == null ? list[idx]?.link : (String(req.body.link || '').trim() || undefined),
+      };
+      list[idx] = updated;
+      writeJson(file, list);
+      rows = list;
+      return 'ok';
+    });
+    if (state === 'not_found') return res.status(404).json({ ok: false, error: 'group not found' });
+    if (state === 'name_required') return res.status(400).json({ ok: false, error: 'name is required' });
+    if (state === 'duplicate') return res.status(409).json({ ok: false, error: 'group id already exists' });
+    return res.json({ ok: true, row: updated, rows });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -1337,7 +1475,10 @@ app.post('/api/groups/batch', (req, res) => {
       });
     }
 
-    saveGroups(ws, cleaned);
+    const file = getWorkspaceGroupsFile(ws);
+    withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+      writeJson(file, cleaned);
+    });
     return res.json({ ok: true, rows: cleaned });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1370,7 +1511,10 @@ app.post('/api/roles/batch', (req, res) => {
       if (acc.enabled === false) return res.status(400).json({ ok: false, error: `bound slot disabled: ${slot}` });
     }
 
-    saveRoles(ws, roles);
+    const file = getWorkspaceRolesFile(ws);
+    withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+      writeJson(file, roles);
+    });
     return res.json({ ok: true, roles });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1544,15 +1688,23 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
   });
 });
 
-async function rebuildClientAndGetPage(ws, slot) {
-  const acc = ensureAccount(ws, slot);
-  if (acc.enabled === false) throw new Error('account disabled');
-  await destroyClient(ws, slot);
-  const client = ensureClient(ws, slot);
-  await withInitLimit(async () => {
-    await client.initialize();
-  });
-  return getPupPage(client);
+async function rebuildClientAndGetPage(ws, slot, reason = 'manual') {
+  log('warn', 'rebuild_start', { ws, slot, reason });
+  try {
+    const acc = ensureAccount(ws, slot);
+    if (acc.enabled === false) throw new Error('account disabled');
+    await destroyClient(ws, slot);
+    const client = ensureClient(ws, slot);
+    await withInitLimit(async () => {
+      await client.initialize();
+    });
+    const page = await getPupPage(client);
+    log('info', 'rebuild_done', { ws, slot });
+    return page;
+  } catch (err) {
+    log('error', 'rebuild_fail', { ws, slot, err: String(err?.message || err) });
+    throw err;
+  }
 }
 
 // 登出：不会删掉 slot->uid（以后可重复登录同一个坑位）
@@ -1604,14 +1756,15 @@ app.post('/api/accounts/:slot/open', async (req, res) => {
     let client = clients.get(slot);
     let page = client ? await getPupPage(client) : null;
 
-    if (!page) page = await rebuildClientAndGetPage(ws, slot);
+    if (!page) page = await rebuildClientAndGetPage(ws, slot, 'open_no_page');
     if (!page) return res.status(400).json({ ok: false, error: '当前版本无法获取页面对象（无法打开窗口）' });
 
     try {
       await restoreAndFocus(page);
     } catch (e) {
       if (!isDetachedErr(e)) throw e;
-      page = await rebuildClientAndGetPage(ws, slot);
+      log('warn', 'puppeteer_detached_retry', { ws, slot, err: String(e?.message || e) });
+      page = await rebuildClientAndGetPage(ws, slot, 'detached_frame_open');
       if (!page) return res.status(400).json({ ok: false, error: '当前版本无法获取页面对象（无法打开窗口）' });
       await restoreAndFocus(page);
     }
@@ -1652,7 +1805,7 @@ app.post('/api/accounts/:slot/openChat', async (req, res) => {
 
     let client = clients.get(slot);
     let page = client ? await getPupPage(client) : null;
-    if (!page?.goto) page = await rebuildClientAndGetPage(ws, slot);
+    if (!page?.goto) page = await rebuildClientAndGetPage(ws, slot, 'openchat_no_page');
     if (!page?.goto) return res.status(400).json({ ok: false, error: 'cannot access browser page' });
 
     try {
@@ -1660,7 +1813,8 @@ app.post('/api/accounts/:slot/openChat', async (req, res) => {
       await page.goto(url, { waitUntil: 'domcontentloaded' });
     } catch (e) {
       if (!isDetachedErr(e)) throw e;
-      page = await rebuildClientAndGetPage(ws, slot);
+      log('warn', 'puppeteer_detached_retry', { ws, slot, err: String(e?.message || e) });
+      page = await rebuildClientAndGetPage(ws, slot, 'detached_frame_openchat');
       if (!page?.goto) return res.status(400).json({ ok: false, error: 'cannot access browser page' });
       await restoreAndFocus(page);
       await page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -1689,18 +1843,22 @@ async function deleteAccountHandler(req, res) {
     profiles.delete(slot);
 
     // 2) 删除账号记录
-    const list = loadAccounts(ws);
-    const idx = list.findIndex(x => normalizeSlot(x.slot) === slot);
-    if (idx < 0) return res.json({ ok: true });
-
-    const acc = list[idx];
-    list.splice(idx, 1);
-    saveAccounts(ws, list);
+    const file = getWorkspaceAccountsFile(ws);
+    const acc = withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+      const list = loadAccounts(ws);
+      const idx = list.findIndex(x => normalizeSlot(x.slot) === slot);
+      if (idx < 0) return null;
+      const removed = list[idx];
+      list.splice(idx, 1);
+      writeJson(file, list);
+      return removed;
+    });
+    if (!acc) return res.json({ ok: true });
 
     // 3) 账号会话目录仅按 accounts.json 里的精确 sessionDir 回收
     const sessionDir = String(acc.sessionDir || '').trim();
     if (sessionDir) {
-      const abs = path.join(getAuthDir(), sessionDir);
+      const abs = path.join(getWorkspaceAuthDir(ws), sessionDir);
       safeMoveToTrash(abs, 'sessions', `${ws}_${slot}`);
     }
 
@@ -1936,9 +2094,10 @@ setInterval(async () => {
   if (scheduleTickRunning) return;
   scheduleTickRunning = true;
   try {
-    if (!fs.existsSync(WORKSPACES_DIR)) return;
-    const wsList = fs.readdirSync(WORKSPACES_DIR).filter((name) => {
-      const full = path.join(WORKSPACES_DIR, name);
+    const base = path.join(CONFIG_ROOT, 'workspaces');
+    if (!fs.existsSync(base)) return;
+    const wsList = fs.readdirSync(base).filter((name) => {
+      const full = path.join(base, name);
       return fs.existsSync(full) && fs.statSync(full).isDirectory();
     });
 
@@ -1963,4 +2122,5 @@ setInterval(async () => {
   }
 }, 1000);
 
-server.listen(3001, () => console.log('wa-gateway http://127.0.0.1:3001'));
+const PORT = Number(process.env.PORT || 3001);
+server.listen(PORT, () => log('info', 'server_listen', { url: `http://127.0.0.1:${PORT}` }));
