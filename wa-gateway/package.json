@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "start:worker1": "PORT=3001 SLOT_FROM=A1 SLOT_TO=A50 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w1 node server.js",
+    "start:worker2": "PORT=3002 SLOT_FROM=A51 SLOT_TO=A100 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w2 node server.js"
   },
   "keywords": [],
   "author": "",
