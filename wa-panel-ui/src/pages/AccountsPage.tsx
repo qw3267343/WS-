@@ -23,7 +23,6 @@ import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
 import { getWsId, wsKey } from "../lib/workspace";
 import type { Role, WaAccountRow } from "../lib/types";
-import { loadEnabledMap, saveEnabledMap } from "../utils/enabledSlots";
 
 function statusColor(s: string) {
   if (s === "READY") return "green";
@@ -66,7 +65,6 @@ export default function AccountsPage() {
   const [remarkQuery, setRemarkQuery] = useState("");
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchAction, setBatchAction] = useState<"connect" | "logout" | null>(null);
-  const [enabledMap, setEnabledMap] = useState<Record<string, boolean>>(loadEnabledMap());
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
@@ -81,12 +79,7 @@ export default function AccountsPage() {
     }
   }, [remarksStorageKey]);
 
-
-  useEffect(() => {
-    saveEnabledMap(enabledMap);
-  }, [enabledMap]);
   async function refresh() {
-    const currentEnabledMap = loadEnabledMap();
     const [accountsResp, rolesResp] = await Promise.all([
       http.get(`/api/accounts`),
       http.get(`/api/roles`),
@@ -95,9 +88,9 @@ export default function AccountsPage() {
 
     // 没账号时显示 A1 占位
     if (!list.length) {
-      setRows([{ slot: "A1", status: "NEW", lastQr: null, uid: null, phone: null, nickname: null, enabled: currentEnabledMap["A1"] !== false }]);
+      setRows([{ slot: "A1", status: "NEW", lastQr: null, uid: null, phone: null, nickname: null, enabled: true }]);
     } else {
-      setRows(list.map(r => ({ ...r, enabled: currentEnabledMap[r.slot] !== false })));
+      setRows(list);
     }
 
     const roleList = Array.isArray(rolesResp.data?.roles) ? (rolesResp.data.roles as Role[]) : [];
@@ -126,7 +119,7 @@ export default function AccountsPage() {
           };
           return next;
         }
-        return [{ slot, status: p.status || "NEW", lastQr: null, uid: p.uid ?? null, phone: p.phone ?? null, nickname: p.nickname ?? null, enabled: loadEnabledMap()[slot] !== false }, ...prev];
+        return [{ slot, status: p.status || "NEW", lastQr: null, uid: p.uid ?? null, phone: p.phone ?? null, nickname: p.nickname ?? null, enabled: true }, ...prev];
       });
     };
 
@@ -317,12 +310,15 @@ export default function AccountsPage() {
       render: (_: any, r) => (
         <Switch
           checked={r.enabled !== false}
-          onChange={(v) => {
-            setEnabledMap(m => ({ ...m, [r.slot]: v }));
+          onChange={async (v) => {
+            const prevEnabled = r.enabled !== false;
             setRows(prev => prev.map(item => (item.slot === r.slot ? { ...item, enabled: v } : item)));
             setSelectedKeys(prev => prev.filter(k => k !== r.slot));
-            if (v === false) {
-              void http.post(`/api/accounts/${r.slot}/destroy`).catch(() => {});
+            try {
+              await http.post(`/api/accounts/${r.slot}/enabled`, { enabled: v });
+            } catch (e: any) {
+              setRows(prev => prev.map(item => (item.slot === r.slot ? { ...item, enabled: prevEnabled } : item)));
+              message.error("更新启用状态失败：" + (e?.response?.data?.error || e.message));
             }
           }}
           size="small"
@@ -466,14 +462,33 @@ export default function AccountsPage() {
           style={{
             position: "sticky",
             bottom: 0,
-            zIndex: 20,
+            zIndex: 50,
             background: "#fff",
-            padding: "8px 12px",
+            padding: "10px 12px",
             borderTop: "1px solid #f0f0f0",
+            boxShadow: "0 -6px 16px rgba(0,0,0,0.06)",
             display: "flex",
-            justifyContent: "flex-end",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 8,
           }}
         >
+          <Space>
+            <Button
+              size="small"
+              disabled={safePage <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              上一页
+            </Button>
+            <Button
+              size="small"
+              disabled={safePage >= maxPage}
+              onClick={() => setPage((p) => Math.min(maxPage, p + 1))}
+            >
+              下一页
+            </Button>
+          </Space>
           <Pagination
             current={safePage}
             pageSize={pageSize}
