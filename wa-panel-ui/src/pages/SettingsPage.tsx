@@ -5,7 +5,7 @@ import { resetSocket } from "../lib/socket";
 import { loadSlots, saveSlots } from "../lib/storage";
 
 export default function SettingsPage() {
-  const [api, setApi] = useState(localStorage.getItem("wa_api_base") || "http://127.0.0.1:3001");
+  const [api, setApi] = useState(localStorage.getItem("wa_api_base") || (import.meta as any).env?.VITE_API_BASE_URL || "http://127.0.0.1:3000");
   const [slots, setSlots] = useState(loadSlots().join(",") || "acc001,acc002,acc003");
 
   return (

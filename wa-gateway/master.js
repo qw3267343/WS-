@@ -4,10 +4,25 @@ const http = require('http');
 const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 
+// ----- 默认目录工具（AppData）-----
+function getDefaultRoot() {
+  const appdata = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(appdata, '@ws-manager', 'wa-gateway-data');
+}
+const DEFAULT_ROOT = getDefaultRoot();
+const DEFAULT_CONFIG_ROOT = path.join(DEFAULT_ROOT, 'data');
+const DEFAULT_WORK_BASE = path.join(DEFAULT_ROOT, 'work');
+
+// ----- 环境变量 -----
 const PORT_MASTER = Number(process.env.PORT_MASTER || 3000);
-const CONFIG_ROOT = path.resolve(process.env.CONFIGDIR || path.join(__dirname, 'data_runtime', 'data'));
+// ✅ CONFIG_ROOT：优先 CONFIGDIR，其次 DATA_DIR/data，最后 AppData 默认
+const CONFIG_ROOT = path.resolve(
+  process.env.CONFIGDIR ||
+  (process.env.DATA_DIR ? path.join(process.env.DATA_DIR, 'data') : DEFAULT_CONFIG_ROOT)
+);
 const PREWARM = Math.max(0, Number(process.env.PREWARM || 2));
 const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
 const MAX_ACTIVE = process.env.MAX_ACTIVE;
@@ -15,11 +30,13 @@ const MAX_INIT = process.env.MAX_INIT || process.env.WA_INIT_CONCURRENCY;
 const WARMUP_LIMIT = process.env.WARMUP_LIMIT;
 const LOG_LEVEL = process.env.LOG_LEVEL;
 
+// ----- 分片定义 -----
 function parseShards() {
   if (process.env.SHARDS_JSON) return JSON.parse(process.env.SHARDS_JSON);
+  // 默认分片：使用 AppData 下的 work 目录
   return [
-    { id: 'w1', port: 3001, from: 'A1', to: 'A50', workdir: './data_w1' },
-    { id: 'w2', port: 3002, from: 'A51', to: 'A100', workdir: './data_w2' },
+    { id: 1, port: 3001, from: 'A1',  to: 'A30',  workdir: path.join(DEFAULT_WORK_BASE, 'w1') },
+    { id: 2, port: 3002, from: 'A31', to: 'A60',  workdir: path.join(DEFAULT_WORK_BASE, 'w2') },
   ];
 }
 const shards = parseShards();
@@ -66,21 +83,30 @@ function shardForSlot(slot) {
   );
 }
 function parseSlot(req) {
-  const fullPath = `${req.baseUrl || ''}${req.path || ''}`; // 例如 /api/accounts/A61/connect 或 /api + /accounts/A61/connect
+  const fullPath = `${req.baseUrl || ''}${req.path || ''}`;
   let m = /\/accounts\/(A\d+)(\/|$)/i.exec(fullPath);
   if (m) return String(m[1]).toUpperCase();
 
-  // 兜底：有些场景 baseUrl/path 不好用，直接用 originalUrl
   const ou = String(req.originalUrl || req.url || '');
   m = /\/accounts\/(A\d+)(\/|$)/i.exec(ou);
   if (m) return String(m[1]).toUpperCase();
 
-  // body 兜底（roles/batch 等）
   const body = req.body || {};
+
+  // ✅ 兼容 roles/batch：body.roles 是数组，里面的 role 可能有 boundSlot
+  if (Array.isArray(body.roles)) {
+    const r = body.roles.find(x => x && typeof x === 'object' && x.boundSlot);
+    if (r?.boundSlot) {
+      const s = String(r.boundSlot).trim().toUpperCase();
+      if (/^A\d+$/.test(s)) return s;
+    }
+  }
+
   const cand = body.slot || body.boundSlot || body?.role?.boundSlot || '';
   const s = String(cand).trim().toUpperCase();
   return /^A\d+$/.test(s) ? s : null;
 }
+
 
 function readJson(file, fallback) {
   try {
@@ -122,7 +148,8 @@ const env = {
   ...process.env,
   PORT: String(shard.port),
   CONFIGDIR: CONFIG_ROOT,
-  WORKDIR: path.resolve(shard.workdir || `./data_${shard.id}`),
+  // WORKDIR：优先 shard.workdir，否则使用 AppData 下的默认 work 目录
+  WORKDIR: path.resolve(shard.workdir || path.join(DEFAULT_WORK_BASE, `w${shard.id}`)),
   SLOT_FROM: fromN == null ? '' : String(fromN),
   SLOT_TO:   toN == null ? '' : String(toN),
   MASTER_INTERNAL_URL: `http://127.0.0.1:${PORT_MASTER}`,
@@ -217,34 +244,176 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.get('/api/accounts', (req, res, next) => {
+app.get('/api/accounts', (req, res) => {
   const ws = resolveWs(req.query?.ws || req.headers['x-ws'] || 'default');
   const file = path.join(CONFIG_ROOT, 'workspaces', ws, 'accounts.json');
-  if (!fs.existsSync(file)) return next();
-  return res.json({ ok: true, data: readJson(file, []) });
+  const data = fs.existsSync(file) ? readJson(file, []) : [];
+  return res.json({ ok: true, data });
 });
-app.get('/api/roles', (req, res, next) => {
+
+app.get('/api/roles', (req, res) => {
   const ws = resolveWs(req.query?.ws || req.headers['x-ws'] || 'default');
   const file = path.join(CONFIG_ROOT, 'workspaces', ws, 'roles.json');
-  if (!fs.existsSync(file)) return next();
-  return res.json({ ok: true, roles: readJson(file, []) });
+  const roles = fs.existsSync(file) ? readJson(file, []) : [];
+  return res.json({ ok: true, roles });
 });
-app.get('/api/groups', (req, res, next) => {
+
+app.get('/api/groups', (req, res) => {
   const ws = resolveWs(req.query?.ws || req.headers['x-ws'] || 'default');
   const file = path.join(CONFIG_ROOT, 'workspaces', ws, 'groups.json');
-  if (!fs.existsSync(file)) return next();
-  return res.json({ ok: true, rows: readJson(file, []) });
+  const rows = fs.existsSync(file) ? readJson(file, []) : [];
+  return res.json({ ok: true, rows });
 });
+
+// ===================== Projects (workspaces) CRUD on master =====================
+function safeProjectId(raw) {
+  // 前端 ws 可能是 "6688" / "p_100001" 这种；允许字母数字_-，其它替换成 _
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  return s.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
+function projectDir(id) {
+  return path.join(CONFIG_ROOT, 'workspaces', id);
+}
+
+function projectMetaFile(id) {
+  return path.join(projectDir(id), 'project.json');
+}
+
+function loadProjectMeta(id) {
+  const file = projectMetaFile(id);
+  if (fs.existsSync(file)) {
+    const obj = readJson(file, null);
+    if (obj && typeof obj === 'object') return obj;
+  }
+  // 兼容旧结构：没有 project.json 也算一个项目
+  return { id, name: id, createdAt: null, updatedAt: null };
+}
+
+function saveProjectMeta(id, meta) {
+  const dir = projectDir(id);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const file = projectMetaFile(id);
+  fs.writeFileSync(file, JSON.stringify(meta, null, 2), 'utf-8');
+}
+
+// GET /api/projects  (注意：前端会带 ?ws=xxx，这里忽略)
+app.get('/api/projects', (_req, res) => {
+  try {
+    const dir = path.join(CONFIG_ROOT, 'workspaces');
+    if (!fs.existsSync(dir)) {
+      return res.json({ ok: true, data: [], rows: [], projects: [] });
+    }
+    const ids = fs.readdirSync(dir, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name)
+      .sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true }));
+
+    const rows = ids.map(id => {
+      const meta = loadProjectMeta(id);
+      return { id, name: meta?.name || id, createdAt: meta?.createdAt || null, updatedAt: meta?.updatedAt || null };
+    });
+
+    // 多字段兼容（前端用 data/rows/projects 任意一个都能接上）
+    return res.json({ ok: true, data: rows, rows, projects: rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// GET /api/projects/:id
+app.get('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeProjectId(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+
+    const dir = projectDir(id);
+    if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    const meta = loadProjectMeta(id);
+    return res.json({ ok: true, data: { id, ...(meta || {}) } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// POST /api/projects  body: {id,name}（允许只传 name，则用 name 生成 id）
+app.post('/api/projects', (req, res) => {
+  try {
+    const body = req.body || {};
+    const id = safeProjectId(body.id || body.ws || body.projectId || body.name);
+    const name = String(body.name || body.title || id || '').trim();
+
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+
+    const dir = projectDir(id);
+    if (fs.existsSync(dir)) return res.status(409).json({ ok: false, error: 'project already exists' });
+
+    fs.mkdirSync(dir, { recursive: true });
+    const now = Date.now();
+    saveProjectMeta(id, { id, name: name || id, createdAt: now, updatedAt: now });
+
+    return res.json({ ok: true, data: { id, name: name || id } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// PUT /api/projects/:id  body: {name}
+app.put('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeProjectId(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+
+    const dir = projectDir(id);
+    if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    const body = req.body || {};
+    const meta = loadProjectMeta(id);
+    const now = Date.now();
+
+    const name = String(body.name || body.title || meta?.name || id).trim();
+    const next = { ...(meta || {}), id, name, updatedAt: now, createdAt: meta?.createdAt || now };
+
+    saveProjectMeta(id, next);
+    return res.json({ ok: true, data: next });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// DELETE /api/projects/:id
+app.delete('/api/projects/:id', (req, res) => {
+  try {
+    const id = safeProjectId(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+
+    const dir = projectDir(id);
+    if (!fs.existsSync(dir)) return res.json({ ok: true });
+
+    // ⚠️ 删除整个 workspace（包含 accounts/roles/groups 等）
+    fs.rmSync(dir, { recursive: true, force: true });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+// ===================== end projects =====================
+
+
 
 app.use('/api', async (req, res) => {
   try {
-    // 这些由 master 本地读已经有 app.get('/api/accounts|roles|groups') 覆盖了
-    // 其它 /api 请求：必须能解析到 slot 才能路由
     const slot = parseSlot(req);
-    if (!slot) return res.status(400).json({ ok: false, error: 'slot required for routing' });
 
-    const shard = shardForSlot(slot);
-    if (!shard) return res.status(404).json({ ok: false, error: 'no shard for slot' });
+    // ✅ 有 slot：按段路由；没 slot：默认走 worker1（shards[0]）
+    const shard = slot ? shardForSlot(slot) : shards[0];
+    if (!shard) return res.status(404).json({ ok: false, error: 'no shard available' });
+
+    if (!slot) {
+      log('warn', 'no_slot_default_route', { method: req.method, url: req.originalUrl, to: shard.id || shard.port });
+    }
 
     await ensureWorkerRunning(shard);
     await proxyToShard(req, res, shard);
@@ -252,6 +421,7 @@ app.use('/api', async (req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 
 server.listen(PORT_MASTER, async () => {
   log('info', 'master_listen', { port: PORT_MASTER });

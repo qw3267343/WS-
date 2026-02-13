@@ -45,6 +45,23 @@ export default function MasterPage() {
 
   const titleText = useMemo(() => (editing ? "编辑任务" : "新建任务"), [editing]);
 
+  // ✅ 新增通用打开函数
+  function openProjectWindow(projectId: string) {
+    const w: any = window as any;
+
+    // Electron 环境：走 IPC 打开新窗口（需确保 preload 暴露了 ws.openProjectWindow）
+    if (w?.ws?.openProjectWindow) {
+      return w.ws.openProjectWindow(projectId);
+    }
+
+    // 浏览器环境：新开标签页，保留 hash 路由结构
+    const hash = `#/w/${encodeURIComponent(projectId)}/tasks`;
+    const base = window.location.href.split("#")[0]; // 兼容 file:// 和 http://
+    const url = `${base}${hash}`;
+    window.open(url, "_blank");
+    return Promise.resolve();
+  }
+
   async function fetchProjects() {
     setLoading(true);
     try {
@@ -96,7 +113,8 @@ export default function MasterPage() {
         message.success("任务已创建");
         setModalOpen(false);
         await fetchProjects();
-        if (id) navigate(`/w/${encodeURIComponent(id)}/tasks`);
+        // ✅ 创建成功后打开新窗口/标签页，不覆盖当前页
+        if (id) await openProjectWindow(id);
       }
     } catch (e) {
       if (e && (e as { errorFields?: unknown }).errorFields) return;
@@ -116,16 +134,9 @@ export default function MasterPage() {
     }
   };
 
-  // ✅ 修复：file:// 下 window.location.origin 可能是 "null"
-  // 用 href.split("#")[0] 拿到真实的 index.html 基础路径
+  // ✅ 统一使用 openProjectWindow，移除旧 window.open 逻辑
   const handleOpen = (row: ProjectRow) => {
-    const hash = `#/w/${row.id}/tasks`;
-    const base = window.location.href.split("#")[0]; // ✅ 兼容 file:// / http://
-    const url = `${base}${hash}`;
-
-    const name = `wa_ws_${row.id}`;
-    const popup = window.open(url, name, "popup,width=1200,height=800");
-    if (popup) popup.focus();
+    openProjectWindow(row.id);
   };
 
   const handleLogout = () => {

@@ -11,19 +11,27 @@ const path = require("path");
 const os = require('os');
 
 // =====================================================
-// ✅ 统一数据根目录：Electron 会传 DATA_DIR
-//    例如：C:\Users\Administrator\AppData\Roaming\@ws-manager\wa-gateway-data
+// ✅ 统一数据根目录：优先使用环境变量 DATA_DIR，否则默认 AppData
 // =====================================================
+function getDefaultRoot() {
+  const appdata = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(appdata, '@ws-manager', 'wa-gateway-data');
+}
+const DEFAULT_ROOT = getDefaultRoot();
+const DEFAULT_CONFIG_ROOT = path.join(DEFAULT_ROOT, 'data');
+const DEFAULT_WORK_ROOT = path.join(DEFAULT_ROOT, 'work');
+
+// DATA_ROOT 作为所有运行时数据的顶层目录（包括 .wwebjs_auth, .wwebjs_cache, data, _uploads 等）
 const DATA_ROOT = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
-  : path.join(__dirname, "data_runtime"); // 没传时 fallback（开发/直跑也不炸）
+  : DEFAULT_ROOT;  // 没有 DATA_DIR 时使用 AppData 默认
 
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
   return p;
 }
 
-// 统一把最终根写回 env（后面你其他模块/函数也可直接用）
+// 统一把最终根写回 env（后面其他模块/函数也可直接用）
 process.env.DATA_DIR = DATA_ROOT;
 ensureDir(DATA_ROOT);
 
@@ -56,8 +64,20 @@ const SLOT_FROM = String(process.env.SLOT_FROM || '').trim().toUpperCase();
 const SLOT_TO = String(process.env.SLOT_TO || '').trim().toUpperCase();
 const MASTER_INTERNAL_URL = String(process.env.MASTER_INTERNAL_URL || '').trim();
 const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
-const CONFIG_ROOT = path.resolve(process.env.CONFIGDIR || DATA_DIR);
-const WORK_ROOT = path.resolve(process.env.WORKDIR || CONFIG_ROOT);
+
+// ✅ CONFIG_ROOT：共享配置根（读写 accounts/roles/groups/...）
+const CONFIG_ROOT = path.resolve(
+  process.env.CONFIGDIR ||
+  (process.env.DATA_DIR ? path.join(process.env.DATA_DIR, "data") : DEFAULT_CONFIG_ROOT)
+);
+
+// ✅ WORK_ROOT：运行态根（wwebjs_auth/浏览器 profile 等）
+// worker 模式下 master 会传 WORKDIR（例如 ...\work\w1）；单 worker 模式可用 DEFAULT_WORK_ROOT
+const WORK_ROOT = path.resolve(
+  process.env.WORKDIR ||
+  (process.env.DATA_DIR ? path.join(process.env.DATA_DIR, "work") : DEFAULT_WORK_ROOT)
+);
+
 const RECENT_LOG_LIMIT = Math.max(10, Number(process.env.RECENT_LOG_LIMIT || 200));
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 const LOG_LEVEL_WEIGHT = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -130,7 +150,6 @@ function normalizeWs(ws) {
   const s = String(ws || "default").trim();
   return s.replace(/[^A-Za-z0-9_-]/g, "_");
 }
-
 
 // =====================================================
 // Express / Socket.IO

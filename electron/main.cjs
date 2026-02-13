@@ -7,7 +7,7 @@ const http = require("http");
 
 let win = null;
 let isQuitting = false;
-let gatewayProc = null;
+let masterProc = null;  // 改为 master 进程
 
 // ✅ 统一数据目录到 Roaming\@ws-manager（你想要的方案）
 const WS_HOME = path.join(app.getPath("appData"), "@ws-manager");
@@ -50,9 +50,10 @@ function getUiIndexPath() {
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
-function startGateway() {
+// ✅ 修改：启动 master.js 而非 server.js，强制使用 AppData
+function startMaster() {
   // 防重复启动
-  if (gatewayProc && gatewayProc.exitCode === null) return;
+  if (masterProc && masterProc.exitCode === null) return;
 
   const isDev = !app.isPackaged;
 
@@ -60,41 +61,54 @@ function startGateway() {
     ? path.join(__dirname, "..", "wa-gateway")
     : path.join(process.resourcesPath, "wa-gateway");
 
-  const entry = path.join(gatewayDir, "server.js");
+  const entry = path.join(gatewayDir, "master.js");  // 改为 master.js
 
   // 运行数据目录：统一放在 userData 下
-  const dataDir = path.join(app.getPath("userData"), "wa-gateway-data");
-  fs.mkdirSync(dataDir, { recursive: true });
+  const rootDir = path.join(app.getPath("userData"), "wa-gateway-data");
+  fs.mkdirSync(rootDir, { recursive: true });
+  const configDir = path.join(rootDir, "data");
+  const workDir = path.join(rootDir, "work");
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.mkdirSync(workDir, { recursive: true });
 
-  // ✅ 关键：打包后用内置 node.exe 跑 server.js（用户无需安装 Node）
-  // 开发环境：优先 WASTACK_NODE，其次系统 node
-  // 打包环境：固定使用 resources/vendor/node/node.exe
-  const nodePath = isDev
-    ? (process.env.WASTACK_NODE || "node")
-    : path.join(process.resourcesPath, "vendor", "node", "node.exe");
-
-  // ✅ 打包后看日志（非常重要）
+  // 日志文件
   const logDir = app.getPath("userData");
-  const out = fs.openSync(path.join(logDir, "gateway.out.log"), "a");
-  const err = fs.openSync(path.join(logDir, "gateway.err.log"), "a");
+  const out = fs.openSync(path.join(logDir, "master.out.log"), "a");
+  const err = fs.openSync(path.join(logDir, "master.err.log"), "a");
 
-  console.log("[gateway] nodePath=", nodePath);
-  console.log("[gateway] gatewayDir=", gatewayDir);
-  console.log("[gateway] entry=", entry);
-  console.log("[gateway] DATA_DIR=", dataDir);
+  // 构建环境变量
+  const env = {
+    ...process.env,
+    PORT_MASTER: "3000",
+    PREWARM: "2",
+    LOG_LEVEL: "info",
+    CONFIGDIR: configDir,
+    SHARDS_JSON: JSON.stringify([
+      { id: 1, port: 3001, from: "A1", to: "A30", workdir: path.join(workDir, "w1") },
+      { id: 2, port: 3002, from: "A31", to: "A60", workdir: path.join(workDir, "w2") },
+    ]),
+    // 让 Electron 以 Node 模式运行脚本（避免弹出新窗口）
+    ELECTRON_RUN_AS_NODE: "1",
+  };
 
-  gatewayProc = spawn(nodePath, [entry], {
+  console.log("[master] entry=", entry);
+  console.log("[master] CONFIGDIR=", configDir);
+  console.log("[master] workDir=", workDir);
+
+  // 使用 process.execPath 启动（Electron 自带的 Node）
+  masterProc = spawn(process.execPath, [entry], {
     cwd: gatewayDir,
     windowsHide: true,
-    env: { ...process.env, PORT: "3001", DATA_DIR: dataDir },
+    env,
     stdio: ["ignore", out, err],
   });
 
-  gatewayProc.on("exit", (code) => console.log("[gateway] exited", code));
-  gatewayProc.on("error", (e) => console.error("[gateway] spawn error", e));
+  masterProc.on("exit", (code) => console.log("[master] exited", code));
+  masterProc.on("error", (e) => console.error("[master] spawn error", e));
 }
 
-function waitForGateway({ host = "127.0.0.1", port = 3001, timeoutMs = 20000 } = {}) {
+// ✅ 修改默认端口为 3000（master 的端口）
+function waitForMaster({ host = "127.0.0.1", port = 3000, timeoutMs = 20000 } = {}) {
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
@@ -111,7 +125,7 @@ function waitForGateway({ host = "127.0.0.1", port = 3001, timeoutMs = 20000 } =
       req.on("timeout", () => req.destroy(new Error("timeout")));
       req.on("error", () => {
         if (Date.now() - start >= timeoutMs) {
-          reject(new Error("gateway not ready (timeout)"));
+          reject(new Error("master not ready (timeout)"));
         } else {
           setTimeout(tick, 400);
         }
@@ -192,18 +206,17 @@ function openProjectWindow(projectId) {
 }
 
 app.whenReady().then(async () => {
-  startGateway();
+  startMaster();  // 启动 master
 
   try {
-    await waitForGateway({ port: 3001, timeoutMs: 20000 });
+    await waitForMaster({ port: 3000, timeoutMs: 20000 });  // 等待 master 就绪
   } catch (e) {
-    console.error("[gateway] not ready:", e);
-    // 不中断启动：UI 依然打开，前端会自动重试（方案1兜底）
+    console.error("[master] not ready:", e);
+    // 不中断启动：UI 依然打开，前端会自动重试
   }
 
   createMainWindow();
 });
-
 
 // ✅ 前端请求打开新窗口
 ipcMain.handle("ws:openProjectWindow", async (_event, projectId) => {
@@ -212,12 +225,11 @@ ipcMain.handle("ws:openProjectWindow", async (_event, projectId) => {
 });
 
 app.on("window-all-closed", () => {
-  safeKill(gatewayProc);
+  safeKill(masterProc);
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", () => {
   isQuitting = true;
-  safeKill(gatewayProc);
+  safeKill(masterProc);
 });
-
