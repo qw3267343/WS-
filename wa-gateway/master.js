@@ -22,6 +22,10 @@ const WORKER_PORT_BASE = Math.max(1, Number(process.env.WORKER_PORT_BASE || 3101
 const WORKERS_PER_PROJECT = 3;
 const MAX_ACTIVE = 13;
 const UNBIND_COOLDOWN_MS = Math.max(0, Number(process.env.UNBIND_COOLDOWN_MS || 120000));
+const PROJECTS_FILE = path.join(CONFIG_ROOT, 'projects.json');
+const PROJECT_COUNTER_FILE = path.join(CONFIG_ROOT, 'project_counter.txt');
+const UID_COUNTER_FILE = path.join(CONFIG_ROOT, 'uid_counter.txt');
+const UID_START = 100001;
 
 const RECENT_LOGS = [];
 const workers = new Map(); // workerId -> {child,state,startingPromise,ws}
@@ -94,6 +98,49 @@ function saveLease(ws) { writeJson(wsLeaseFile(ws), loadLease(ws)); }
 function setLeaseWorker(ws, slot, workerId) { const lease = loadLease(ws); lease[slot] = workerId; saveLease(ws); }
 function releaseLease(ws, slot) { const lease = loadLease(ws); delete lease[slot]; saveLease(ws); }
 
+function isValidSlot(slot) { return /^A\d+$/i.test(String(slot || '').trim()); }
+function normalizeSlot(slot) {
+  const m = /^A(\d+)$/i.exec(String(slot || '').trim());
+  return m ? `A${Number(m[1])}` : '';
+}
+function accountsFile(ws) { return path.join(wsDir(ws), 'accounts.json'); }
+function accountsLockFile(ws) { return `${accountsFile(ws)}.lock`; }
+function readLastUid() {
+  try {
+    const n = Number(String(fs.readFileSync(UID_COUNTER_FILE, 'utf-8') || '').trim());
+    return Number.isFinite(n) ? n : (UID_START - 1);
+  } catch {
+    return (UID_START - 1);
+  }
+}
+function writeLastUid(n) { fs.writeFileSync(UID_COUNTER_FILE, String(n), 'utf-8'); }
+function allocateNextUid(currentAccountsList) {
+  const used = new Set((currentAccountsList || []).map((x) => String(x?.uid || '').trim()).filter(Boolean));
+  return withFileLockSync(`${UID_COUNTER_FILE}.lock`, () => {
+    let last = readLastUid();
+    for (const u of used) {
+      const n = Number(u);
+      if (Number.isFinite(n) && n > last) last = n;
+    }
+    let next = Math.max(last + 1, UID_START);
+    while (used.has(String(next))) next++;
+    writeLastUid(next);
+    return String(next);
+  });
+}
+function buildSessionDir(uid) {
+  const v = String(uid || '').trim();
+  return v ? `session-${v}` : '';
+}
+function nextSlotLabel(list) {
+  let max = 0;
+  for (const a of (list || [])) {
+    const m = /^A(\d+)$/i.exec(String(a?.slot || ''));
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `A${max + 1}`;
+}
+
 function safeProjectId(raw) {
   const s = String(raw || '').trim();
   if (!s) return null;
@@ -103,6 +150,159 @@ function projectDir(id) { return wsDir(id); }
 function projectMetaFile(id) { return path.join(projectDir(id), 'project.json'); }
 function loadProjectMeta(id) { return readJson(projectMetaFile(id), { id, name: id, status: 'STOPPED', workers: [] }); }
 function saveProjectMeta(id, meta) { writeJson(projectMetaFile(id), meta); }
+
+function parseProjectNumber(id) {
+  const m = String(id || '').match(/^p_(\d+)$/i);
+  return m ? Number(m[1]) : null;
+}
+function normalizeProject(project) {
+  if (!project || typeof project !== 'object') return null;
+  const id = safeProjectId(project.id);
+  if (!id) return null;
+  const now = Date.now();
+  return {
+    id,
+    name: String(project.name || id),
+    note: project.note != null ? String(project.note) : undefined,
+    createdAt: Number(project.createdAt || now),
+    updatedAt: Number(project.updatedAt || now),
+    status: String(project.status || 'STOPPED').toUpperCase() === 'RUNNING' ? 'RUNNING' : 'STOPPED',
+    workers: Array.isArray(project.workers) ? project.workers.map((v) => String(v)).filter(Boolean) : [],
+    ...(project.migratedFromName ? { migratedFromName: String(project.migratedFromName) } : {}),
+  };
+}
+function loadProjects() {
+  const rows = readJson(PROJECTS_FILE, []);
+  return Array.isArray(rows) ? rows.map(normalizeProject).filter(Boolean) : [];
+}
+function saveProjects(list) {
+  const normalized = Array.isArray(list) ? list.map(normalizeProject).filter(Boolean) : [];
+  withFileLockSync(`${PROJECTS_FILE}.lock`, () => writeJson(PROJECTS_FILE, normalized));
+}
+function findProject(id) {
+  const pid = safeProjectId(id);
+  if (!pid) return null;
+  return loadProjects().find((p) => p.id === pid) || null;
+}
+function upsertProject(project) {
+  const next = normalizeProject(project);
+  if (!next) throw new Error('invalid project');
+  withFileLockSync(`${PROJECTS_FILE}.lock`, () => {
+    const list = loadProjects();
+    const idx = list.findIndex((p) => p.id === next.id);
+    if (idx >= 0) list[idx] = next;
+    else list.push(next);
+    writeJson(PROJECTS_FILE, list);
+  });
+  return next;
+}
+function deleteProjectRecord(id) {
+  const pid = safeProjectId(id);
+  if (!pid) return;
+  withFileLockSync(`${PROJECTS_FILE}.lock`, () => {
+    const list = loadProjects().filter((p) => p.id !== pid);
+    writeJson(PROJECTS_FILE, list);
+  });
+}
+function readProjectCounter() {
+  try {
+    const n = Number(String(fs.readFileSync(PROJECT_COUNTER_FILE, 'utf-8') || '').trim());
+    return Number.isFinite(n) ? n : 100000;
+  } catch {
+    return 100000;
+  }
+}
+function writeProjectCounter(n) { fs.writeFileSync(PROJECT_COUNTER_FILE, String(n), 'utf-8'); }
+function allocateProjectId() {
+  return withFileLockSync(`${PROJECT_COUNTER_FILE}.lock`, () => {
+    const projects = loadProjects();
+    const maxIdNum = projects.reduce((mx, item) => {
+      const n = parseProjectNumber(item.id);
+      return n && n > mx ? n : mx;
+    }, 100000);
+    const last = Math.max(readProjectCounter(), maxIdNum, 100000);
+    const next = last + 1;
+    writeProjectCounter(next);
+    return `p_${next}`;
+  });
+}
+
+function migrateProjects() {
+  const raw = readJson(PROJECTS_FILE, []);
+  let list = Array.isArray(raw) ? raw : [];
+  if (!list.length) {
+    const wsRoot = path.join(CONFIG_ROOT, 'workspaces');
+    if (fs.existsSync(wsRoot)) {
+      list = fs.readdirSync(wsRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => readJson(projectMetaFile(d.name), { id: d.name, name: d.name, status: 'STOPPED', workers: [] }));
+    }
+  }
+  const migrated = [];
+  let changed = false;
+
+  for (const item of list) {
+    const currentId = String(item?.id || '').trim();
+    const hasNewId = /^p_\d+$/i.test(currentId);
+    if (hasNewId) {
+      const normalized = normalizeProject(item);
+      if (normalized) migrated.push(normalized);
+      continue;
+    }
+
+    changed = true;
+    const oldId = safeProjectId(currentId || item?.name || '');
+    const newId = allocateProjectId();
+    const now = Date.now();
+    const next = {
+      id: newId,
+      name: String(item?.name || currentId || newId),
+      note: item?.note != null ? String(item.note) : undefined,
+      migratedFromName: String(currentId || ''),
+      createdAt: Number(item?.createdAt || now),
+      updatedAt: now,
+      status: 'STOPPED',
+      workers: [],
+    };
+    const oldDir = oldId ? projectDir(oldId) : null;
+    const newDir = projectDir(newId);
+    if (oldDir && fs.existsSync(oldDir) && !fs.existsSync(newDir)) fs.renameSync(oldDir, newDir);
+    else ensureDir(newDir);
+    saveProjectMeta(newId, next);
+    migrated.push(next);
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const item of migrated) {
+    if (seen.has(item.id)) {
+      changed = true;
+      continue;
+    }
+    seen.add(item.id);
+    ensureDir(projectDir(item.id));
+    saveProjectMeta(item.id, item);
+    unique.push(item);
+  }
+
+  const maxNum = unique.reduce((mx, item) => {
+    const n = parseProjectNumber(item.id);
+    return n && n > mx ? n : mx;
+  }, 100000);
+  if (readProjectCounter() < maxNum) writeProjectCounter(maxNum);
+
+  withFileLockSync(poolLockFile(), () => {
+    const pool = loadWorkersPool();
+    const valid = new Set(unique.flatMap((p) => (p.workers || []).map((wid) => `${p.id}:${wid}`)));
+    for (const w of pool.workers) {
+      if (!w.assignedTo) continue;
+      if (!unique.find((p) => p.id === w.assignedTo && valid.has(`${p.id}:${w.id}`))) w.assignedTo = null;
+    }
+    saveWorkersPool(pool);
+  });
+
+  if (changed || !Array.isArray(raw)) saveProjects(unique);
+}
 
 function buildDefaultPool() {
   return {
@@ -323,6 +523,20 @@ app.post('/internal/emit', (req, res) => {
   return res.json({ ok: true });
 });
 
+
+function isStartBypassPath(req) {
+  const p = String(req.path || req.originalUrl || '');
+  if (p.startsWith('/projects')) return true;
+  if (p === '/system/recentLogs') return true;
+  return false;
+}
+function ensureProjectRunning(ws) {
+  const meta = findProject(ws);
+  if (!meta) return { ok: false, reason: 'project not found' };
+  if (meta.status !== 'RUNNING') return { ok: false, reason: 'project not started' };
+  return { ok: true, meta };
+}
+
 app.get('/api/system/recentLogs', (_req, res) => res.json({ ok: true, logs: RECENT_LOGS }));
 app.get('/health', (_req, res) => {
   const pool = loadWorkersPool();
@@ -331,15 +545,57 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/accounts', (req, res) => {
   const ws = getWsFromReq(req);
-  const rows = readJson(path.join(wsDir(ws), 'accounts.json'), []);
-  return res.json({ ok: true, data: rows });
+  const rows = readJson(accountsFile(ws), []);
+  return res.json({ ok: true, data: Array.isArray(rows) ? rows : [] });
+});
+app.post('/api/accounts/create', (req, res) => {
+  try {
+    const ws = getWsFromReq(req);
+    ensureDir(wsDir(ws));
+    const requestedSlot = normalizeSlot(req.body?.slot);
+    const enabled = req.body?.enabled !== false;
+    let result = null;
+    let invalid = false;
+
+    withFileLockSync(accountsLockFile(ws), () => {
+      const listRaw = readJson(accountsFile(ws), []);
+      const list = Array.isArray(listRaw) ? listRaw : [];
+      let slot = requestedSlot || nextSlotLabel(list);
+      slot = normalizeSlot(slot);
+      if (!isValidSlot(slot)) {
+        invalid = true;
+        return;
+      }
+
+      const existed = list.find((x) => String(x?.slot || '').toUpperCase() === slot);
+      if (existed) {
+        result = existed;
+        return;
+      }
+
+      const uid = allocateNextUid(list);
+      const acc = { slot, uid, sessionDir: buildSessionDir(uid), createdAt: Date.now(), enabled };
+      list.push(acc);
+      writeJson(accountsFile(ws), list);
+      result = acc;
+    });
+
+    if (invalid) return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
+    return res.json({ ok: true, data: result });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 app.get('/api/roles', (req, res) => {
   const ws = getWsFromReq(req);
+  const running = ensureProjectRunning(ws);
+  if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
   return res.json({ ok: true, roles: readJson(path.join(wsDir(ws), 'roles.json'), []) });
 });
 app.post('/api/roles/batch', async (req, res) => {
   const ws = getWsFromReq(req);
+  const running = ensureProjectRunning(ws);
+  if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
   const roles = Array.isArray(req.body?.roles) ? req.body.roles : [];
   writeJson(path.join(wsDir(ws), 'roles.json'), roles);
   await reconcileWorkspace(ws);
@@ -347,43 +603,42 @@ app.post('/api/roles/batch', async (req, res) => {
 });
 app.get('/api/groups', (req, res) => {
   const ws = getWsFromReq(req);
+  const running = ensureProjectRunning(ws);
+  if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
   return res.json({ ok: true, rows: readJson(path.join(wsDir(ws), 'groups.json'), []) });
 });
 
 app.get('/api/projects', (_req, res) => {
-  const dir = path.join(CONFIG_ROOT, 'workspaces');
-  if (!fs.existsSync(dir)) return res.json({ ok: true, data: [] });
-  const rows = fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => loadProjectMeta(d.name));
+  const rows = loadProjects().map((item) => ({ ...item, workers: Array.isArray(item.workers) ? item.workers : [] }));
   return res.json({ ok: true, data: rows, rows, projects: rows });
 });
 app.get('/api/projects/:id', (req, res) => {
   const id = safeProjectId(req.params.id);
   if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-  const dir = projectDir(id);
-  if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'project not found' });
-  return res.json({ ok: true, data: loadProjectMeta(id) });
+  const project = findProject(id);
+  if (!project) return res.status(404).json({ ok: false, error: 'project not found' });
+  return res.json({ ok: true, data: project });
 });
 app.post('/api/projects', (req, res) => {
   try {
     const body = req.body || {};
-    const id = safeProjectId(body.id || body.ws || body.projectId || body.name);
-    const name = String(body.name || body.title || id || '').trim();
-    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-    if (fs.existsSync(projectDir(id))) return res.status(409).json({ ok: false, error: 'project already exists' });
-
-    let assigned = null;
-    withFileLockSync(poolLockFile(), () => {
-      const pool = loadWorkersPool();
-      const block = findContiguousWorkers(pool, WORKERS_PER_PROJECT);
-      if (!block) throw new Error('no contiguous workers available');
-      for (const w of block) w.assignedTo = id;
-      saveWorkersPool(pool);
-      assigned = block.map((w) => w.id);
-    });
-
+    const name = String(body.name || '').trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'name required' });
+    const id = allocateProjectId();
     const now = Date.now();
-    saveProjectMeta(id, { id, name: name || id, createdAt: now, updatedAt: now, status: 'STOPPED', workers: assigned });
-    return res.json({ ok: true, data: { id, name: name || id, workers: assigned, status: 'STOPPED' } });
+    const project = {
+      id,
+      name,
+      ...(body.note != null ? { note: String(body.note) } : {}),
+      createdAt: now,
+      updatedAt: now,
+      status: 'STOPPED',
+      workers: [],
+    };
+    ensureDir(projectDir(id));
+    saveProjectMeta(id, project);
+    upsertProject(project);
+    return res.json({ ok: true, data: project });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -391,24 +646,42 @@ app.post('/api/projects', (req, res) => {
 app.put('/api/projects/:id', (req, res) => {
   const id = safeProjectId(req.params.id);
   if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-  if (!fs.existsSync(projectDir(id))) return res.status(404).json({ ok: false, error: 'project not found' });
-  const meta = loadProjectMeta(id);
+  const meta = findProject(id);
+  if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
   const now = Date.now();
-  const next = { ...meta, name: String(req.body?.name || meta.name || id), updatedAt: now };
+  const next = {
+    ...meta,
+    name: String(req.body?.name || meta.name || id),
+    ...(req.body?.note != null ? { note: String(req.body.note) } : { note: meta.note }),
+    updatedAt: now,
+  };
   saveProjectMeta(id, next);
+  upsertProject(next);
   return res.json({ ok: true, data: next });
 });
 app.post('/api/projects/:id/start', async (req, res) => {
   try {
     const id = safeProjectId(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-    const meta = loadProjectMeta(id);
+    const meta = findProject(id);
+    if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
+    if (!Array.isArray(meta.workers) || meta.workers.length !== WORKERS_PER_PROJECT) {
+      withFileLockSync(poolLockFile(), () => {
+        const pool = loadWorkersPool();
+        for (const w of pool.workers) if (meta.workers?.includes(w.id)) w.assignedTo = null;
+        const block = findContiguousWorkers(pool, WORKERS_PER_PROJECT);
+        if (!block) throw new Error('no contiguous workers available');
+        meta.workers = block.map((w) => w.id);
+        for (const w of block) w.assignedTo = id;
+        saveWorkersPool(pool);
+      });
+    }
     const wsWorkers = getProjectWorkers(meta);
-    if (wsWorkers.length !== WORKERS_PER_PROJECT) return res.status(400).json({ ok: false, error: 'project worker assignment invalid' });
     for (const w of wsWorkers) await ensureWorkerRunning(w, id);
     meta.status = 'RUNNING';
     meta.updatedAt = Date.now();
     saveProjectMeta(id, meta);
+    upsertProject(meta);
     await reconcileWorkspace(id);
     return res.json({ ok: true, data: meta });
   } catch (e) {
@@ -419,7 +692,8 @@ app.post('/api/projects/:id/stop', (req, res) => {
   try {
     const id = safeProjectId(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-    const meta = loadProjectMeta(id);
+    const meta = findProject(id);
+    if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
     for (const wid of (meta.workers || [])) {
       const running = workers.get(wid);
       if (running?.child) safeKill(running.child);
@@ -428,6 +702,7 @@ app.post('/api/projects/:id/stop', (req, res) => {
     meta.status = 'STOPPED';
     meta.updatedAt = Date.now();
     saveProjectMeta(id, meta);
+    upsertProject(meta);
     return res.json({ ok: true, data: meta });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -437,7 +712,8 @@ app.delete('/api/projects/:id', (req, res) => {
   try {
     const id = safeProjectId(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-    const meta = loadProjectMeta(id);
+    const meta = findProject(id);
+    if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
     for (const wid of (meta.workers || [])) {
       const running = workers.get(wid);
       if (running?.child) safeKill(running.child);
@@ -448,6 +724,7 @@ app.delete('/api/projects/:id', (req, res) => {
       saveWorkersPool(pool);
     });
     fs.rmSync(projectDir(id), { recursive: true, force: true });
+    deleteProjectRecord(id);
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -456,9 +733,14 @@ app.delete('/api/projects/:id', (req, res) => {
 
 app.use('/api', async (req, res) => {
   try {
-    const ws = getWsFromReq(req);
+    const ws = resolveWs(req.headers['x-ws'] || req.query?.ws || 'default');
+    if (!isStartBypassPath(req)) {
+      const running = ensureProjectRunning(ws);
+      if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
+    }
     const slot = parseSlot(req);
-    const meta = loadProjectMeta(ws);
+    const meta = findProject(ws);
+    if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
     const wsWorkers = getProjectWorkers(meta);
     if (!wsWorkers.length) return res.status(409).json({ ok: false, error: 'project has no workers' });
 
@@ -495,6 +777,10 @@ app.use('/api', async (req, res) => {
 server.listen(PORT_MASTER, () => {
   ensureDir(path.join(CONFIG_ROOT, 'workspaces'));
   ensureDir(WORK_ROOT);
+  if (!fs.existsSync(PROJECTS_FILE)) writeJson(PROJECTS_FILE, []);
+  if (!fs.existsSync(PROJECT_COUNTER_FILE)) fs.writeFileSync(PROJECT_COUNTER_FILE, '100000', 'utf-8');
+  if (!fs.existsSync(UID_COUNTER_FILE)) fs.writeFileSync(UID_COUNTER_FILE, String(UID_START - 1), 'utf-8');
+  migrateProjects();
   loadWorkersPool();
   log('info', 'master_listen', { port: PORT_MASTER, workerPoolSize: WORKER_POOL_SIZE });
 });
