@@ -49,7 +49,13 @@ const UID_COUNTER_FILE = path.join(DATA_DIR, "uid_counter.txt");
 const UID_START = 100001;
 const TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TRASH_CLEAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const MAX_INIT = Math.max(1, Number(process.env.WA_INIT_CONCURRENCY || 3));
+const MAX_INIT = Math.max(1, Number(process.env.MAX_INIT || process.env.WA_INIT_CONCURRENCY || 3));
+const MAX_ACTIVE = Math.max(1, Number(process.env.MAX_ACTIVE || 30));
+const WARMUP_LIMIT = Math.max(0, Number(process.env.WARMUP_LIMIT || 10));
+const SLOT_FROM = String(process.env.SLOT_FROM || '').trim().toUpperCase();
+const SLOT_TO = String(process.env.SLOT_TO || '').trim().toUpperCase();
+const MASTER_INTERNAL_URL = String(process.env.MASTER_INTERNAL_URL || '').trim();
+const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
 const CONFIG_ROOT = path.resolve(process.env.CONFIGDIR || DATA_DIR);
 const WORK_ROOT = path.resolve(process.env.WORKDIR || CONFIG_ROOT);
 const RECENT_LOG_LIMIT = Math.max(10, Number(process.env.RECENT_LOG_LIMIT || 200));
@@ -136,8 +142,19 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+app.get("/health", (req, res) => {
+  const ws = getWs(req);
+  res.json({
+    ok: true,
+    worker: {
+      port: Number(process.env.PORT || 3001),
+      slotFrom: SLOT_FROM || null,
+      slotTo: SLOT_TO || null,
+      active: getActiveCount(ws),
+      maxActive: MAX_ACTIVE,
+    },
+    ts: Date.now(),
+  });
 });
 
 // =========================
@@ -693,6 +710,29 @@ function normalizeSlot(s) {
 function isValidSlot(slot) {
   return /^A\d+$/i.test(String(slot || '').trim());
 }
+function slotToNumber(slot) {
+  const m = /^A(\d+)$/i.exec(String(slot || '').trim());
+  return m ? Number(m[1]) : null;
+}
+
+function slotInWorkerRange(slot) {
+  if (!SLOT_FROM && !SLOT_TO) return true;
+  const n = slotToNumber(slot);
+  if (!Number.isFinite(n)) return false;
+  const from = slotToNumber(SLOT_FROM);
+  const to = slotToNumber(SLOT_TO);
+  if (Number.isFinite(from) && n < from) return false;
+  if (Number.isFinite(to) && n > to) return false;
+  return true;
+}
+
+function ensureSlotOwned(res, slot) {
+  if (!slotInWorkerRange(slot)) {
+    res.status(409).json({ ok: false, error: 'slot not in this worker' });
+    return false;
+  }
+  return true;
+}
 function getAccountBySlot(ws, slot) {
   const list = loadAccounts(ws);
   return list.find(x => x.slot === slot) || null;
@@ -926,6 +966,51 @@ function ctx(ws) {
   return contexts.get(key);
 }
 
+function getActiveCount(ws) {
+  return ctx(ws).clients.size;
+}
+
+function hasWorkerCapacity(ws) {
+  return getActiveCount(ws) < MAX_ACTIVE;
+}
+
+function postJson(urlStr, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(urlStr);
+      const data = Buffer.from(JSON.stringify(payload || {}), 'utf-8');
+      const req = http.request({
+        hostname: u.hostname,
+        port: Number(u.port || 80),
+        path: u.pathname + (u.search || ''),
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': data.length,
+          ...headers,
+        },
+      }, (res) => {
+        res.on('data', () => {});
+        res.on('end', () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode }));
+      });
+      req.on('error', reject);
+      req.write(data);
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function emitWsEvent(ws, event, payload) {
+  io.to(ws).emit(event, payload);
+  if (!MASTER_INTERNAL_URL) return;
+  postJson(`${MASTER_INTERNAL_URL}/internal/emit`, { ws, event, payload }, MASTER_TOKEN ? { 'x-master-token': MASTER_TOKEN } : {})
+    .catch((e) => {
+      log('warn', 'master_emit_failed', { ws, event, err: String(e?.message || e) });
+    });
+}
+
 async function runPool(items, worker, concurrency) {
   let idx = 0;
   const results = new Array(items.length).fill(false);
@@ -1028,6 +1113,11 @@ function selectReadySlot(ws) {
 function ensureClient(ws, slot) {
   const { clients, statuses, profiles } = ctx(ws);
   if (clients.has(slot)) return clients.get(slot);
+  if (!slotInWorkerRange(slot)) throw new Error('slot not in this worker');
+  if (!hasWorkerCapacity(ws)) {
+    log('warn', 'worker_capacity_full', { ws, slot, active: getActiveCount(ws), max: MAX_ACTIVE });
+    throw new Error('worker capacity full');
+  }
 
   const acc = ensureAccount(ws, slot); // 确保 slot->uid 存在
   const uid = acc.uid;
@@ -1065,8 +1155,8 @@ function ensureClient(ws, slot) {
 
   client.on('qr', (qr) => {
     statuses.set(slot, { status: 'QR', lastQr: qr });
-    io.to(ws).emit('wa:qr', { slot, uid, qr });
-    io.to(ws).emit('wa:status', { slot, uid, status: 'QR' });
+    emitWsEvent(ws, 'wa:qr', { slot, uid, qr });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'QR' });
   });
 
   client.on('ready', () => {
@@ -1083,17 +1173,17 @@ function ensureClient(ws, slot) {
     profiles.set(slot, { phone, nickname });
 
     statuses.set(slot, { status: 'READY', lastQr: null });
-    io.to(ws).emit('wa:status', { slot, uid, status: 'READY', phone, nickname });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'READY', phone, nickname });
   });
 
   client.on('auth_failure', (msg) => {
     statuses.set(slot, { status: 'AUTH_FAILURE', lastQr: null });
-    io.to(ws).emit('wa:status', { slot, uid, status: 'AUTH_FAILURE', msg });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'AUTH_FAILURE', msg });
   });
 
   client.on('disconnected', (reason) => {
     statuses.set(slot, { status: 'DISCONNECTED', lastQr: null });
-    io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED', reason });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'DISCONNECTED', reason });
   });
 
   clients.set(slot, client);
@@ -1208,6 +1298,9 @@ app.post('/api/accounts/create', (req, res) => {
     const file = getWorkspaceAccountsFile(ws);
     const enabled = req.body?.enabled !== false;
     const requestedSlot = normalizeSlot(req.body?.slot);
+    if (requestedSlot && !slotInWorkerRange(requestedSlot)) {
+      return res.status(409).json({ ok: false, error: 'slot not in this worker' });
+    }
     let result = null;
     let invalid = false;
 
@@ -1261,6 +1354,7 @@ app.get('/api/accounts/:slot/status', (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
 
   const acc = getAccountBySlot(ws, slot);
   const { statuses, profiles } = ctx(ws);
@@ -1282,6 +1376,7 @@ app.post('/api/accounts/:slot/enabled', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
 
   const enabled = req.body?.enabled !== false;
   const file = getWorkspaceAccountsFile(ws);
@@ -1298,7 +1393,7 @@ app.post('/api/accounts/:slot/enabled', async (req, res) => {
   if (!found) return res.status(404).json({ ok: false, error: 'account not found' });
   if (!enabled) {
     await destroyClient(ws, slot);
-    io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED' });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'DISCONNECTED' });
   }
   return res.json({ ok: true, slot, enabled });
 });
@@ -1340,6 +1435,7 @@ app.get('/api/accounts/:slot/groups', async (req, res) => {
     const ws = getWs(req);
     const { clients, statuses } = ctx(ws);
     const slot = normalizeSlot(req.params.slot);
+    if (!ensureSlotOwned(res, slot)) return;
 
     const client = clients.get(slot);
     const st = statuses.get(slot)?.status;
@@ -1655,6 +1751,7 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
 
   return enqueueSlot(ws, slot, async () => {
     const { statuses } = ctx(ws);
@@ -1666,6 +1763,10 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
 
     const acc = ensureAccount(ws, slot);
     if (acc.enabled === false) return res.status(400).json({ ok: false, error: 'account disabled' });
+    if (!ctx(ws).clients.has(slot) && !hasWorkerCapacity(ws)) {
+      log('warn', 'worker_capacity_full', { ws, slot, active: getActiveCount(ws), max: MAX_ACTIVE });
+      return res.status(429).json({ ok: false, error: 'worker capacity full' });
+    }
 
     try {
       await singleflight(ws, slot, async () => {
@@ -1681,7 +1782,9 @@ app.post('/api/accounts/:slot/connect', async (req, res) => {
       });
       res.json({ ok: true, data: acc });
     } catch (e) {
-      res.status(500).json({ ok: false, error: String(e) });
+      const msg = String(e?.message || e);
+      if (msg.includes('worker capacity full')) return res.status(429).json({ ok: false, error: 'worker capacity full' });
+      res.status(500).json({ ok: false, error: msg });
     }
   }).catch((e) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1711,6 +1814,7 @@ async function rebuildClientAndGetPage(ws, slot, reason = 'manual') {
 app.post('/api/accounts/:slot/logout', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
+  if (!ensureSlotOwned(res, slot)) return;
   return enqueueSlot(ws, slot, async () => {
     const uid = getAccountBySlot(ws, slot)?.uid || null;
     const { clients } = ctx(ws);
@@ -1721,7 +1825,7 @@ app.post('/api/accounts/:slot/logout', async (req, res) => {
 
     const { statuses } = ctx(ws);
     statuses.set(slot, { status: 'LOGGED_OUT', lastQr: null });
-    io.to(ws).emit('wa:status', { slot, uid, status: 'LOGGED_OUT' });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'LOGGED_OUT' });
     res.json({ ok: true });
   }).catch((e) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1732,10 +1836,11 @@ app.post('/api/accounts/:slot/destroy', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
   return enqueueSlot(ws, slot, async () => {
     await destroyClient(ws, slot);
     const uid = getAccountBySlot(ws, slot)?.uid || null;
-    io.to(ws).emit('wa:status', { slot, uid, status: 'DISCONNECTED' });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'DISCONNECTED' });
     return res.json({ ok: true });
   }).catch((e) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1747,6 +1852,7 @@ app.post('/api/accounts/:slot/open', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
 
   return enqueueSlot(ws, slot, async () => {
     const acc = ensureAccount(ws, slot);
@@ -1781,6 +1887,7 @@ app.post('/api/accounts/:slot/openChat', async (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.params.slot);
   if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
 
   return enqueueSlot(ws, slot, async () => {
     const { clients, statuses } = ctx(ws);
@@ -1830,6 +1937,7 @@ async function deleteAccountHandler(req, res) {
   const ws = getWs(req);
   const { clients, statuses, profiles } = ctx(ws);
   const slot = normalizeSlot(req.params.slot);
+  if (!ensureSlotOwned(res, slot)) return;
 
   try {
     // 1) 停掉运行中的 client
@@ -1877,6 +1985,7 @@ app.post('/api/accounts/:slot/send', async (req, res) => {
   const ws = getWs(req);
   const { clients, statuses } = ctx(ws);
   const slot = normalizeSlot(req.params.slot);
+  if (!ensureSlotOwned(res, slot)) return;
   const { to, text } = req.body;
   if (!to || !text) return res.status(400).json({ ok: false, error: 'to/text required' });
 
@@ -1905,6 +2014,7 @@ app.post('/api/accounts/:slot/sendMedia', upload.array('files', 10), async (req,
     const ws = getWs(req);
     const { clients, statuses } = ctx(ws);
     const slot = normalizeSlot(req.params.slot);
+    if (!ensureSlotOwned(res, slot)) return;
     const client = clients.get(slot);
     const st = statuses.get(slot)?.status;
 
@@ -1956,13 +2066,14 @@ app.get('/api/schedules/history', (req, res) => {
 app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
   const ws = getWs(req);
   const slot = normalizeSlot(req.body?.slot);
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot required' });
+  if (!ensureSlotOwned(res, slot)) return;
   const mode = String(req.body?.mode || '').trim();
   const text = String(req.body?.text || '');
   const roleName = String(req.body?.roleName || '').trim();
   const minutes = Number(req.body?.minutes || 0);
   const targetsRaw = req.body?.targets;
 
-  if (!slot) return res.status(400).json({ ok: false, error: 'slot required' });
   if (!mode) return res.status(400).json({ ok: false, error: 'mode required' });
   if (!targetsRaw) return res.status(400).json({ ok: false, error: 'targets required' });
   if (!['enabled_groups', 'single_group', 'single_contact'].includes(mode)) {
@@ -2089,6 +2200,65 @@ async function executeScheduledJob(ws, job) {
   cleanupScheduledUploads(ws, job.id);
 }
 
+async function runWarmup() {
+  try {
+    const base = path.join(CONFIG_ROOT, 'workspaces');
+    if (!fs.existsSync(base)) return;
+    const wsList = fs.readdirSync(base).filter((name) => {
+      const full = path.join(base, name);
+      return fs.existsSync(full) && fs.statSync(full).isDirectory();
+    });
+
+    for (const ws of wsList) {
+      const roles = loadRoles(ws);
+      const accounts = loadAccounts(ws);
+      const enabledSlots = new Set(accounts.filter((a) => a?.enabled !== false).map((a) => normalizeSlot(a.slot)).filter(Boolean));
+      const rawSlots = Array.from(new Set((roles || []).map((r) => normalizeSlot(r?.boundSlot)).filter(Boolean)));
+      const inRangeSlots = rawSlots.filter((slot) => slotInWorkerRange(slot));
+      const slots = inRangeSlots.sort((a, b) => slotToNumber(a) - slotToNumber(b));
+
+      const capacity = Math.max(0, MAX_ACTIVE - getActiveCount(ws));
+      if (capacity <= 0) {
+        log('warn', 'warmup_capacity_full', { ws, active: getActiveCount(ws), maxActive: MAX_ACTIVE });
+        continue;
+      }
+      const limit = Math.min(capacity, WARMUP_LIMIT, MAX_ACTIVE);
+      const selected = slots.slice(0, limit);
+      log('info', 'warmup_start', { ws, count: selected.length, slots: selected });
+      let ok = 0;
+      let fail = 0;
+
+      for (const slot of selected) {
+        if (!enabledSlots.has(slot)) {
+          log('warn', 'warmup_skip_disabled', { ws, slot });
+          continue;
+        }
+        if (!hasWorkerCapacity(ws) && !ctx(ws).clients.has(slot)) {
+          log('warn', 'warmup_capacity_full', { ws, active: getActiveCount(ws), maxActive: MAX_ACTIVE });
+          break;
+        }
+        try {
+          await enqueueSlot(ws, slot, async () => {
+            await singleflight(ws, slot, async () => {
+              const client = ensureClient(ws, slot);
+              await withInitLimit(async () => {
+                await client.initialize();
+              });
+            });
+          });
+          ok += 1;
+        } catch {
+          fail += 1;
+        }
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+      log('info', 'warmup_done', { ws, ok, fail });
+    }
+  } catch (e) {
+    log('warn', 'warmup_failed', { err: String(e?.message || e) });
+  }
+}
+
 let scheduleTickRunning = false;
 setInterval(async () => {
   if (scheduleTickRunning) return;
@@ -2123,4 +2293,7 @@ setInterval(async () => {
 }, 1000);
 
 const PORT = Number(process.env.PORT || 3001);
-server.listen(PORT, () => log('info', 'server_listen', { url: `http://127.0.0.1:${PORT}` }));
+server.listen(PORT, () => {
+  log('info', 'server_listen', { url: `http://127.0.0.1:${PORT}` });
+  setTimeout(() => { runWarmup(); }, 0);
+});

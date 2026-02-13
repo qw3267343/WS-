@@ -7,7 +7,15 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js",
     "start:worker1": "PORT=3001 SLOT_FROM=A1 SLOT_TO=A50 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w1 node server.js",
-    "start:worker2": "PORT=3002 SLOT_FROM=A51 SLOT_TO=A100 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w2 node server.js"
+    "start:worker2": "PORT=3002 SLOT_FROM=A51 SLOT_TO=A100 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w2 node server.js",
+    "start:master": "PORT_MASTER=3000 PREWARM=2 CONFIGDIR=./data_shared SHARDS_JSON=\"[{\"id\":\"w1\",\"port\":3001,\"from\":\"A1\",\"to\":\"A50\",\"workdir\":\"./data_w1\"},{\"id\":\"w2\",\"port\":3002,\"from\":\"A51\",\"to\":\"A100\",\"workdir\":\"./data_w2\"}]\" node master.js",
+    "start:w1": "PORT=3001 SLOT_FROM=A1 SLOT_TO=A50 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w1 node server.js",
+    "start:w2": "PORT=3002 SLOT_FROM=A51 SLOT_TO=A100 MAX_ACTIVE=20 MAX_INIT=2 CONFIGDIR=./data_shared WORKDIR=./data_w2 node server.js",
+    "start:w3": "PORT=3003 SLOT_FROM=A101 SLOT_TO=A150 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w3 node server.js",
+    "start:w4": "PORT=3004 SLOT_FROM=A151 SLOT_TO=A200 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w4 node server.js",
+    "start:w5": "PORT=3005 SLOT_FROM=A201 SLOT_TO=A250 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w5 node server.js",
+    "start:w6": "PORT=3006 SLOT_FROM=A251 SLOT_TO=A300 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w6 node server.js",
+    "start:w7": "PORT=3007 SLOT_FROM=A301 SLOT_TO=A350 MAX_ACTIVE=20 MAX_INIT=2 WARMUP_LIMIT=10 CONFIGDIR=./data_shared WORKDIR=./data_w7 node server.js"
   },
   "keywords": [],
   "author": "",
