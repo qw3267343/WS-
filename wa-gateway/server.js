@@ -59,9 +59,8 @@ const TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TRASH_CLEAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_INIT = Math.max(1, Number(process.env.MAX_INIT || process.env.WA_INIT_CONCURRENCY || 3));
 const MAX_ACTIVE = Math.max(1, Number(process.env.MAX_ACTIVE || 30));
+const WORKSPACE_ID = String(process.env.WORKSPACE_ID || '').trim();
 const WARMUP_LIMIT = Math.max(0, Number(process.env.WARMUP_LIMIT || 10));
-const SLOT_FROM = String(process.env.SLOT_FROM || '').trim().toUpperCase();
-const SLOT_TO = String(process.env.SLOT_TO || '').trim().toUpperCase();
 const MASTER_INTERNAL_URL = String(process.env.MASTER_INTERNAL_URL || '').trim();
 const IS_MASTER_MODE = !!MASTER_INTERNAL_URL;
 const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
@@ -158,52 +157,7 @@ function normalizeWs(ws) {
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ====== M5 guard: enforce slot ownership at the framework level ======
-function parseSlotNumber(slot) {
-  const m = String(slot || '').trim().toUpperCase().match(/^A(\d+)$/);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
-}
-
-function getWorkerRange() {
-  const fromRaw = process.env.SLOT_FROM;
-  const toRaw = process.env.SLOT_TO;
-  const from = fromRaw != null && String(fromRaw).trim() !== '' ? Number(fromRaw) : null;
-  const to   = toRaw   != null && String(toRaw).trim()   !== '' ? Number(toRaw)   : null;
-  return {
-    from: Number.isFinite(from) ? from : null,
-    to: Number.isFinite(to) ? to : null,
-  };
-}
-
-function isSlotInWorkerRange(slot) {
-  const { from, to } = getWorkerRange();
-  // 未设置分段 => 视为不限制（兼容单 worker）
-  if (from == null || to == null) return true;
-  const n = parseSlotNumber(slot);
-  if (n == null) return false;
-  return n >= from && n <= to;
-}
-
-// ⚠️ 全局拦截所有带 :slot 的路由（connect/status/open/openChat/logout/...）
-app.param('slot', (req, res, next, raw) => {
-  const slot = String(raw || '').trim().toUpperCase();
-  req.params.slot = slot;
-
-  // 你的项目里已有 isValidSlot(slot) / normalizeSlot(slot) 也行
-  if (!/^A\d+$/i.test(slot)) {
-    return res.status(400).json({ ok: false, error: 'slot format must be A1/A2/...' });
-  }
-
-  if (!isSlotInWorkerRange(slot)) {
-    return res.status(409).json({ ok: false, error: 'slot not in this worker' });
-  }
-
-  return next();
-});
-// ====== end guard ======
+app.use('/api', enforceWorkspace);
 
 
 const server = http.createServer(app);
@@ -215,8 +169,6 @@ app.get("/health", (req, res) => {
     ok: true,
     worker: {
       port: Number(process.env.PORT || 3001),
-      slotFrom: SLOT_FROM || null,
-      slotTo: SLOT_TO || null,
       active: getActiveCount(ws),
       maxActive: MAX_ACTIVE,
     },
@@ -486,6 +438,15 @@ function resolveWs(raw) {
 function getWs(req) {
   const raw = req.query?.ws || req.headers['x-ws'] || 'default';
   return resolveWs(raw);
+}
+
+function enforceWorkspace(req, res, next) {
+  if (!WORKSPACE_ID) return next();
+  const ws = getWs(req);
+  if (ws !== WORKSPACE_ID) {
+    return res.status(409).json({ ok: false, error: `workspace mismatch: worker=${WORKSPACE_ID}, request=${ws}` });
+  }
+  return next();
 }
 
 function getWorkspaceConfigDir(ws) {
@@ -782,22 +743,11 @@ function slotToNumber(slot) {
   return m ? Number(m[1]) : null;
 }
 
-function slotInWorkerRange(slot) {
-  if (!SLOT_FROM && !SLOT_TO) return true;
-  const n = slotToNumber(slot);
-  if (!Number.isFinite(n)) return false;
-  const from = slotToNumber(SLOT_FROM);
-  const to = slotToNumber(SLOT_TO);
-  if (Number.isFinite(from) && n < from) return false;
-  if (Number.isFinite(to) && n > to) return false;
+function slotInWorkerRange(_slot) {
   return true;
 }
 
-function ensureSlotOwned(res, slot) {
-  if (!slotInWorkerRange(slot)) {
-    res.status(409).json({ ok: false, error: 'slot not in this worker' });
-    return false;
-  }
+function ensureSlotOwned(_res, _slot) {
   return true;
 }
 function getAccountBySlot(ws, slot) {
@@ -1182,7 +1132,6 @@ function selectReadySlot(ws) {
 function ensureClient(ws, slot) {
   const { clients, statuses, profiles } = ctx(ws);
   if (clients.has(slot)) return clients.get(slot);
-  if (!slotInWorkerRange(slot)) throw new Error('slot not in this worker');
   if (!hasWorkerCapacity(ws)) {
     log('warn', 'worker_capacity_full', { ws, slot, active: getActiveCount(ws), max: MAX_ACTIVE });
     throw new Error('worker capacity full');
@@ -1367,9 +1316,6 @@ app.post('/api/accounts/create', (req, res) => {
     const file = getWorkspaceAccountsFile(ws);
     const enabled = req.body?.enabled !== false;
     const requestedSlot = normalizeSlot(req.body?.slot);
-    if (requestedSlot && !slotInWorkerRange(requestedSlot)) {
-      return res.status(409).json({ ok: false, error: 'slot not in this worker' });
-    }
     let result = null;
     let invalid = false;
 
@@ -2378,7 +2324,7 @@ const PORT = Number(process.env.PORT || 3001);
 server.listen(PORT, () => {
   log('info', 'server_listen', { url: `http://127.0.0.1:${PORT}` });
   if (IS_MASTER_MODE) {
-    log('info', 'warmup_skipped_master_mode', { port: PORT, slotFrom: SLOT_FROM || null, slotTo: SLOT_TO || null });
+    log('info', 'warmup_skipped_master_mode', { port: PORT, workspace: WORKSPACE_ID || null });
     return;
   }
   setTimeout(() => { runWarmup(); }, 0);

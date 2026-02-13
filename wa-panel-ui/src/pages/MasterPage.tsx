@@ -108,13 +108,10 @@ export default function MasterPage() {
         setModalOpen(false);
         await fetchProjects();
       } else {
-        const res = await http.post("/api/projects", values);
-        const id = String(res.data?.data?.id || "").trim();
+        await http.post("/api/projects", values);
         message.success("任务已创建");
         setModalOpen(false);
         await fetchProjects();
-        // ✅ 创建成功后打开新窗口/标签页，不覆盖当前页
-        if (id) await openProjectWindow(id);
       }
     } catch (e) {
       if (e && (e as { errorFields?: unknown }).errorFields) return;
@@ -134,10 +131,27 @@ export default function MasterPage() {
     }
   };
 
-  // ✅ 统一使用 openProjectWindow，移除旧 window.open 逻辑
-  const handleOpen = (row: ProjectRow) => {
-    openProjectWindow(row.id);
+  const handleStart = async (row: ProjectRow) => {
+    try {
+      await http.post(`/api/projects/${row.id}/start`);
+      message.success("任务已启动");
+      await fetchProjects();
+      await openProjectWindow(row.id);
+    } catch (e) {
+      message.error(String(e));
+    }
   };
+
+  const handleStop = async (row: ProjectRow) => {
+    try {
+      await http.post(`/api/projects/${row.id}/stop`);
+      message.success("任务已停止");
+      await fetchProjects();
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
 
   const handleLogout = () => {
     clearAuth();
@@ -181,8 +195,11 @@ export default function MasterPage() {
               width: 220,
               render: (_, row) => (
                 <Space>
-                  <Button size="small" type="primary" onClick={() => handleOpen(row)}>
-                    打开
+                  <Button size="small" type="primary" onClick={() => handleStart(row)}>
+                    启动
+                  </Button>
+                  <Button size="small" onClick={() => handleStop(row)}>
+                    停止
                   </Button>
                   <Button size="small" onClick={() => openEdit(row)}>
                     编辑

@@ -7,46 +7,25 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 
-// ----- 默认目录工具（AppData）-----
 function getDefaultRoot() {
   const appdata = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   return path.join(appdata, '@ws-manager', 'wa-gateway-data');
 }
 const DEFAULT_ROOT = getDefaultRoot();
 const DATA_ROOT = path.resolve(process.env.DATA_DIR || DEFAULT_ROOT);
-const DEFAULT_CONFIG_ROOT = path.join(DATA_ROOT, 'data');
-const DEFAULT_WORK_BASE = path.join(DATA_ROOT, 'work');
-
-// ----- 环境变量 -----
+const CONFIG_ROOT = path.resolve(process.env.CONFIGDIR || path.join(DATA_ROOT, 'data'));
+const WORK_ROOT = path.resolve(process.env.WORKDIR || path.join(DATA_ROOT, 'work'));
 const PORT_MASTER = Number(process.env.PORT_MASTER || 3000);
-// ✅ CONFIG_ROOT：优先 CONFIGDIR，其次 DATA_DIR/data，最后 AppData 默认
-const CONFIG_ROOT = path.resolve(
-  process.env.CONFIGDIR ||
-  (process.env.DATA_DIR ? path.join(process.env.DATA_DIR, 'data') : DEFAULT_CONFIG_ROOT)
-);
-const PREWARM = Math.max(0, Number(process.env.PREWARM || 2));
 const MASTER_TOKEN = String(process.env.MASTER_TOKEN || '').trim();
-const MAX_ACTIVE_ENV = process.env.MAX_ACTIVE;
-const MAX_ACTIVE = Math.max(1, Number(process.env.MAX_ACTIVE || 13));
-const POOL_SIZE = Math.max(1, Number(process.env.POOL_SIZE || 3));
+const WORKER_POOL_SIZE = Math.max(3, Number(process.env.WORKER_POOL_SIZE || 60));
+const WORKER_PORT_BASE = Math.max(1, Number(process.env.WORKER_PORT_BASE || 3101));
+const WORKERS_PER_PROJECT = 3;
+const MAX_ACTIVE = 13;
 const UNBIND_COOLDOWN_MS = Math.max(0, Number(process.env.UNBIND_COOLDOWN_MS || 120000));
-const MAX_INIT = process.env.MAX_INIT || process.env.WA_INIT_CONCURRENCY;
-const WARMUP_LIMIT = process.env.WARMUP_LIMIT;
-const LOG_LEVEL = process.env.LOG_LEVEL;
 
-// ----- 分片定义 -----
-function parseShards() {
-  if (process.env.SHARDS_JSON) return JSON.parse(process.env.SHARDS_JSON);
-  // 默认分片：使用 AppData 下的 work 目录
-  return [
-    { id: 1, port: 3001, from: 'A1',  to: 'A30',  workdir: path.join(DEFAULT_WORK_BASE, 'w1') },
-    { id: 2, port: 3002, from: 'A31', to: 'A60',  workdir: path.join(DEFAULT_WORK_BASE, 'w2') },
-  ];
-}
-const shards = parseShards();
-const workers = new Map();
 const RECENT_LOGS = [];
-const wsRuntime = new Map(); // ws -> { pool, lease, lastWorker, statusByWorker, releaseTimers }
+const workers = new Map(); // workerId -> {child,state,startingPromise,ws}
+const wsRuntime = new Map();
 
 function log(level, event, fields = {}) {
   const row = { ts: new Date().toISOString(), level, event, ...fields };
@@ -55,201 +34,114 @@ function log(level, event, fields = {}) {
   process.stdout.write(`${JSON.stringify(row)}\n`);
 }
 
+function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); return p; }
+function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return fallback; } }
+function writeJson(file, data) { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8'); }
+function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function withFileLockSync(lockFile, fn, timeoutMs = 15000, pollMs = 40) {
+  const start = Date.now();
+  while (true) {
+    let fd = null;
+    try {
+      ensureDir(path.dirname(lockFile));
+      fd = fs.openSync(lockFile, 'wx');
+      return fn();
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      if (Date.now() - start > timeoutMs) throw new Error(`lock timeout: ${lockFile}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pollMs);
+    } finally {
+      if (fd != null) {
+        try { fs.closeSync(fd); } catch {}
+        try { fs.unlinkSync(lockFile); } catch {}
+      }
+    }
+  }
+}
+
 function resolveWs(raw) {
   const s = String(raw || 'default').trim().replace(/[^A-Za-z0-9_-]/g, '_');
   return s || 'default';
 }
-function slotToNumber(v) {
-  if (v == null) return null;
-  if (typeof v === 'number' && Number.isFinite(v)) return v;
-
-  const s = String(v).trim().toUpperCase();
-  // 支持 A123
-  let m = /^A(\d+)$/.exec(s);
-  if (m) return Number(m[1]);
-  // 支持 123
-  m = /^(\d+)$/.exec(s);
-  if (m) return Number(m[1]);
-
-  return null;
-}
-function shardForSlot(slot) {
-  const n = slotToNumber(slot);
-  if (!Number.isFinite(n)) return null;
-
-  return (
-    shards.find((s) => {
-      const from = slotToNumber(s.from);
-      const to = slotToNumber(s.to);
-      if (Number.isFinite(from) && n < from) return false;
-      if (Number.isFinite(to) && n > to) return false;
-      return true;
-    }) || null
-  );
-}
+function getWsFromReq(req) { return resolveWs(req.headers['x-ws'] || req.query?.ws || req.body?.ws || 'default'); }
 function parseSlot(req) {
-  const fullPath = `${req.baseUrl || ''}${req.path || ''}`;
-  let m = /\/accounts\/(A\d+)(\/|$)/i.exec(fullPath);
-  if (m) return String(m[1]).toUpperCase();
-
-  const ou = String(req.originalUrl || req.url || '');
-  m = /\/accounts\/(A\d+)(\/|$)/i.exec(ou);
-  if (m) return String(m[1]).toUpperCase();
-
-  const body = req.body || {};
-
-  // ✅ 兼容 roles/batch：body.roles 是数组，里面的 role 可能有 boundSlot
-  if (Array.isArray(body.roles)) {
-    const r = body.roles.find(x => x && typeof x === 'object' && x.boundSlot);
-    if (r?.boundSlot) {
-      const s = String(r.boundSlot).trim().toUpperCase();
-      if (/^A\d+$/.test(s)) return s;
-    }
-  }
-
-  const cand = body.slot || body.boundSlot || body?.role?.boundSlot || '';
-  const s = String(cand).trim().toUpperCase();
-  return /^A\d+$/.test(s) ? s : null;
-}
-
-
-function readJson(file, fallback) {
-  try {
-    const txt = fs.readFileSync(file, 'utf-8');
-    return JSON.parse(txt);
-  } catch {
-    return fallback;
-  }
-}
-
-function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-function wsDir(ws) {
-  return path.join(CONFIG_ROOT, 'workspaces', ws);
-}
-function wsPoolFile(ws) {
-  return path.join(wsDir(ws), 'pool.json');
-}
-function wsLeaseFile(ws) {
-  return path.join(wsDir(ws), 'slot_owner.json');
-}
-function ensureWsRuntime(ws) {
-  if (!wsRuntime.has(ws)) {
-    wsRuntime.set(ws, {
-      pool: null,
-      lease: null,
-      lastWorker: new Map(),
-      statusByWorker: new Map(),
-      releaseTimers: new Map(),
-    });
-  }
-  return wsRuntime.get(ws);
-}
-function writeJson(file, val) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(val, null, 2), 'utf-8');
-}
-function loadPool(ws) {
-  const rt = ensureWsRuntime(ws);
-  if (Array.isArray(rt.pool) && rt.pool.length) return rt.pool;
-  const file = wsPoolFile(ws);
-  const fromFile = readJson(file, null);
-  if (Array.isArray(fromFile) && fromFile.length) {
-    rt.pool = fromFile.map(Number).filter((id) => shards.some((x) => x.id === id));
-  }
-  if (!rt.pool || !rt.pool.length) {
-    rt.pool = shards.map((s) => s.id).slice(0, Math.min(POOL_SIZE, shards.length));
-    writeJson(file, rt.pool);
-  }
-  return rt.pool;
-}
-function loadLease(ws) {
-  const rt = ensureWsRuntime(ws);
-  if (rt.lease && typeof rt.lease === 'object') return rt.lease;
-  const fromFile = readJson(wsLeaseFile(ws), {});
-  rt.lease = (fromFile && typeof fromFile === 'object') ? fromFile : {};
-  return rt.lease;
-}
-function saveLease(ws) {
-  const lease = loadLease(ws);
-  writeJson(wsLeaseFile(ws), lease);
-}
-function isActiveStatus(status) {
-  return ['INIT', 'QR', 'READY', 'AUTH_FAILURE'].includes(String(status || ''));
-}
-function workerActiveCount(ws, workerId) {
-  const rt = ensureWsRuntime(ws);
-  const map = rt.statusByWorker.get(Number(workerId)) || new Map();
-  let n = 0;
-  for (const st of map.values()) if (isActiveStatus(st)) n++;
-  return n;
-}
-
-function globalWorkerActiveCount(workerId) {
-  let n = 0;
-  for (const rt of wsRuntime.values()) {
-    const map = rt.statusByWorker.get(Number(workerId)) || new Map();
-    for (const st of map.values()) if (isActiveStatus(st)) n++;
-  }
-  return n;
-}
-
-function setLeaseWorker(ws, slot, workerId) {
-  const lease = loadLease(ws);
-  const prev = lease[slot];
-  if (Number(prev) === Number(workerId)) return;
-  lease[slot] = Number(workerId);
-  saveLease(ws);
-  log('info', 'lease_assign', { ws, slot, workerId: Number(workerId) });
-}
-function ensurePool(ws) {
-  const pool = loadPool(ws);
-  if (!pool.length) throw new Error('pool empty');
-  return pool;
-}
-function pickWorkerForHot(ws) {
-  const pool = ensurePool(ws);
-  for (const id of pool) {
-    if (workerActiveCount(ws, id) < MAX_ACTIVE) return id;
-  }
-  return null;
-}
-function pickWorkerForOnce(ws) {
-  return pickWorkerForHot(ws);
-}
-function assignLease(ws, slot) {
-  const lease = loadLease(ws);
-  if (lease[slot]) return Number(lease[slot]);
-  const wid = pickWorkerForHot(ws);
-  if (!wid) return null;
-  lease[slot] = wid;
-  saveLease(ws);
-  log('info', 'lease_assign', { ws, slot, workerId: wid });
-  return wid;
-}
-function releaseLease(ws, slot) {
-  const lease = loadLease(ws);
-  const workerId = lease[slot];
-  if (!workerId) return;
-  delete lease[slot];
-  saveLease(ws);
-  log('info', 'lease_release', { ws, slot, workerId });
+  const full = `${req.baseUrl || ''}${req.path || ''}${req.originalUrl || ''}`;
+  const m = /\/accounts\/(A\d+)(\/|$)/i.exec(full);
+  return m ? String(m[1]).toUpperCase() : null;
 }
 function parseAccountAction(req) {
   const m = /\/accounts\/A\d+\/([^/?#]+)/i.exec(String(req.originalUrl || req.url || ''));
   return m ? String(m[1]).toLowerCase() : '';
 }
-function getWsFromReq(req) {
-  return resolveWs(req.query?.ws || req.headers['x-ws'] || req.body?.ws || 'default');
+
+function wsDir(ws) { return path.join(CONFIG_ROOT, 'workspaces', ws); }
+function wsLeaseFile(ws) { return path.join(wsDir(ws), 'slot_owner.json'); }
+function poolFile() { return path.join(CONFIG_ROOT, 'workers_pool.json'); }
+function poolLockFile() { return `${poolFile()}.lock`; }
+
+function ensureWsRuntime(ws) {
+  if (!wsRuntime.has(ws)) wsRuntime.set(ws, { lease: null, statusByWorker: new Map(), releaseTimers: new Map() });
+  return wsRuntime.get(ws);
 }
-function lastWorkerFor(ws, slot) {
+function loadLease(ws) {
   const rt = ensureWsRuntime(ws);
-  return Number(rt.lastWorker.get(slot) || 0) || null;
+  if (rt.lease) return rt.lease;
+  rt.lease = readJson(wsLeaseFile(ws), {});
+  return rt.lease;
 }
-function shardById(id) {
-  return shards.find((s) => s.id === Number(id)) || null;
+function saveLease(ws) { writeJson(wsLeaseFile(ws), loadLease(ws)); }
+function setLeaseWorker(ws, slot, workerId) { const lease = loadLease(ws); lease[slot] = workerId; saveLease(ws); }
+function releaseLease(ws, slot) { const lease = loadLease(ws); delete lease[slot]; saveLease(ws); }
+
+function safeProjectId(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  return s.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+function projectDir(id) { return wsDir(id); }
+function projectMetaFile(id) { return path.join(projectDir(id), 'project.json'); }
+function loadProjectMeta(id) { return readJson(projectMetaFile(id), { id, name: id, status: 'STOPPED', workers: [] }); }
+function saveProjectMeta(id, meta) { writeJson(projectMetaFile(id), meta); }
+
+function buildDefaultPool() {
+  return {
+    workers: Array.from({ length: WORKER_POOL_SIZE }, (_, i) => ({ id: `w${i + 1}`, port: WORKER_PORT_BASE + i, assignedTo: null })),
+    updatedAt: Date.now(),
+  };
+}
+function loadWorkersPool() {
+  const file = poolFile();
+  if (!fs.existsSync(file)) {
+    const p = buildDefaultPool();
+    writeJson(file, p);
+    return p;
+  }
+  const p = readJson(file, null);
+  if (!p || !Array.isArray(p.workers)) {
+    const next = buildDefaultPool();
+    writeJson(file, next);
+    return next;
+  }
+  return p;
+}
+function saveWorkersPool(pool) { pool.updatedAt = Date.now(); writeJson(poolFile(), pool); }
+
+function findContiguousWorkers(pool, count) {
+  let run = [];
+  for (const w of pool.workers) {
+    if (!w.assignedTo) run.push(w);
+    else run = [];
+    if (run.length === count) return run;
+  }
+  return null;
 }
 
+function getProjectWorkers(project) {
+  const pool = loadWorkersPool();
+  const byId = new Map(pool.workers.map((w) => [w.id, w]));
+  return (project.workers || []).map((id) => byId.get(id)).filter(Boolean);
+}
 
 async function waitWorkerHealth(port, timeoutMs = 25000) {
   const deadline = Date.now() + timeoutMs;
@@ -265,109 +157,58 @@ async function waitWorkerHealth(port, timeoutMs = 25000) {
   throw new Error(`worker ${port} health timeout`);
 }
 
-async function ensureWorkerRunning(shard) {
-  const running = workers.get(shard.id);
-  if (running && running.state === 'running') return running;
-  if (running && running.startingPromise) {
-    await running.startingPromise;
-    return workers.get(shard.id);
+function safeKill(child) {
+  if (!child || child.exitCode !== null) return;
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+    return;
   }
+  child.kill('SIGTERM');
+  setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1000);
+}
 
-const fromN = slotToNumber(shard.from);
-const toN   = slotToNumber(shard.to);
+async function ensureWorkerRunning(worker, ws) {
+  const running = workers.get(worker.id);
+  if (running && running.state === 'running') return running;
+  if (running && running.startingPromise) return running.startingPromise;
 
-const env = {
-  ...process.env,
-  PORT: String(shard.port),
-  DATA_DIR: DATA_ROOT,
-  CONFIGDIR: CONFIG_ROOT,
-  // WORKDIR：优先 shard.workdir，否则使用 AppData 下的默认 work 目录
-  WORKDIR: path.resolve(shard.workdir || path.join(DEFAULT_WORK_BASE, `w${shard.id}`)),
-  SLOT_FROM: fromN == null ? '' : String(fromN),
-  SLOT_TO:   toN == null ? '' : String(toN),
-  MASTER_INTERNAL_URL: `http://127.0.0.1:${PORT_MASTER}`,
-  WORKER_ID: String(shard.id),
-};
+  const workdir = path.join(WORK_ROOT, worker.id);
+  ensureDir(workdir);
+  const env = {
+    ...process.env,
+    PORT: String(worker.port),
+    DATA_DIR: DATA_ROOT,
+    CONFIGDIR: CONFIG_ROOT,
+    WORKDIR: workdir,
+    MASTER_INTERNAL_URL: `http://127.0.0.1:${PORT_MASTER}`,
+    WORKER_ID: String(worker.id),
+    WORKSPACE_ID: ws,
+    MAX_ACTIVE: String(MAX_ACTIVE),
+  };
   if (MASTER_TOKEN) env.MASTER_TOKEN = MASTER_TOKEN;
-  if (MAX_ACTIVE_ENV) env.MAX_ACTIVE = String(MAX_ACTIVE);
-  else env.MAX_ACTIVE = String(MAX_ACTIVE);
-  if (MAX_INIT) env.MAX_INIT = String(MAX_INIT);
-  if (WARMUP_LIMIT) env.WARMUP_LIMIT = String(WARMUP_LIMIT);
-  if (LOG_LEVEL) env.LOG_LEVEL = String(LOG_LEVEL);
-
-  log('info', 'spawn_worker_env', {
-    id: shard.id,
-    port: shard.port,
-    CONFIGDIR: env.CONFIGDIR,
-    WORKDIR: env.WORKDIR,
-    DATA_ROOT,
-  });
 
   const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], { env, stdio: 'inherit' });
-  const entry = { child, state: 'starting' };
-  workers.set(shard.id, entry);
   child.on('exit', (code) => {
-    log('warn', 'worker_exit', { id: shard.id, code });
-    workers.set(shard.id, { state: 'stopped' });
+    log('warn', 'worker_exit', { workerId: worker.id, code });
+    workers.set(worker.id, { state: 'stopped', ws });
   });
 
-  const startingPromise = waitWorkerHealth(shard.port)
-    .then(() => {
-      workers.set(shard.id, { child, state: 'running' });
-      log('info', 'worker_ready', { id: shard.id, port: shard.port, from: shard.from, to: shard.to });
-    })
-    .catch((e) => {
-      workers.set(shard.id, { state: 'failed' });
-      log('error', 'worker_start_failed', { id: shard.id, err: String(e?.message || e) });
-      throw e;
-    });
-
-  workers.set(shard.id, { child, state: 'starting', startingPromise });
+  const startingPromise = waitWorkerHealth(worker.port).then(() => {
+    workers.set(worker.id, { child, state: 'running', ws });
+    log('info', 'worker_ready', { workerId: worker.id, port: worker.port, ws });
+  });
+  workers.set(worker.id, { child, state: 'starting', ws, startingPromise });
   await startingPromise;
-  return workers.get(shard.id);
+  return workers.get(worker.id);
 }
 
-function proxyToShard(req, res, shard) {
-  return new Promise((resolve) => {
-    const headers = { ...req.headers, host: `127.0.0.1:${shard.port}` };
-    const options = { hostname: '127.0.0.1', port: shard.port, path: req.originalUrl, method: req.method, headers };
-    const upstream = http.request(options, (upRes) => {
-      res.statusCode = upRes.statusCode || 502;
-      for (const [k, v] of Object.entries(upRes.headers || {})) {
-        if (v !== undefined) res.setHeader(k, v);
-      }
-      upRes.pipe(res);
-      upRes.on('end', resolve);
-    });
-    upstream.on('error', (e) => {
-      res.status(502).json({ ok: false, error: String(e?.message || e) });
-      resolve();
-    });
-
-    if (req.body && Object.keys(req.body).length > 0 && req.is('application/json')) {
-      upstream.write(JSON.stringify(req.body));
-      upstream.end();
-      return;
-    }
-    req.pipe(upstream);
-  });
-}
-
-
-async function requestJsonToShard(shard, method, urlPath, headers = {}, body = null) {
-  await ensureWorkerRunning(shard);
+async function requestJsonToWorker(worker, method, urlPath, headers = {}, body = null) {
+  await ensureWorkerRunning(worker, headers['x-ws'] || headers['X-WS'] || 'default');
   return new Promise((resolve, reject) => {
     const payload = body == null ? null : Buffer.from(JSON.stringify(body), 'utf-8');
     const req = http.request({
-      hostname: '127.0.0.1',
-      port: shard.port,
-      path: urlPath,
-      method,
-      headers: {
-        'content-type': 'application/json',
-        ...(payload ? { 'content-length': payload.length } : {}),
-        ...headers,
-      },
+      hostname: '127.0.0.1', port: worker.port, path: urlPath, method,
+      headers: { 'content-type': 'application/json', ...(payload ? { 'content-length': payload.length } : {}), ...headers },
     }, (res) => {
       let data = '';
       res.on('data', (c) => data += c);
@@ -383,10 +224,76 @@ async function requestJsonToShard(shard, method, urlPath, headers = {}, body = n
   });
 }
 
+function proxyToWorker(req, res, worker) {
+  return new Promise((resolve) => {
+    const headers = { ...req.headers, host: `127.0.0.1:${worker.port}` };
+    const options = { hostname: '127.0.0.1', port: worker.port, path: req.originalUrl, method: req.method, headers };
+    const upstream = http.request(options, (upRes) => {
+      res.statusCode = upRes.statusCode || 502;
+      for (const [k, v] of Object.entries(upRes.headers || {})) if (v !== undefined) res.setHeader(k, v);
+      upRes.pipe(res);
+      upRes.on('end', resolve);
+    });
+    upstream.on('error', (e) => { res.status(502).json({ ok: false, error: String(e?.message || e) }); resolve(); });
+    if (req.body && Object.keys(req.body).length > 0 && req.is('application/json')) {
+      upstream.write(JSON.stringify(req.body));
+      upstream.end();
+      return;
+    }
+    req.pipe(upstream);
+  });
+}
+
+function isActiveStatus(status) { return ['INIT', 'QR', 'READY', 'AUTH_FAILURE'].includes(String(status || '')); }
+function workerActiveCount(ws, workerId) {
+  const map = ensureWsRuntime(ws).statusByWorker.get(String(workerId)) || new Map();
+  let n = 0;
+  for (const st of map.values()) if (isActiveStatus(st)) n++;
+  return n;
+}
+
+async function reconcileWorkspace(ws) {
+  const project = loadProjectMeta(ws);
+  const wsWorkers = getProjectWorkers(project);
+  if (!wsWorkers.length) return;
+
+  const roles = readJson(path.join(wsDir(ws), 'roles.json'), []);
+  const accounts = readJson(path.join(wsDir(ws), 'accounts.json'), []);
+  const enabledSlots = new Set((accounts || []).filter((a) => a && a.enabled !== false).map((a) => String(a.slot || '').toUpperCase()));
+  const hotSlots = new Set((roles || []).map((r) => String(r?.boundSlot || '').toUpperCase()).filter((s) => /^A\d+$/.test(s) && enabledSlots.has(s)));
+
+  const rt = ensureWsRuntime(ws);
+  const lease = loadLease(ws);
+  for (const slot of hotSlots) {
+    const t = rt.releaseTimers.get(slot);
+    if (t) { clearTimeout(t); rt.releaseTimers.delete(slot); }
+    if (!lease[slot]) {
+      const pick = wsWorkers.find((w) => workerActiveCount(ws, w.id) < MAX_ACTIVE) || wsWorkers[0];
+      if (pick) {
+        lease[slot] = pick.id;
+        saveLease(ws);
+        await requestJsonToWorker(pick, 'POST', `/api/accounts/${slot}/connect?force=1`, { 'x-ws': ws, 'x-connect-mode': 'hot' }, {});
+      }
+    }
+  }
+
+  for (const [slot, wid] of Object.entries(lease)) {
+    if (hotSlots.has(slot) || rt.releaseTimers.has(slot)) continue;
+    const timer = setTimeout(async () => {
+      rt.releaseTimers.delete(slot);
+      const target = wsWorkers.find((w) => w.id === wid);
+      if (target) {
+        try { await requestJsonToWorker(target, 'POST', `/api/accounts/${slot}/stop`, { 'x-ws': ws }, {}); } catch {}
+      }
+      releaseLease(ws, slot);
+    }, UNBIND_COOLDOWN_MS);
+    rt.releaseTimers.set(slot, timer);
+  }
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
@@ -396,385 +303,198 @@ io.on('connection', (socket) => {
 });
 
 app.post('/internal/emit', (req, res) => {
-  if (MASTER_TOKEN && req.headers['x-master-token'] !== MASTER_TOKEN) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
+  if (MASTER_TOKEN && req.headers['x-master-token'] !== MASTER_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
   const ws = resolveWs(req.body?.ws);
   const event = String(req.body?.event || '').trim();
   const payload = req.body?.payload ?? {};
-  const workerId = Number(req.headers['x-worker-id'] || 0) || null;
+  const workerId = String(req.headers['x-worker-id'] || '') || null;
   if (!event) return res.status(400).json({ ok: false, error: 'event required' });
 
   if (workerId && event === 'wa:status') {
     const slot = String(payload?.slot || '').trim().toUpperCase();
     if (slot) {
       const rt = ensureWsRuntime(ws);
-      rt.lastWorker.set(slot, workerId);
       if (!rt.statusByWorker.has(workerId)) rt.statusByWorker.set(workerId, new Map());
       rt.statusByWorker.get(workerId).set(slot, String(payload?.status || ''));
     }
   }
 
   io.to(ws).emit(event, payload);
-  log('info', 'worker_event_forwarded', { ws, event, workerId: workerId || undefined });
   return res.json({ ok: true });
 });
 
 app.get('/api/system/recentLogs', (_req, res) => res.json({ ok: true, logs: RECENT_LOGS }));
-
 app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    master: { port: PORT_MASTER },
-    workers: shards.map((s) => ({ id: s.id, port: s.port, from: s.from, to: s.to, running: workers.get(s.id)?.state === 'running' })),
-  });
+  const pool = loadWorkersPool();
+  res.json({ ok: true, master: { port: PORT_MASTER }, workers: pool.workers.map((w) => ({ ...w, running: workers.get(w.id)?.state === 'running' })) });
 });
 
 app.get('/api/accounts', (req, res) => {
-  const ws = resolveWs(req.query?.ws || req.headers['x-ws'] || 'default');
-  const file = path.join(CONFIG_ROOT, 'workspaces', ws, 'accounts.json');
-  const data = fs.existsSync(file) ? readJson(file, []) : [];
-  return res.json({ ok: true, data });
+  const ws = getWsFromReq(req);
+  const rows = readJson(path.join(wsDir(ws), 'accounts.json'), []);
+  return res.json({ ok: true, data: rows });
 });
-
 app.get('/api/roles', (req, res) => {
-  const ws = resolveWs(req.query?.ws || req.headers['x-ws'] || 'default');
-  const file = path.join(CONFIG_ROOT, 'workspaces', ws, 'roles.json');
-  const roles = fs.existsSync(file) ? readJson(file, []) : [];
+  const ws = getWsFromReq(req);
+  return res.json({ ok: true, roles: readJson(path.join(wsDir(ws), 'roles.json'), []) });
+});
+app.post('/api/roles/batch', async (req, res) => {
+  const ws = getWsFromReq(req);
+  const roles = Array.isArray(req.body?.roles) ? req.body.roles : [];
+  writeJson(path.join(wsDir(ws), 'roles.json'), roles);
+  await reconcileWorkspace(ws);
   return res.json({ ok: true, roles });
 });
-
 app.get('/api/groups', (req, res) => {
-  const ws = resolveWs(req.query?.ws || req.headers['x-ws'] || 'default');
-  const file = path.join(CONFIG_ROOT, 'workspaces', ws, 'groups.json');
-  const rows = fs.existsSync(file) ? readJson(file, []) : [];
-  return res.json({ ok: true, rows });
+  const ws = getWsFromReq(req);
+  return res.json({ ok: true, rows: readJson(path.join(wsDir(ws), 'groups.json'), []) });
 });
 
-
-async function reconcileWorkspace(ws) {
-  const rws = resolveWs(ws);
-  log('info', 'reconcile_start', { ws: rws });
-  const dir = wsDir(rws);
-  const roles = readJson(path.join(dir, 'roles.json'), []);
-  const accounts = readJson(path.join(dir, 'accounts.json'), []);
-  const enabledSlots = new Set((accounts || []).filter((a) => a && a.enabled !== false).map((a) => String(a.slot || '').toUpperCase()));
-  const hotSlots = new Set((roles || []).map((r) => String(r?.boundSlot || '').toUpperCase()).filter((slot) => /^A\d+$/.test(slot) && enabledSlots.has(slot)));
-
-  const rt = ensureWsRuntime(rws);
-  const lease = loadLease(rws);
-
-  for (const slot of hotSlots) {
-    const t = rt.releaseTimers.get(slot);
-    if (t) {
-      clearTimeout(t);
-      rt.releaseTimers.delete(slot);
-    }
-    if (!lease[slot]) {
-      const wid = assignLease(rws, slot);
-      if (wid) {
-        const shard = shardById(wid);
-        if (shard) {
-          try {
-            await requestJsonToShard(shard, 'POST', `/api/accounts/${slot}/connect?force=1`, { 'x-ws': rws, 'x-connect-mode': 'hot' }, {});
-          } catch (e) {
-            log('warn', 'reconcile_connect_fail', { ws: rws, slot, err: String(e?.message || e) });
-          }
-        }
-      }
-    }
-  }
-
-  for (const [slot, wid] of Object.entries(lease)) {
-    if (hotSlots.has(slot)) continue;
-    if (rt.releaseTimers.has(slot)) continue;
-    const timer = setTimeout(async () => {
-      rt.releaseTimers.delete(slot);
-      const shard = shardById(wid);
-      if (shard) {
-        try {
-          await requestJsonToShard(shard, 'POST', `/api/accounts/${slot}/stop`, { 'x-ws': rws }, {});
-        } catch (e) {
-          log('warn', 'reconcile_stop_fail', { ws: rws, slot, err: String(e?.message || e) });
-        }
-      }
-      releaseLease(rws, slot);
-    }, UNBIND_COOLDOWN_MS);
-    rt.releaseTimers.set(slot, timer);
-  }
-
-  log('info', 'reconcile_done', { ws: rws, hotCount: hotSlots.size });
-}
-
-app.post('/api/roles/batch', async (req, res) => {
-  try {
-    const ws = getWsFromReq(req);
-    const shard = shards[0];
-    if (!shard) return res.status(404).json({ ok: false, error: 'no shard available' });
-    const r = await requestJsonToShard(shard, 'POST', req.originalUrl, req.headers || {}, req.body || {});
-    if (r.status >= 200 && r.status < 300 && r.json?.ok) {
-      await reconcileWorkspace(ws);
-    }
-    return res.status(r.status || 502).json(r.json || { ok: false, error: r.text || 'upstream failed' });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ===================== Projects (workspaces) CRUD on master =====================
-function safeProjectId(raw) {
-  // 前端 ws 可能是 "6688" / "p_100001" 这种；允许字母数字_-，其它替换成 _
-  const s = String(raw || '').trim();
-  if (!s) return null;
-  return s.replace(/[^A-Za-z0-9_-]/g, '_');
-}
-
-function projectDir(id) {
-  return path.join(CONFIG_ROOT, 'workspaces', id);
-}
-
-function projectMetaFile(id) {
-  return path.join(projectDir(id), 'project.json');
-}
-
-function loadProjectMeta(id) {
-  const file = projectMetaFile(id);
-  if (fs.existsSync(file)) {
-    const obj = readJson(file, null);
-    if (obj && typeof obj === 'object') return obj;
-  }
-  // 兼容旧结构：没有 project.json 也算一个项目
-  return { id, name: id, createdAt: null, updatedAt: null };
-}
-
-function saveProjectMeta(id, meta) {
-  const dir = projectDir(id);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const file = projectMetaFile(id);
-  fs.writeFileSync(file, JSON.stringify(meta, null, 2), 'utf-8');
-}
-
-// GET /api/projects  (注意：前端会带 ?ws=xxx，这里忽略)
 app.get('/api/projects', (_req, res) => {
-  try {
-    const dir = path.join(CONFIG_ROOT, 'workspaces');
-    if (!fs.existsSync(dir)) {
-      return res.json({ ok: true, data: [], rows: [], projects: [] });
-    }
-    const ids = fs.readdirSync(dir, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => d.name)
-      .sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true }));
-
-    const rows = ids.map(id => {
-      const meta = loadProjectMeta(id);
-      return { id, name: meta?.name || id, createdAt: meta?.createdAt || null, updatedAt: meta?.updatedAt || null };
-    });
-
-    // 多字段兼容（前端用 data/rows/projects 任意一个都能接上）
-    return res.json({ ok: true, data: rows, rows, projects: rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+  const dir = path.join(CONFIG_ROOT, 'workspaces');
+  if (!fs.existsSync(dir)) return res.json({ ok: true, data: [] });
+  const rows = fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => loadProjectMeta(d.name));
+  return res.json({ ok: true, data: rows, rows, projects: rows });
 });
-
-// GET /api/projects/:id
 app.get('/api/projects/:id', (req, res) => {
-  try {
-    const id = safeProjectId(req.params.id);
-    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-
-    const dir = projectDir(id);
-    if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'project not found' });
-
-    const meta = loadProjectMeta(id);
-    return res.json({ ok: true, data: { id, ...(meta || {}) } });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+  const id = safeProjectId(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+  const dir = projectDir(id);
+  if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'project not found' });
+  return res.json({ ok: true, data: loadProjectMeta(id) });
 });
-
-// POST /api/projects  body: {id,name}（允许只传 name，则用 name 生成 id）
 app.post('/api/projects', (req, res) => {
   try {
     const body = req.body || {};
     const id = safeProjectId(body.id || body.ws || body.projectId || body.name);
     const name = String(body.name || body.title || id || '').trim();
-
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+    if (fs.existsSync(projectDir(id))) return res.status(409).json({ ok: false, error: 'project already exists' });
 
-    const dir = projectDir(id);
-    if (fs.existsSync(dir)) return res.status(409).json({ ok: false, error: 'project already exists' });
+    let assigned = null;
+    withFileLockSync(poolLockFile(), () => {
+      const pool = loadWorkersPool();
+      const block = findContiguousWorkers(pool, WORKERS_PER_PROJECT);
+      if (!block) throw new Error('no contiguous workers available');
+      for (const w of block) w.assignedTo = id;
+      saveWorkersPool(pool);
+      assigned = block.map((w) => w.id);
+    });
 
-    fs.mkdirSync(dir, { recursive: true });
     const now = Date.now();
-    saveProjectMeta(id, { id, name: name || id, createdAt: now, updatedAt: now });
-
-    return res.json({ ok: true, data: { id, name: name || id } });
+    saveProjectMeta(id, { id, name: name || id, createdAt: now, updatedAt: now, status: 'STOPPED', workers: assigned });
+    return res.json({ ok: true, data: { id, name: name || id, workers: assigned, status: 'STOPPED' } });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-
-// PUT /api/projects/:id  body: {name}
 app.put('/api/projects/:id', (req, res) => {
+  const id = safeProjectId(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+  if (!fs.existsSync(projectDir(id))) return res.status(404).json({ ok: false, error: 'project not found' });
+  const meta = loadProjectMeta(id);
+  const now = Date.now();
+  const next = { ...meta, name: String(req.body?.name || meta.name || id), updatedAt: now };
+  saveProjectMeta(id, next);
+  return res.json({ ok: true, data: next });
+});
+app.post('/api/projects/:id/start', async (req, res) => {
   try {
     const id = safeProjectId(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-
-    const dir = projectDir(id);
-    if (!fs.existsSync(dir)) return res.status(404).json({ ok: false, error: 'project not found' });
-
-    const body = req.body || {};
     const meta = loadProjectMeta(id);
-    const now = Date.now();
-
-    const name = String(body.name || body.title || meta?.name || id).trim();
-    const next = { ...(meta || {}), id, name, updatedAt: now, createdAt: meta?.createdAt || now };
-
-    saveProjectMeta(id, next);
-    return res.json({ ok: true, data: next });
+    const wsWorkers = getProjectWorkers(meta);
+    if (wsWorkers.length !== WORKERS_PER_PROJECT) return res.status(400).json({ ok: false, error: 'project worker assignment invalid' });
+    for (const w of wsWorkers) await ensureWorkerRunning(w, id);
+    meta.status = 'RUNNING';
+    meta.updatedAt = Date.now();
+    saveProjectMeta(id, meta);
+    await reconcileWorkspace(id);
+    return res.json({ ok: true, data: meta });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-
-// DELETE /api/projects/:id
+app.post('/api/projects/:id/stop', (req, res) => {
+  try {
+    const id = safeProjectId(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+    const meta = loadProjectMeta(id);
+    for (const wid of (meta.workers || [])) {
+      const running = workers.get(wid);
+      if (running?.child) safeKill(running.child);
+      workers.set(wid, { state: 'stopped', ws: id });
+    }
+    meta.status = 'STOPPED';
+    meta.updatedAt = Date.now();
+    saveProjectMeta(id, meta);
+    return res.json({ ok: true, data: meta });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 app.delete('/api/projects/:id', (req, res) => {
   try {
     const id = safeProjectId(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
-
-    const dir = projectDir(id);
-    if (!fs.existsSync(dir)) return res.json({ ok: true });
-
-    // ⚠️ 删除整个 workspace（包含 accounts/roles/groups 等）
-    fs.rmSync(dir, { recursive: true, force: true });
+    const meta = loadProjectMeta(id);
+    for (const wid of (meta.workers || [])) {
+      const running = workers.get(wid);
+      if (running?.child) safeKill(running.child);
+    }
+    withFileLockSync(poolLockFile(), () => {
+      const pool = loadWorkersPool();
+      for (const w of pool.workers) if (w.assignedTo === id) w.assignedTo = null;
+      saveWorkersPool(pool);
+    });
+    fs.rmSync(projectDir(id), { recursive: true, force: true });
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-// ===================== end projects =====================
-
-
-
-
-async function reconcileWarmup() {
-  try {
-    const base = path.join(CONFIG_ROOT, 'workspaces');
-    if (!fs.existsSync(base)) {
-      log('info', 'master_warmup_start', { workspaces: 0, totalSlots: 0 });
-      log('info', 'master_warmup_done', { ok: 0, fail: 0 });
-      return;
-    }
-
-    const wsList = fs.readdirSync(base, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
-
-    const tasks = [];
-    for (const wsName of wsList) {
-      const ws = resolveWs(wsName);
-      const roles = readJson(path.join(base, wsName, 'roles.json'), []);
-      const accounts = readJson(path.join(base, wsName, 'accounts.json'), []);
-      const enabled = new Set((accounts || []).filter((a) => a && a.enabled !== false).map((a) => String(a.slot || '').trim().toUpperCase()));
-      const hotSlots = Array.from(new Set((roles || []).map((r) => String(r?.boundSlot || '').trim().toUpperCase())))
-        .filter((slot) => /^A\d+$/.test(slot) && enabled.has(slot));
-
-      for (const slot of hotSlots) {
-        const shard = shardForSlot(slot);
-        if (!shard) continue;
-        tasks.push({ ws, slot, workerId: shard.id, shard });
-      }
-    }
-
-    log('info', 'master_warmup_start', { workspaces: wsList.length, totalSlots: tasks.length });
-
-    const planned = new Map();
-    for (const shard of shards) planned.set(shard.id, globalWorkerActiveCount(shard.id));
-
-    let ok = 0;
-    let fail = 0;
-    for (const t of tasks) {
-      const current = Number(planned.get(t.workerId) || 0);
-      if (current >= MAX_ACTIVE) {
-        log('warn', 'warmup_capacity_full', { workerId: t.workerId, ws: t.ws, slot: t.slot });
-        fail += 1;
-        continue;
-      }
-
-      try {
-        setLeaseWorker(t.ws, t.slot, t.workerId);
-        const r = await requestJsonToShard(t.shard, 'POST', `/api/accounts/${t.slot}/connect?force=1`, { 'x-ws': t.ws, 'x-connect-mode': 'hot' }, {});
-        if (r.status >= 200 && r.status < 300 && r.json?.ok) {
-          ok += 1;
-          planned.set(t.workerId, current + 1);
-        } else {
-          fail += 1;
-        }
-      } catch {
-        fail += 1;
-      }
-    }
-
-    log('info', 'master_warmup_done', { ok, fail });
-  } catch (e) {
-    log('warn', 'master_warmup_failed', { err: String(e?.message || e) });
-  }
-}
 
 app.use('/api', async (req, res) => {
   try {
     const ws = getWsFromReq(req);
     const slot = parseSlot(req);
-    let shard = null;
+    const meta = loadProjectMeta(ws);
+    const wsWorkers = getProjectWorkers(meta);
+    if (!wsWorkers.length) return res.status(409).json({ ok: false, error: 'project has no workers' });
 
-    if (slot) {
-      const lease = loadLease(ws);
-      const action = parseAccountAction(req);
-      const connectMode = String(req.headers['x-connect-mode'] || '').trim().toLowerCase();
-      const isConnect = req.method === 'POST' && action === 'connect';
-
-      if (isConnect && connectMode === 'hot') {
-        const ownerShard = shardForSlot(slot);
-        const preferredWorkerId = ownerShard?.id || null;
-        const leasedWorkerId = Number(lease[slot] || 0) || null;
-        const wid = leasedWorkerId || preferredWorkerId || assignLease(ws, slot);
-        if (wid) {
-          if (!leasedWorkerId) setLeaseWorker(ws, slot, wid);
-          shard = shardById(wid);
-        }
-      } else if (isConnect && connectMode === 'once') {
-        const wid = pickWorkerForOnce(ws);
-        shard = shardById(wid);
-      } else {
-        const wid = Number(lease[slot] || 0) || lastWorkerFor(ws, slot) || shards[0]?.id;
-        shard = shardById(wid);
+    if (!slot) {
+      if (req.path.startsWith('/groups') || req.path.startsWith('/roles') || req.path.startsWith('/projects') || req.path.startsWith('/accounts')) {
+        return res.status(404).json({ ok: false, error: 'route not handled by master' });
       }
-
-      if (!shard) {
-        shard = shardForSlot(slot) || shards[0];
-      }
-    } else {
-      shard = shards[0];
-      log('warn', 'no_slot_default_route', { method: req.method, url: req.originalUrl, to: shard?.id || shard?.port });
+      await ensureWorkerRunning(wsWorkers[0], ws);
+      return proxyToWorker(req, res, wsWorkers[0]);
     }
 
-    if (!shard) return res.status(404).json({ ok: false, error: 'no shard available' });
+    const action = parseAccountAction(req);
+    const lease = loadLease(ws);
+    let target = null;
 
-    await ensureWorkerRunning(shard);
-    await proxyToShard(req, res, shard);
+    if (req.method === 'POST' && action === 'connect') {
+      target = wsWorkers.find((w) => workerActiveCount(ws, w.id) < MAX_ACTIVE) || null;
+      if (!target) return res.status(409).json({ ok: false, error: 'all workers reached max active' });
+      lease[slot] = target.id;
+      saveLease(ws);
+    } else {
+      const owner = lease[slot];
+      target = wsWorkers.find((w) => w.id === owner) || wsWorkers[0];
+    }
+
+    if (!target) return res.status(409).json({ ok: false, error: 'no target worker' });
+    await ensureWorkerRunning(target, ws);
+    return proxyToWorker(req, res, target);
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-
-server.listen(PORT_MASTER, async () => {
-  log('info', 'master_listen', { port: PORT_MASTER });
-  for (const shard of shards.slice(0, PREWARM)) {
-    try { await ensureWorkerRunning(shard); } catch {}
-  }
-  await reconcileWarmup();
+server.listen(PORT_MASTER, () => {
+  ensureDir(path.join(CONFIG_ROOT, 'workspaces'));
+  ensureDir(WORK_ROOT);
+  loadWorkersPool();
+  log('info', 'master_listen', { port: PORT_MASTER, workerPoolSize: WORKER_POOL_SIZE });
 });
