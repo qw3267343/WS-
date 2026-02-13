@@ -64,7 +64,7 @@ export default function AccountsPage() {
   const [bindFilter, setBindFilter] = useState<"all" | "bound" | "unbound">("all");
   const [remarkQuery, setRemarkQuery] = useState("");
   const [batchOpen, setBatchOpen] = useState(false);
-  const [batchAction, setBatchAction] = useState<"connect" | "logout" | null>(null);
+  const [batchAction, setBatchAction] = useState<"connect_bound_hot" | "connect_all_verify" | "logout" | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
@@ -403,13 +403,21 @@ export default function AccountsPage() {
             <Button type="primary" onClick={createAccountOnly}>新增账号</Button>
 
             <Button
-              disabled={!selectedSlots.length}
               onClick={() => {
-                setBatchAction("connect");
+                setBatchAction("connect_bound_hot");
                 setBatchOpen(true);
               }}
             >
-              一键登录({selectedSlots.length})
+              启动已绑定
+            </Button>
+            <Button
+              disabled={!selectedSlots.length}
+              onClick={() => {
+                setBatchAction("connect_all_verify");
+                setBatchOpen(true);
+              }}
+            >
+              全量启动({selectedSlots.length})
             </Button>
             <Button
               disabled={!selectedSlots.length}
@@ -513,6 +521,7 @@ export default function AccountsPage() {
         action={batchAction}
         slots={selectedSlots}
         rows={rows}
+        roles={roles}
         onCancel={() => setBatchOpen(false)}
         onDone={async () => {
           setBatchOpen(false);
@@ -542,9 +551,10 @@ async function runPool<T>(
 
 function BatchProgressModal(props: {
   open: boolean;
-  action: "connect" | "logout" | null;
+  action: "connect_bound_hot" | "connect_all_verify" | "logout" | null;
   slots: string[];
   rows: AccRow[];
+  roles: Role[];
   onCancel: () => void;
   onDone: () => void;
 }) {
@@ -571,60 +581,59 @@ function BatchProgressModal(props: {
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  async function waitSlotReady(slot: string, timeoutMs: number) {
+  async function waitReadyOrHandleAuth(slot: string, timeoutMs: number) {
     const start = Date.now();
+    let lastOpenAt = 0;
+
     while (true) {
       const { data } = await http.get(`/api/accounts/${slot}/status`);
-      const st = data?.status;
-
+      const st = String(data?.status || "");
       if (st === "READY") return;
-      if (st === "AUTH_FAILURE") throw new Error("AUTH_FAILURE");
-      if (st === "DISCONNECTED") throw new Error("DISCONNECTED");
+
+      if (st === "QR" || st === "AUTH_FAILURE") {
+        if (Date.now() - lastOpenAt > 5000) {
+          await http.post(`/api/accounts/${slot}/open`).catch(() => undefined);
+          lastOpenAt = Date.now();
+        }
+      }
 
       if (Date.now() - start > timeoutMs) throw new Error("TIMEOUT");
       await sleep(800);
     }
   }
 
-  async function waitCpuBelow(
-    threshold = 30,
-    stableChecks = 3,
-    intervalMs = 2000,
-    maxWaitMs = 120000,
-  ) {
-    const start = Date.now();
-    let okStreak = 0;
-
-    while (true) {
-      const { data } = await http.get(`/api/system/cpu`);
-      const cpu = Number(data?.cpu ?? 100);
-
-      if (cpu < threshold) okStreak++;
-      else okStreak = 0;
-
-      if (okStreak >= stableChecks) return;
-      if (Date.now() - start > maxWaitMs) return;
-      await sleep(intervalMs);
+  async function connectAndMaybeStop(slot: string, mode: "hot" | "once", stopAfterReady: boolean) {
+    await http.post(`/api/accounts/${slot}/connect?force=1`, {}, { headers: { "x-connect-mode": mode } });
+    await waitReadyOrHandleAuth(slot, 10 * 60 * 1000);
+    if (stopAfterReady) {
+      await http.post(`/api/accounts/${slot}/stop`);
     }
   }
 
   async function onRun() {
-    if (!props.slots.length || !props.action) {
-      message.warning("请先勾选账号");
+    const boundSlots = new Set(
+      props.roles
+        .map((r) => String(r?.boundSlot || "").trim().toUpperCase())
+        .filter((slot) => /^A\d+$/.test(slot))
+    );
+
+    const targets = props.action === "connect_bound_hot"
+      ? props.rows.map((r) => r.slot).filter((slot) => boundSlots.has(slot))
+      : props.slots;
+
+    if (!targets.length || !props.action) {
+      message.warning("没有可执行账号");
       return;
     }
-    const cooldownMs = 8000;
-    const waitTimeoutMs = 10 * 60 * 1000;
-    const cpuThreshold = 30;
 
     setRunning(true);
-    setTotal(props.slots.length);
+    setTotal(targets.length);
     setDone(0);
     setOkCount(0);
     setFailCount(0);
     setResults([]);
 
-    await runPool(props.slots, concurrency, async (slot) => {
+    await runPool(targets, concurrency, async (slot) => {
       try {
         const row = props.rows.find(r => r.slot === slot);
         if (row?.enabled === false) {
@@ -633,21 +642,16 @@ function BatchProgressModal(props: {
           return;
         }
 
-        if (props.action === "connect") {
-          await waitCpuBelow(cpuThreshold);
-
-          await sleep(300 + Math.random() * 700);
-
-          await http.post(`/api/accounts/${slot}/connect?force=1`);
-
-          await waitSlotReady(slot, waitTimeoutMs);
-
-          await sleep(cooldownMs);
-          await waitCpuBelow(cpuThreshold);
+        if (props.action === "connect_bound_hot") {
+          await connectAndMaybeStop(slot, "hot", false);
+        } else if (props.action === "connect_all_verify") {
+          const isBound = boundSlots.has(slot);
+          await connectAndMaybeStop(slot, "once", !isBound);
         } else {
           await http.post(`/api/accounts/${slot}/logout`);
-          await sleep(300);
+          await sleep(200);
         }
+
         setResults(prev => [...prev, { ok: true, slot }]);
         setOkCount(x => x + 1);
       } catch (e: any) {
@@ -661,16 +665,26 @@ function BatchProgressModal(props: {
       }
     });
 
-    message.success(`批量${props.action === "connect" ? "登录" : "登出"}完成`);
+    const actionText = props.action === "connect_bound_hot"
+      ? "启动已绑定"
+      : props.action === "connect_all_verify"
+        ? "全量启动"
+        : "登出";
+    message.success(`批量${actionText}完成`);
     setRunning(false);
     await props.onDone();
   }
 
   const percent = total ? Math.round((done / total) * 100) : 0;
+  const title = props.action === "connect_bound_hot"
+    ? "启动已绑定"
+    : props.action === "connect_all_verify"
+      ? "全量启动"
+      : "一键登出";
 
   return (
     <Modal
-      title={props.action === "connect" ? "一键登录" : "一键登出"}
+      title={title}
       open={props.open}
       onCancel={props.onCancel}
       footer={
