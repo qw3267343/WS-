@@ -13,8 +13,9 @@ function getDefaultRoot() {
   return path.join(appdata, '@ws-manager', 'wa-gateway-data');
 }
 const DEFAULT_ROOT = getDefaultRoot();
-const DEFAULT_CONFIG_ROOT = path.join(DEFAULT_ROOT, 'data');
-const DEFAULT_WORK_BASE = path.join(DEFAULT_ROOT, 'work');
+const DATA_ROOT = path.resolve(process.env.DATA_DIR || DEFAULT_ROOT);
+const DEFAULT_CONFIG_ROOT = path.join(DATA_ROOT, 'data');
+const DEFAULT_WORK_BASE = path.join(DATA_ROOT, 'work');
 
 // ----- 环境变量 -----
 const PORT_MASTER = Number(process.env.PORT_MASTER || 3000);
@@ -147,6 +148,7 @@ const toN   = slotToNumber(shard.to);
 const env = {
   ...process.env,
   PORT: String(shard.port),
+  DATA_DIR: DATA_ROOT,
   CONFIGDIR: CONFIG_ROOT,
   // WORKDIR：优先 shard.workdir，否则使用 AppData 下的默认 work 目录
   WORKDIR: path.resolve(shard.workdir || path.join(DEFAULT_WORK_BASE, `w${shard.id}`)),
@@ -159,6 +161,14 @@ const env = {
   if (MAX_INIT) env.MAX_INIT = String(MAX_INIT);
   if (WARMUP_LIMIT) env.WARMUP_LIMIT = String(WARMUP_LIMIT);
   if (LOG_LEVEL) env.LOG_LEVEL = String(LOG_LEVEL);
+
+  log('info', 'spawn_worker_env', {
+    id: shard.id,
+    port: shard.port,
+    CONFIGDIR: env.CONFIGDIR,
+    WORKDIR: env.WORKDIR,
+    DATA_ROOT,
+  });
 
   const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], { env, stdio: 'inherit' });
   const entry = { child, state: 'starting' };
