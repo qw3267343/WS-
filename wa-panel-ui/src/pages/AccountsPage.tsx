@@ -71,6 +71,24 @@ export default function AccountsPage() {
   const [pageSize, setPageSize] = useState(20);
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
 
+  function mergeAccountRows(prev: AccRow[], incoming: AccRow[]): AccRow[] {
+    const oldByUid = new Map<string, AccRow>();
+    for (const old of prev) {
+      const uid = String(old.uid ?? "").trim();
+      if (uid) oldByUid.set(uid, old);
+    }
+
+    return incoming.map((row) => {
+      const uid = String(row.uid ?? "").trim();
+      const old = uid ? oldByUid.get(uid) : undefined;
+      return {
+        ...(old ?? {}),
+        ...row,
+        runtimeState: row.runtimeState ?? old?.runtimeState ?? "-",
+      };
+    });
+  }
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(remarksStorageKey);
@@ -92,7 +110,7 @@ export default function AccountsPage() {
     if (!list.length) {
       setRows([{ slot: "A1", status: "NEW", lastQr: null, uid: null, phone: null, nickname: null, enabled: true }]);
     } else {
-      setRows(list);
+      setRows((prev) => mergeAccountRows(prev, list));
     }
 
     const roleList = Array.isArray(rolesResp.data?.roles) ? (rolesResp.data.roles as Role[]) : [];
@@ -113,7 +131,7 @@ export default function AccountsPage() {
           const next = [...prev];
           next[idx] = {
             ...next[idx],
-            status: p.status ?? next[idx].status,
+            runtimeState: p.status ?? next[idx].runtimeState ?? "-",
             lastQr: p.lastQr ?? next[idx].lastQr,
             uid: p.uid ?? next[idx].uid ?? null,
             phone: p.phone ?? next[idx].phone ?? null,
@@ -121,7 +139,7 @@ export default function AccountsPage() {
           };
           return next;
         }
-        return [{ slot, status: p.status || "NEW", lastQr: null, uid: p.uid ?? null, phone: p.phone ?? null, nickname: p.nickname ?? null, enabled: true }, ...prev];
+        return [{ slot, status: "NEW", runtimeState: p.status || "NEW", lastQr: null, uid: p.uid ?? null, phone: p.phone ?? null, nickname: p.nickname ?? null, enabled: true }, ...prev];
       });
     };
 
