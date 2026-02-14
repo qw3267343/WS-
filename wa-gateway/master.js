@@ -113,6 +113,23 @@ function normalizeSlot(slot) {
 }
 function accountsFile(ws) { return path.join(wsDir(ws), 'accounts.json'); }
 function accountsLockFile(ws) { return `${accountsFile(ws)}.lock`; }
+function groupsFile(ws) { return path.join(wsDir(ws), 'groups.json'); }
+function rolesFile(ws) { return path.join(wsDir(ws), 'roles.json'); }
+
+function listEnabledSlots(ws) {
+  const accounts = readJson(accountsFile(ws), []);
+  return new Set((accounts || [])
+    .filter((a) => a && a.enabled !== false)
+    .map((a) => String(a.slot || '').toUpperCase())
+    .filter((slot) => /^A\d+$/.test(slot)));
+}
+
+function computeHotSlots(ws, enabledSlots = listEnabledSlots(ws)) {
+  const roles = readJson(rolesFile(ws), []);
+  return new Set((roles || [])
+    .map((r) => String(r?.boundSlot || '').toUpperCase())
+    .filter((slot) => /^A\d+$/.test(slot) && enabledSlots.has(slot)));
+}
 function readLastUid() {
   try {
     const n = Number(String(fs.readFileSync(UID_COUNTER_FILE, 'utf-8') || '').trim());
@@ -432,6 +449,30 @@ async function requestJsonToWorker(worker, method, urlPath, headers = {}, body =
   });
 }
 
+async function requestJsonToMaster(method, urlPath, headers = {}, body = null) {
+  return new Promise((resolve, reject) => {
+    const payload = body == null ? null : Buffer.from(JSON.stringify(body), 'utf-8');
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: PORT_MASTER,
+      path: urlPath,
+      method,
+      headers: { 'content-type': 'application/json', ...(payload ? { 'content-length': payload.length } : {}), ...headers },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        let json = null;
+        try { json = data ? JSON.parse(data) : null; } catch {}
+        resolve({ status: res.statusCode || 0, json, text: data });
+      });
+    });
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
 function proxyToWorker(req, res, worker) {
   return new Promise((resolve) => {
     const headers = { ...req.headers, host: `127.0.0.1:${worker.port}` };
@@ -468,10 +509,8 @@ async function reconcileWorkspace(ws) {
   const wsWorkers = getProjectWorkers(project);
   if (!wsWorkers.length) return;
 
-  const roles = readJson(path.join(wsDir(ws), 'roles.json'), []);
-  const accounts = readJson(path.join(wsDir(ws), 'accounts.json'), []);
-  const enabledSlots = new Set((accounts || []).filter((a) => a && a.enabled !== false).map((a) => String(a.slot || '').toUpperCase()));
-  const hotSlots = new Set((roles || []).map((r) => String(r?.boundSlot || '').toUpperCase()).filter((s) => /^A\d+$/.test(s) && enabledSlots.has(s)));
+  const enabledSlots = listEnabledSlots(ws);
+  const hotSlots = computeHotSlots(ws, enabledSlots);
 
   const rt = ensureWsRuntime(ws);
   const lease = loadLease(ws);
@@ -631,7 +670,19 @@ app.get('/api/groups', (req, res) => {
 });
 
 app.get('/api/projects', (_req, res) => {
-  const rows = loadProjects().map((item) => ({ ...item, workers: Array.isArray(item.workers) ? item.workers : [] }));
+  const rows = loadProjects().map((item) => {
+    const ws = item.id;
+    const accountRows = readJson(accountsFile(ws), []);
+    const groupRows = readJson(groupsFile(ws), []);
+    const accountCount = Array.isArray(accountRows) ? accountRows.length : 0;
+    const groupCount = Array.isArray(groupRows) ? groupRows.length : 0;
+    return {
+      ...item,
+      workers: Array.isArray(item.workers) ? item.workers : [],
+      accountCount,
+      groupCount,
+    };
+  });
   return res.json({ ok: true, data: rows, rows, projects: rows });
 });
 app.get('/api/projects/:id', (req, res) => {
@@ -710,6 +761,112 @@ app.post('/api/projects/:id/start', async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+app.post('/api/projects/:id/start-selected-once', async (req, res) => {
+  try {
+    const id = safeProjectId(req.params.id);
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+    const meta = findProject(id);
+    if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    if (meta.status !== 'RUNNING') {
+      const started = await requestJsonToMaster('POST', `/api/projects/${encodeURIComponent(id)}/start`, {}, req.body || {});
+      if (started.status >= 400 || !started.json?.ok) {
+        return res.status(started.status || 500).json(started.json || { ok: false, error: 'failed to start project' });
+      }
+    }
+
+    const enabledSlots = listEnabledSlots(id);
+    const hotSlots = computeHotSlots(id, enabledSlots);
+    const allSlots = Array.isArray(req.body?.slots) ? req.body.slots : [];
+    const targetSlots = Array.from(new Set(allSlots
+      .map((slot) => normalizeSlot(slot))
+      .filter((slot) => !!slot && enabledSlots.has(slot))));
+
+    const maxBatchSize = 3 * MAX_ACTIVE;
+    const inputBatchSize = Number(req.body?.batchSize);
+    const batchSize = Number.isFinite(inputBatchSize)
+      ? Math.max(1, Math.min(maxBatchSize, Math.trunc(inputBatchSize)))
+      : maxBatchSize;
+    const timeoutMsInput = Number(req.body?.timeoutMs);
+    const timeoutSecInput = Number(req.body?.timeoutSec);
+    const timeoutMs = Number.isFinite(timeoutMsInput)
+      ? Math.max(1000, Math.trunc(timeoutMsInput))
+      : (Number.isFinite(timeoutSecInput) ? Math.max(1000, Math.trunc(timeoutSecInput * 1000)) : 90000);
+
+    const rt = ensureWsRuntime(id);
+    const terminalStates = new Set(['READY', 'AUTH_FAILURE', 'DISCONNECTED']);
+    const details = [];
+    let success = 0;
+    let fail = 0;
+    let timeout = 0;
+    const releaseSet = new Set();
+
+    for (let i = 0; i < targetSlots.length; i += batchSize) {
+      const batch = targetSlots.slice(i, i + batchSize);
+
+      for (const slot of batch) {
+        while (true) {
+          const connected = await requestJsonToMaster('POST', `/api/accounts/${slot}/connect?ws=${encodeURIComponent(id)}&force=1`, { 'x-ws': id }, {});
+          if (connected.status !== 409) break;
+          await wait(1000 + Math.floor(Math.random() * 1000));
+        }
+      }
+
+      for (const slot of batch) {
+        const deadline = Date.now() + timeoutMs;
+        let finalState = '';
+        while (Date.now() < deadline) {
+          const st = String(rt.statusBySlot.get(slot) || '').toUpperCase();
+          if (terminalStates.has(st)) {
+            finalState = st;
+            break;
+          }
+          await wait(1000);
+        }
+        if (!finalState) {
+          finalState = 'TIMEOUT';
+          timeout += 1;
+        } else if (finalState === 'READY') {
+          success += 1;
+        } else {
+          fail += 1;
+        }
+
+        const lease = loadLease(id);
+        details.push({ slot, finalState, workerId: lease[slot] || null });
+      }
+
+      for (const slot of batch) {
+        if (hotSlots.has(slot)) continue;
+        const lease = loadLease(id);
+        const workerId = lease[slot];
+        const target = workerId ? getProjectWorkers(findProject(id) || {}).find((w) => w.id === workerId) : null;
+        if (target) {
+          try { await requestJsonToWorker(target, 'POST', `/api/accounts/${slot}/stop`, { 'x-ws': id }, {}); } catch {}
+        }
+        releaseLease(id, slot);
+        releaseSet.add(slot);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      summary: {
+        total: targetSlots.length,
+        success,
+        fail,
+        timeout,
+        keptHot: details.filter((d) => hotSlots.has(d.slot)).length,
+        released: releaseSet.size,
+      },
+      details,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 app.post('/api/projects/:id/stop', (req, res) => {
   try {
     const id = safeProjectId(req.params.id);
