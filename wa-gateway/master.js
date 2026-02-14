@@ -90,11 +90,46 @@ function ensureWsRuntime(ws) {
       lease: null,
       statusByWorker: new Map(),
       statusBySlot: new Map(),
+      slotMeta: new Map(),
       lastSeenByWorker: new Map(),
       releaseTimers: new Map(),
     });
   }
   return wsRuntime.get(ws);
+}
+
+function mergeSlotMeta(rt, slot, nextMeta = {}) {
+  if (!slot) return null;
+  const prev = rt.slotMeta.get(slot) || {};
+  const phone = String(nextMeta.phone || '').trim();
+  const nickname = String(nextMeta.nickname || '').trim();
+  const merged = {
+    phone: phone || prev.phone || '',
+    nickname: nickname || prev.nickname || '',
+    updatedAt: Date.now(),
+  };
+  rt.slotMeta.set(slot, merged);
+  return merged;
+}
+
+function persistAccountLastKnownMeta(ws, slot, nextMeta = {}) {
+  const phone = String(nextMeta.phone || '').trim();
+  const nickname = String(nextMeta.nickname || '').trim();
+  if (!phone && !nickname) return;
+  withFileLockSync(accountsLockFile(ws), () => {
+    const rows = readJson(accountsFile(ws), []);
+    if (!Array.isArray(rows) || !rows.length) return;
+    const idx = rows.findIndex((acc) => String(acc?.slot || '').toUpperCase() === slot);
+    if (idx < 0) return;
+    const current = rows[idx] || {};
+    const patched = {
+      ...current,
+      ...(phone ? { phone } : {}),
+      ...(nickname ? { nickname } : {}),
+    };
+    rows[idx] = patched;
+    writeJson(accountsFile(ws), rows);
+  });
 }
 function loadLease(ws) {
   const rt = ensureWsRuntime(ws);
@@ -570,6 +605,15 @@ app.post('/internal/emit', (req, res) => {
       rt.statusBySlot.set(slot, status);
       if (!rt.statusByWorker.has(workerId)) rt.statusByWorker.set(workerId, new Map());
       rt.statusByWorker.get(workerId).set(slot, status);
+
+      const phone = String(payload?.phone || '').trim();
+      const nickname = String(payload?.nickname || '').trim();
+      if (phone || nickname) {
+        mergeSlotMeta(rt, slot, { phone, nickname });
+        if (String(status).toUpperCase() === 'READY') {
+          persistAccountLastKnownMeta(ws, slot, { phone, nickname });
+        }
+      }
     }
   }
 
@@ -607,7 +651,14 @@ app.get('/api/accounts', (req, res) => {
     const slot = String(acc?.slot || '').toUpperCase();
     const workerId = slot ? (lease[slot] || null) : null;
     const runtimeState = (slot && rt.statusBySlot.get(slot)) || (workerId ? 'INIT' : 'OFFLINE');
-    return { ...acc, workerId, runtimeState };
+    const slotMeta = slot ? rt.slotMeta.get(slot) : null;
+    return {
+      ...acc,
+      workerId,
+      runtimeState,
+      phone: slotMeta?.phone || acc?.phone || '',
+      nickname: slotMeta?.nickname || acc?.nickname || '',
+    };
   });
   return res.json({ ok: true, data });
 });
@@ -649,6 +700,39 @@ app.post('/api/accounts/create', (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }); 
+
+app.post('/api/accounts/:slot/stop', async (req, res) => {
+  try {
+    const ws = getWsFromReq(req);
+    const slot = normalizeSlot(req.params.slot);
+    if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+
+    const meta = findProject(ws);
+    if (!meta) return res.status(404).json({ ok: false, error: 'project not found' });
+    const wsWorkers = getProjectWorkers(meta);
+
+    const rt = ensureWsRuntime(ws);
+    const timer = rt.releaseTimers.get(slot);
+    if (timer) {
+      clearTimeout(timer);
+      rt.releaseTimers.delete(slot);
+    }
+
+    const lease = loadLease(ws);
+    const owner = lease[slot] || null;
+    const target = owner ? wsWorkers.find((w) => w.id === owner) : null;
+
+    if (target) {
+      try { await requestJsonToWorker(target, 'POST', `/api/accounts/${slot}/stop`, { 'x-ws': ws }, {}); } catch {}
+    }
+
+    releaseLease(ws, slot);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 
 app.get('/api/roles', (req, res) => {
   const ws = getWsFromReq(req);
