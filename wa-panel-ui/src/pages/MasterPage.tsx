@@ -23,8 +23,8 @@ type ProjectRow = {
   id: string;
   name: string;
   note?: string;
-  accountsCount?: number;
-  groupsCount?: number;
+  accountCount?: number;
+  groupCount?: number;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -62,7 +62,7 @@ export default function MasterPage() {
     return Promise.resolve();
   }
 
-  async function fetchProjects() {
+  async function loadProjects() {
     setLoading(true);
     try {
       const res = await requestWithRetry(() => http.get("/api/projects"), {
@@ -80,7 +80,11 @@ export default function MasterPage() {
   }
 
   useEffect(() => {
-    fetchProjects();
+    loadProjects();
+    const timer = window.setInterval(() => {
+      loadProjects();
+    }, 3000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const openCreate = () => {
@@ -106,12 +110,12 @@ export default function MasterPage() {
         await http.put(`/api/projects/${editing.id}`, values);
         message.success("任务已更新");
         setModalOpen(false);
-        await fetchProjects();
+        await loadProjects();
       } else {
         await http.post("/api/projects", values);
         message.success("任务已创建");
         setModalOpen(false);
-        await fetchProjects();
+        await loadProjects();
       }
     } catch (e) {
       if (e && (e as { errorFields?: unknown }).errorFields) return;
@@ -125,7 +129,7 @@ export default function MasterPage() {
     try {
       await http.delete(`/api/projects/${row.id}`);
       message.success("任务已删除");
-      await fetchProjects();
+      await loadProjects();
     } catch (e) {
       message.error(String(e));
     }
@@ -135,7 +139,7 @@ export default function MasterPage() {
     try {
       await http.post(`/api/projects/${row.id}/start`);
       message.success("任务已启动");
-      await fetchProjects();
+      await loadProjects();
       await openProjectWindow(row.id);
     } catch (e) {
       message.error(String(e));
@@ -146,7 +150,7 @@ export default function MasterPage() {
     try {
       await http.post(`/api/projects/${row.id}/stop`);
       message.success("任务已停止");
-      await fetchProjects();
+      await loadProjects();
     } catch (e) {
       message.error(String(e));
     }
@@ -168,7 +172,7 @@ export default function MasterPage() {
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
             新建任务
           </Button>
-          <Button icon={<ReloadOutlined />} onClick={fetchProjects}>
+          <Button icon={<ReloadOutlined />} onClick={loadProjects}>
             刷新
           </Button>
           <Button danger onClick={handleLogout}>
@@ -187,8 +191,8 @@ export default function MasterPage() {
             { title: "任务ID", dataIndex: "id", key: "id", width: 160 },
             { title: "任务名字", dataIndex: "name", key: "name" },
             { title: "任务备注", dataIndex: "note", key: "note" },
-            { title: "账号数量", dataIndex: "accountsCount", key: "accountsCount", width: 120 },
-            { title: "群聊数量", dataIndex: "groupsCount", key: "groupsCount", width: 120 },
+            { title: "账号数量", dataIndex: "accountCount", key: "accountCount", width: 120 },
+            { title: "群聊数量", dataIndex: "groupCount", key: "groupCount", width: 120 },
             {
               title: "操作",
               key: "actions",

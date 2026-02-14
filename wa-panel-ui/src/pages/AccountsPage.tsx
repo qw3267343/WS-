@@ -66,7 +66,7 @@ export default function AccountsPage() {
   const [bindFilter, setBindFilter] = useState<"all" | "bound" | "unbound">("all");
   const [remarkQuery, setRemarkQuery] = useState("");
   const [batchOpen, setBatchOpen] = useState(false);
-  const [batchAction, setBatchAction] = useState<"connect_bound_hot" | "connect_all_verify" | "logout" | null>(null);
+  const [batchAction, setBatchAction] = useState<"connect_bound_hot" | "connect_all_verify" | "stop" | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const remarksStorageKey = wsKey("wa_accounts_remarks_v1");
@@ -208,13 +208,13 @@ export default function AccountsPage() {
     }
   }
 
-  async function logout(slot: string) {
+  async function stopAccount(slot: string) {
     try {
-      await http.post(`/api/accounts/${slot}/logout`);
-      message.success("已登出");
+      await http.post(`/api/accounts/${slot}/stop`);
+      message.success("已下线");
       await refresh();
     } catch (e: any) {
-      message.error("登出失败：" + (e?.response?.data?.error || e.message));
+      message.error("下线失败：" + (e?.response?.data?.error || e.message));
     }
   }
 
@@ -359,14 +359,14 @@ export default function AccountsPage() {
             { key: "connect", label: "连接/扫码" },
             { key: "open", label: "打开窗口" },
             { type: "divider" as const },
-            { key: "logout", label: "登出", danger: true },
+            { key: "stop", label: "下线/停止运行", danger: true },
             { key: "refresh", label: "刷新" },
             { key: "delete", label: "删除账号", danger: true },
           ],
           onClick: async ({ key }: { key: string }) => {
             if (key === "connect") return connect(r.slot);
             if (key === "open") return openWindow(r.slot);
-            if (key === "logout") return logout(r.slot);
+            if (key === "stop") return stopAccount(r.slot);
             if (key === "refresh") return refresh();
             if (key === "delete") return deleteAccount(r.slot);
           }
@@ -437,11 +437,11 @@ export default function AccountsPage() {
             <Button
               disabled={!selectedSlots.length}
               onClick={() => {
-                setBatchAction("logout");
+                setBatchAction("stop");
                 setBatchOpen(true);
               }}
             >
-              一键登出({selectedSlots.length})
+              一键下线({selectedSlots.length})
             </Button>
 
             <Dropdown menu={batchMenu} trigger={["click"]}>
@@ -566,7 +566,7 @@ async function runPool<T>(
 
 function BatchProgressModal(props: {
   open: boolean;
-  action: "connect_bound_hot" | "connect_all_verify" | "logout" | null;
+  action: "connect_bound_hot" | "connect_all_verify" | "stop" | null;
   slots: string[];
   rows: AccRow[];
   roles: Role[];
@@ -663,7 +663,7 @@ function BatchProgressModal(props: {
           const isBound = boundSlots.has(slot);
           await connectAndMaybeStop(slot, "once", !isBound);
         } else {
-          await http.post(`/api/accounts/${slot}/logout`);
+          await http.post(`/api/accounts/${slot}/stop`);
           await sleep(200);
         }
 
@@ -684,7 +684,7 @@ function BatchProgressModal(props: {
       ? "启动已绑定"
       : props.action === "connect_all_verify"
         ? "全量启动"
-        : "登出";
+         : "下线";
     message.success(`批量${actionText}完成`);
     setRunning(false);
     await props.onDone();
@@ -695,7 +695,7 @@ function BatchProgressModal(props: {
     ? "启动已绑定"
     : props.action === "connect_all_verify"
       ? "全量启动"
-      : "一键登出";
+       : "一键下线";
 
   return (
     <Modal
