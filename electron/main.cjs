@@ -83,12 +83,19 @@ function parseProjectIdFromUrl(urlStr) {
 
   if (!hash) return null;
   const normalizedHash = normalizeHash(hash);
+  const [hashPath, hashQuery = ""] = normalizedHash.split("?");
+  const query = new URLSearchParams(hashQuery);
+  const wsFromProjectHash = String(query.get("ws") || "").trim();
+  if (hashPath === "#/project" && wsFromProjectHash) {
+    return { id: wsFromProjectHash, hash: `#/project?ws=${encodeURIComponent(wsFromProjectHash)}` };
+  }
+
   const m = normalizedHash.match(/^#\/w\/([^/?#]+)(?:[/?#].*)?$/i);
   if (!m) return null;
 
   const id = String(m[1] || "").trim();
   if (!id) return null;
-  return { id, hash: normalizedHash };
+  return { id, hash: `#/project?ws=${encodeURIComponent(id)}` };
 }
 
 function showAndFocus(targetWin) {
@@ -129,7 +136,7 @@ function openOrFocusProjectWindow(id, targetHash) {
 
   child.on("closed", () => projectWindows.delete(projectId));
   projectWindows.set(projectId, child);
-  loadProjectRoute(child, targetHash || `#/w/${projectId}/tasks`);
+  loadProjectRoute(child, targetHash || `#/project?ws=${encodeURIComponent(projectId)}`);
   return child;
 }
 
@@ -277,7 +284,7 @@ function createMainWindow() {
 function openProjectWindow(projectId) {
   const key = String(projectId || "").trim();
   if (!key) return null;
-  return openOrFocusProjectWindow(key, `#/w/${key}/tasks`);
+  return openOrFocusProjectWindow(key, `#/project?ws=${encodeURIComponent(key)}`);
 }
 
 app.whenReady().then(async () => {
@@ -298,7 +305,7 @@ ipcMain.handle("ws:openProjectWindow", async (_event, projectId) => {
 ipcMain.handle("openProjectWindow", async (_event, payload = {}) => {
   const id = typeof payload === "string" ? payload : payload.id;
   const hash = typeof payload === "object" && payload ? payload.hash : undefined;
-  const targetHash = hash || `#/w/${String(id || "").trim()}/tasks`;
+  const targetHash = hash || `#/project?ws=${encodeURIComponent(String(id || "").trim())}`;
   const opened = openOrFocusProjectWindow(id, targetHash);
   return Boolean(opened);
 });

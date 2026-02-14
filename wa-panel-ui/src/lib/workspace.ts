@@ -1,28 +1,28 @@
 const ACTIVE_WS_KEY = "wa_active_ws";
 
 export function getWsId(): string {
+  // ✅ 1) URL query：?ws=...
+  const params = new URLSearchParams(window.location.search);
+  const wsFromQuery = (params.get("ws") || "").trim();
+  if (wsFromQuery) return wsFromQuery;
+
   const hash = String(window.location.hash || "").trim();
 
-  // ✅ 1) hash 内 query：#/xxx?ws=...
+  // ✅ 2) hash 内 query：#/xxx?ws=...
   if (hash.includes("?")) {
-    const q = hash.split("?").slice(1).join("?"); // 防止多 '?'
+    const q = hash.split("?").slice(1).join("?");
     const hp = new URLSearchParams(q);
     const wsFromHashQuery = (hp.get("ws") || "").trim();
     if (wsFromHashQuery) return wsFromHashQuery;
   }
 
-  // ✅ 2) HashRouter path：#/w/<wsId>/...
+  // ✅ 3) HashRouter path：#/w/<wsId>/...
   const hashMatch = hash.match(/#\/w\/([^\/?#]+)/);
   if (hashMatch?.[1]) return decodeURIComponent(hashMatch[1]);
 
-  // ✅ 3) BrowserRouter：/w/<wsId>/...
+  // ✅ 4) BrowserRouter：/w/<wsId>/...
   const pathMatch = String(window.location.pathname || "").match(/^\/w\/([^\/?#]+)/);
   if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
-
-  // ✅ 4) URL query：?ws=...
-  const params = new URLSearchParams(window.location.search);
-  const wsFromQuery = (params.get("ws") || "").trim();
-  if (wsFromQuery) return wsFromQuery;
 
   // ✅ 5) localStorage fallback
   const saved = localStorage.getItem(ACTIVE_WS_KEY);

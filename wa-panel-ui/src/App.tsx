@@ -169,6 +169,7 @@ function LegacyWorkspaceApp() {
     <WorkspaceLayout ws={ws} buildPath={(path) => withWsPath(path, ws)}>
       <Routes>
         <Route path="/" element={<Navigate to={withWsPath("/tasks", ws)} replace />} />
+        <Route path="/project" element={<Navigate to={withWsPath("/tasks", ws)} replace />} />
         <Route path="/tasks" element={<TasksPage />} />
         <Route path="/groups" element={<GroupsPage />} />
         <Route path="/accounts" element={<AccountsPage />} />
