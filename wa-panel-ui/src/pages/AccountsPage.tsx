@@ -50,6 +50,8 @@ type AccRow = WaAccountRow & {
   phone?: string | null;
   nickname?: string | null;
   enabled?: boolean;
+  runtimeState?: string;
+  state?: string;
 };
 
 type BatchResult =
@@ -129,20 +131,12 @@ export default function AccountsPage() {
 
 
   useEffect(() => {
-    let stopped = false;
-    let t: any;
+    const timer = window.setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 2000);
 
-    async function tick() {
-      if (stopped) return;
-      const delay = document.hidden ? 5000 : 1500;
-      try { await refresh(); } catch {}
-      t = setTimeout(tick, delay);
-    }
-
-    tick();
     return () => {
-      stopped = true;
-      if (t) clearTimeout(t);
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -330,7 +324,10 @@ export default function AccountsPage() {
       title: "状态",
       dataIndex: "status",
       width: 120,
-      render: (v: any) => <Tag color={statusColor(String(v))}>{String(v)}</Tag>
+      render: (_: any, row) => {
+        const state = row.runtimeState ?? row.state ?? row.status ?? "-";
+        return <Tag color={statusColor(String(state))}>{String(state)}</Tag>;
+      }
     },
 
     { title: "绑定角色", width: 160, render: (_, r) => <Tag>{boundRole(r.slot)}</Tag> },

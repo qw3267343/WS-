@@ -55,7 +55,7 @@ export default function MasterPage() {
     }
 
     // 浏览器环境：新开标签页，保留 hash 路由结构
-    const hash = `#/w/${encodeURIComponent(projectId)}/tasks`;
+    const hash = `#/project?ws=${encodeURIComponent(projectId)}`;
     const base = window.location.href.split("#")[0]; // 兼容 file:// 和 http://
     const url = `${base}${hash}`;
     window.open(url, "_blank");
