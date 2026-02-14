@@ -85,7 +85,15 @@ function poolFile() { return path.join(CONFIG_ROOT, 'workers_pool.json'); }
 function poolLockFile() { return `${poolFile()}.lock`; }
 
 function ensureWsRuntime(ws) {
-  if (!wsRuntime.has(ws)) wsRuntime.set(ws, { lease: null, statusByWorker: new Map(), releaseTimers: new Map() });
+  if (!wsRuntime.has(ws)) {
+    wsRuntime.set(ws, {
+      lease: null,
+      statusByWorker: new Map(),
+      statusBySlot: new Map(),
+      lastSeenByWorker: new Map(),
+      releaseTimers: new Map(),
+    });
+  }
   return wsRuntime.get(ws);
 }
 function loadLease(ws) {
@@ -444,7 +452,10 @@ function proxyToWorker(req, res, worker) {
   });
 }
 
-function isActiveStatus(status) { return ['INIT', 'QR', 'READY', 'AUTH_FAILURE'].includes(String(status || '')); }
+function isActiveStatus(status) {
+  const st = String(status || '').trim().toUpperCase();
+  return !!st && st !== 'DISCONNECTED';
+}
 function workerActiveCount(ws, workerId) {
   const map = ensureWsRuntime(ws).statusByWorker.get(String(workerId)) || new Map();
   let n = 0;
@@ -507,15 +518,19 @@ app.post('/internal/emit', (req, res) => {
   const ws = resolveWs(req.body?.ws);
   const event = String(req.body?.event || '').trim();
   const payload = req.body?.payload ?? {};
-  const workerId = String(req.headers['x-worker-id'] || '') || null;
+  const workerId = String(req.headers['x-worker-id'] || payload?.workerId || '').trim() || null;
   if (!event) return res.status(400).json({ ok: false, error: 'event required' });
+
+  const rt = ensureWsRuntime(ws);
+  if (workerId) rt.lastSeenByWorker.set(workerId, Date.now());
 
   if (workerId && event === 'wa:status') {
     const slot = String(payload?.slot || '').trim().toUpperCase();
+    const status = String(payload?.status || '');
     if (slot) {
-      const rt = ensureWsRuntime(ws);
+      rt.statusBySlot.set(slot, status);
       if (!rt.statusByWorker.has(workerId)) rt.statusByWorker.set(workerId, new Map());
-      rt.statusByWorker.get(workerId).set(slot, String(payload?.status || ''));
+      rt.statusByWorker.get(workerId).set(slot, status);
     }
   }
 
@@ -546,7 +561,16 @@ app.get('/health', (_req, res) => {
 app.get('/api/accounts', (req, res) => {
   const ws = getWsFromReq(req);
   const rows = readJson(accountsFile(ws), []);
-  return res.json({ ok: true, data: Array.isArray(rows) ? rows : [] });
+  const list = Array.isArray(rows) ? rows : [];
+  const lease = loadLease(ws);
+  const rt = ensureWsRuntime(ws);
+  const data = list.map((acc) => {
+    const slot = String(acc?.slot || '').toUpperCase();
+    const workerId = slot ? (lease[slot] || null) : null;
+    const runtimeState = (slot && rt.statusBySlot.get(slot)) || (workerId ? 'INIT' : 'OFFLINE');
+    return { ...acc, workerId, runtimeState };
+  });
+  return res.json({ ok: true, data });
 });
 app.post('/api/accounts/create', (req, res) => {
   try {
@@ -589,17 +613,14 @@ app.post('/api/accounts/create', (req, res) => {
 
 app.get('/api/roles', (req, res) => {
   const ws = getWsFromReq(req);
-  const running = ensureProjectRunning(ws);
-  if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
   return res.json({ ok: true, roles: readJson(path.join(wsDir(ws), 'roles.json'), []) });
 });
 app.post('/api/roles/batch', async (req, res) => {
   const ws = getWsFromReq(req);
-  const running = ensureProjectRunning(ws);
-  if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
   const roles = Array.isArray(req.body?.roles) ? req.body.roles : [];
   writeJson(path.join(wsDir(ws), 'roles.json'), roles);
-  await reconcileWorkspace(ws);
+  const running = ensureProjectRunning(ws);
+  if (running.ok) await reconcileWorkspace(ws);
   return res.json({ ok: true, roles });
 });
 app.get('/api/groups', (req, res) => {

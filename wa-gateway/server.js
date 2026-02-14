@@ -483,7 +483,7 @@ function resolveWs(raw) {
 }
 
 function getWs(req) {
-  const raw = req.query?.ws || req.headers['x-ws'] || 'default';
+  const raw = req.query?.ws || req.headers['x-ws'] || req.body?.ws || 'default';
   return resolveWs(raw);
 }
 
@@ -1071,10 +1071,40 @@ function postJson(urlStr, payload, headers = {}) {
 function emitWsEvent(ws, event, payload) {
   io.to(ws).emit(event, payload);
   if (!MASTER_INTERNAL_URL) return;
-  postJson(`${MASTER_INTERNAL_URL}/internal/emit`, { ws, event, payload }, MASTER_TOKEN ? { 'x-master-token': MASTER_TOKEN } : {})
+  postJson(
+    `${MASTER_INTERNAL_URL}/internal/emit`,
+    { ws, event, payload },
+    {
+      ...(MASTER_TOKEN ? { 'x-master-token': MASTER_TOKEN } : {}),
+      'x-worker-id': String(process.env.WORKER_ID || ''),
+    },
+  )
     .catch((e) => {
       log('warn', 'master_emit_failed', { ws, event, err: String(e?.message || e) });
     });
+}
+
+if (MASTER_INTERNAL_URL) {
+  setInterval(() => {
+    const ws = resolveWs(process.env.WORKSPACE_ID || 'default');
+    postJson(
+      `${MASTER_INTERNAL_URL}/internal/emit`,
+      {
+        ws,
+        event: 'worker:heartbeat',
+        payload: {
+          workerId: String(process.env.WORKER_ID || ''),
+          ts: Date.now(),
+        },
+      },
+      {
+        ...(MASTER_TOKEN ? { 'x-master-token': MASTER_TOKEN } : {}),
+        'x-worker-id': String(process.env.WORKER_ID || ''),
+      },
+    ).catch((e) => {
+      log('warn', 'worker_heartbeat_failed', { ws, err: String(e?.message || e) });
+    });
+  }, 5000);
 }
 
 async function runPool(items, worker, concurrency) {
@@ -1913,6 +1943,24 @@ app.post('/api/accounts/:slot/destroy', async (req, res) => {
   });
 });
 
+app.post('/api/accounts/:slot/stop', async (req, res) => {
+  const ws = getWs(req);
+  const slot = normalizeSlot(req.params.slot);
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot empty' });
+  if (!ensureSlotOwned(res, slot)) return;
+
+  return enqueueSlot(ws, slot, async () => {
+    await destroyClient(ws, slot);
+    const uid = getAccountBySlot(ws, slot)?.uid || null;
+    const { statuses } = ctx(ws);
+    statuses.set(slot, { status: 'DISCONNECTED', lastQr: null });
+    emitWsEvent(ws, 'wa:status', { slot, uid, status: 'DISCONNECTED', reason: 'stopped' });
+    return res.json({ ok: true });
+  }).catch((e) => {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  });
+});
+
 // 打开窗口（前置浏览器窗口）
 app.post('/api/accounts/:slot/open', async (req, res) => {
   const ws = getWs(req);
@@ -2375,4 +2423,3 @@ server.listen(PORT, () => {
     runWarmup();
   }, 0);
 });
-
