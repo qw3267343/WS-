@@ -59,6 +59,7 @@ const TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TRASH_CLEAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_INIT = Math.max(1, Number(process.env.MAX_INIT || process.env.WA_INIT_CONCURRENCY || 3));
 const MAX_ACTIVE = Math.max(1, Number(process.env.MAX_ACTIVE || 30));
+const STATE_PROBE_INTERVAL_MS = Math.max(10000, Number(process.env.STATE_PROBE_INTERVAL_MS || 12000));
 const WARMUP_LIMIT = Math.max(0, Number(process.env.WARMUP_LIMIT || 10));
 const SLOT_FROM = String(process.env.SLOT_FROM || '').trim().toUpperCase();
 const SLOT_TO = String(process.env.SLOT_TO || '').trim().toUpperCase();
@@ -647,8 +648,8 @@ function getCountsForWorkspace(id) {
   const accounts = readJson(getWorkspaceAccountsFile(id), []);
   const groups = readJson(getWorkspaceGroupsFile(id), []);
   return {
-    accountsCount: Array.isArray(accounts) ? accounts.length : 0,
-    groupsCount: Array.isArray(groups) ? groups.length : 0,
+    accountCount: Array.isArray(accounts) ? accounts.length : 0,
+    groupCount: Array.isArray(groups) ? groups.length : 0,
   };
 }
 function parseProjectNumber(id) {
@@ -1010,7 +1011,12 @@ async function retryDetached(fn, pageGetter, retries = 2) {
 }
 
 async function destroyClient(ws, slot) {
-  const { clients, statuses, profiles } = ctx(ws);
+  const { clients, statuses, profiles, stateProbes } = ctx(ws);
+  const probe = stateProbes.get(slot);
+  if (probe) {
+    clearInterval(probe);
+    stateProbes.delete(slot);
+  }
   const client = clients.get(slot);
   if (client) {
     try { await client.destroy(); } catch {}
@@ -1027,9 +1033,30 @@ function ctx(ws) {
       clients: new Map(),
       statuses: new Map(),
       profiles: new Map(),
+      stateProbes: new Map(),
     });
   }
   return contexts.get(key);
+}
+
+function deriveRuntimeStatusFromWaState(state) {
+  const s = String(state || '').trim().toUpperCase();
+  if (!s) return null;
+  if (s === 'CONNECTED') return 'READY';
+  if (s === 'OPENING' || s === 'PAIRING') return 'INIT';
+  if (s === 'UNPAIRED' || s === 'UNLAUNCHED' || s === 'CONFLICT' || s === 'TIMEOUT') return 'DISCONNECTED';
+  return 'DISCONNECTED';
+}
+
+function applyRuntimeStatus(ws, slot, status, extra = {}) {
+  const next = String(status || '').trim().toUpperCase();
+  if (!next) return;
+  const { statuses } = ctx(ws);
+  const prev = String(statuses.get(slot)?.status || '').toUpperCase();
+  if (prev === next && !extra.forceEmit) return;
+  statuses.set(slot, { status: next, lastQr: null });
+  const uid = getAccountBySlot(ws, slot)?.uid || null;
+  emitWsEvent(ws, 'wa:status', { slot, uid, status: next, ...extra });
 }
 
 function getActiveCount(ws) {
@@ -1207,7 +1234,7 @@ function selectReadySlot(ws) {
 
 // slot -> 用 uid 建 LocalAuth（session-<uid>）
 function ensureClient(ws, slot) {
-  const { clients, statuses, profiles } = ctx(ws);
+  const { clients, statuses, profiles, stateProbes } = ctx(ws);
   if (clients.has(slot)) return clients.get(slot);
   if (!slotInWorkerRange(slot)) throw new Error('slot not in this worker');
   if (!hasWorkerCapacity(ws)) {
@@ -1272,6 +1299,16 @@ function ensureClient(ws, slot) {
     emitWsEvent(ws, 'wa:status', { slot, uid, status: 'READY', phone, nickname });
   });
 
+  client.on('authenticated', () => {
+    applyRuntimeStatus(ws, slot, 'INIT', { reason: 'authenticated' });
+  });
+
+  client.on('change_state', (state) => {
+    const derived = deriveRuntimeStatusFromWaState(state);
+    if (!derived) return;
+    applyRuntimeStatus(ws, slot, derived, { waState: String(state || '') });
+  });
+
   client.on('auth_failure', (msg) => {
     statuses.set(slot, { status: 'AUTH_FAILURE', lastQr: null });
     emitWsEvent(ws, 'wa:status', { slot, uid, status: 'AUTH_FAILURE', msg });
@@ -1283,6 +1320,19 @@ function ensureClient(ws, slot) {
   });
 
   clients.set(slot, client);
+  const previousProbe = stateProbes.get(slot);
+  if (previousProbe) clearInterval(previousProbe);
+  const probeTimer = setInterval(async () => {
+    try {
+      const st = await client.getState();
+      const derived = deriveRuntimeStatusFromWaState(st);
+      if (!derived || derived === 'READY') return;
+      applyRuntimeStatus(ws, slot, derived, { waState: String(st || ''), reason: 'state_probe' });
+    } catch (e) {
+      applyRuntimeStatus(ws, slot, 'DISCONNECTED', { reason: 'state_probe_error', err: String(e?.message || e) });
+    }
+  }, STATE_PROBE_INTERVAL_MS);
+  stateProbes.set(slot, probeTimer);
   return client;
 }
 

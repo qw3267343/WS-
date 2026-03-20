@@ -22,6 +22,7 @@ const WORKER_PORT_BASE = Math.max(1, Number(process.env.WORKER_PORT_BASE || 3101
 const WORKERS_PER_PROJECT = 3;
 const MAX_ACTIVE = 13;
 const UNBIND_COOLDOWN_MS = Math.max(0, Number(process.env.UNBIND_COOLDOWN_MS || 120000));
+const WORKER_STALE_MS = Math.max(10000, Number(process.env.WORKER_STALE_MS || 20000));
 const PROJECTS_FILE = path.join(CONFIG_ROOT, 'projects.json');
 const PROJECT_COUNTER_FILE = path.join(CONFIG_ROOT, 'project_counter.txt');
 const UID_COUNTER_FILE = path.join(CONFIG_ROOT, 'uid_counter.txt');
@@ -532,6 +533,16 @@ function isActiveStatus(status) {
   const st = String(status || '').trim().toUpperCase();
   return !!st && st !== 'DISCONNECTED';
 }
+function computeRuntimeState(rt, slot, workerId) {
+  const state = String((slot && rt.statusBySlot.get(slot)) || (workerId ? 'INIT' : 'OFFLINE')).trim().toUpperCase();
+  if (!workerId) return state || 'OFFLINE';
+  const seenAt = Number(rt.lastSeenByWorker.get(workerId) || 0);
+  if (!seenAt || (Date.now() - seenAt) > WORKER_STALE_MS) {
+    if (state === 'READY' || state === 'INIT' || state === 'QR') return 'OFFLINE_STALE';
+    return state || 'OFFLINE_STALE';
+  }
+  return state || 'OFFLINE';
+}
 function workerActiveCount(ws, workerId) {
   const map = ensureWsRuntime(ws).statusByWorker.get(String(workerId)) || new Map();
   let n = 0;
@@ -650,7 +661,7 @@ app.get('/api/accounts', (req, res) => {
   const data = list.map((acc) => {
     const slot = String(acc?.slot || '').toUpperCase();
     const workerId = slot ? (lease[slot] || null) : null;
-    const runtimeState = (slot && rt.statusBySlot.get(slot)) || (workerId ? 'INIT' : 'OFFLINE');
+    const runtimeState = computeRuntimeState(rt, slot, workerId);
     const slotMeta = slot ? rt.slotMeta.get(slot) : null;
     return {
       ...acc,

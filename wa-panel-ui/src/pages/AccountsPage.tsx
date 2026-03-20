@@ -648,6 +648,40 @@ function BatchProgressModal(props: {
     setFailCount(0);
     setResults([]);
 
+    if (props.action === "connect_all_verify") {
+      try {
+        const ws = getWsId();
+        const timeoutMs = 10 * 60 * 1000;
+        const batchSize = Math.max(1, Math.min(50, Math.trunc(concurrency * 10)));
+        const resp = await http.post(`/api/projects/${encodeURIComponent(ws)}/start-selected-once`, {
+          slots: targets,
+          batchSize,
+          timeoutMs,
+        });
+        const details = Array.isArray(resp.data?.details) ? resp.data.details : [];
+        const source = details.length ? details : targets.map((slot) => ({ slot, state: "UNKNOWN", reason: "missing detail" }));
+        const mapped: BatchResult[] = source.map((d: any) => {
+          const slot = String(d?.slot || "");
+          const state = String(d?.state || "").toUpperCase();
+          if (state === "READY") return { ok: true, slot };
+          return { ok: false, slot, error: d?.reason || state || "unknown error" };
+        });
+        const ok = mapped.filter((item) => item.ok).length;
+        const fail = mapped.length - ok;
+        setResults(mapped);
+        setTotal(targets.length);
+        setDone(targets.length);
+        setOkCount(ok);
+        setFailCount(fail);
+      } catch (e: any) {
+        message.error("全量启动失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+      } finally {
+        setRunning(false);
+        await props.onDone();
+      }
+      return;
+    }
+
     await runPool(targets, concurrency, async (slot) => {
       try {
         const row = props.rows.find(r => r.slot === slot);
@@ -659,9 +693,6 @@ function BatchProgressModal(props: {
 
         if (props.action === "connect_bound_hot") {
           await connectAndMaybeStop(slot, "hot", false);
-        } else if (props.action === "connect_all_verify") {
-          const isBound = boundSlots.has(slot);
-          await connectAndMaybeStop(slot, "once", !isBound);
         } else {
           await http.post(`/api/accounts/${slot}/stop`);
           await sleep(200);
@@ -680,11 +711,7 @@ function BatchProgressModal(props: {
       }
     });
 
-    const actionText = props.action === "connect_bound_hot"
-      ? "启动已绑定"
-      : props.action === "connect_all_verify"
-        ? "全量启动"
-         : "下线";
+    const actionText = props.action === "connect_bound_hot" ? "启动已绑定" : "下线";
     message.success(`批量${actionText}完成`);
     setRunning(false);
     await props.onDone();
