@@ -13,9 +13,10 @@ import {
   Popconfirm,
   Progress,
   Select,
+  Divider,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import type { GroupTarget } from "../lib/types";
+import type { GroupSegment, GroupTarget } from "../lib/types";
 import { http } from "../lib/api";
 
 type ResolveResp =
@@ -43,11 +44,15 @@ async function postJSON<T>(url: string, body: any): Promise<T> {
 
 export default function GroupsPage() {
   const [rows, setRows] = useState<GroupTarget[]>([]);
+  const [segments, setSegments] = useState<GroupSegment[]>([]);
   const [loading, setLoading] = useState(false);
+  const [segmentsLoading, setSegmentsLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<GroupTarget | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
+  const [batchSegmentId, setBatchSegmentId] = useState<string>("");
 
   async function loadGroups() {
     setLoading(true);
@@ -61,6 +66,19 @@ export default function GroupsPage() {
     }
   }
 
+  async function loadSegments() {
+    setSegmentsLoading(true);
+    try {
+      const r = await http.get("/api/group-segments");
+      const list = Array.isArray(r.data?.rows) ? (r.data.rows as GroupSegment[]) : [];
+      setSegments(list.sort((a, b) => Number(a.sort || 0) - Number(b.sort || 0)));
+    } catch (e: any) {
+      message.error("加载分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    } finally {
+      setSegmentsLoading(false);
+    }
+  }
+
   async function saveByBatch(nextRows: GroupTarget[]) {
     const r = await http.post("/api/groups/batch", { rows: nextRows });
     const latest = Array.isArray(r.data?.rows) ? r.data.rows : nextRows;
@@ -68,9 +86,36 @@ export default function GroupsPage() {
     return latest;
   }
 
+  async function saveSegmentsByBatch(nextRows: GroupSegment[]) {
+    const payload = nextRows
+      .map((item, idx) => ({
+        ...item,
+        code: String(item.code || "").trim().toUpperCase(),
+        sort: idx + 1,
+      }))
+      .filter((item) => item.id && item.code);
+    const r = await http.post("/api/group-segments/batch", { rows: payload });
+    const latest = Array.isArray(r.data?.rows) ? (r.data.rows as GroupSegment[]) : payload;
+    const sorted = latest.sort((a, b) => Number(a.sort || 0) - Number(b.sort || 0));
+    setSegments(sorted);
+    return sorted;
+  }
+
   useEffect(() => {
     void loadGroups();
+    void loadSegments();
   }, []);
+
+  const segmentOptions = useMemo(() => {
+    const base = [{ value: "", label: "未分组" }];
+    const sorted = [...segments].sort((a, b) => Number(a.sort || 0) - Number(b.sort || 0));
+    return base.concat(
+      sorted.map((s) => ({
+        value: s.id,
+        label: `${s.code}${s.remark ? `｜${s.remark}` : ""}${s.enabled === false ? "（禁用）" : ""}`,
+      }))
+    );
+  }, [segments]);
 
   const columns: ColumnsType<GroupTarget> = useMemo(
     () => [
@@ -101,6 +146,29 @@ export default function GroupsPage() {
         dataIndex: "id",
         width: 240,
         render: (v) => <Tag>{v}</Tag>,
+      },
+      {
+        title: "分组",
+        dataIndex: "segmentId",
+        width: 260,
+        render: (_v, r) => (
+          <Select
+            style={{ width: "100%" }}
+            value={r.segmentId || ""}
+            options={segmentOptions}
+            onChange={async (v) => {
+              try {
+                const resp = await http.put(`/api/groups/${encodeURIComponent(r.id)}`, {
+                  ...r,
+                  segmentId: String(v || ""),
+                });
+                setRows(Array.isArray(resp.data?.rows) ? resp.data.rows : []);
+              } catch (e: any) {
+                message.error("更新分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+              }
+            }}
+          />
+        ),
       },
       { title: "备注", dataIndex: "note", ellipsis: true },
       {
@@ -152,8 +220,84 @@ export default function GroupsPage() {
         ),
       },
     ],
-    [rows]
+    [rows, segmentOptions]
   );
+
+  async function updateSegmentRow(segId: string, patch: Partial<GroupSegment>) {
+    const next = segments.map((s) => (s.id === segId ? { ...s, ...patch } : s));
+    try {
+      await saveSegmentsByBatch(next);
+      message.success("分组已更新");
+    } catch (e: any) {
+      message.error("更新分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    }
+  }
+
+  async function addSegment() {
+    const stamp = Date.now().toString(36).slice(-6);
+    const next: GroupSegment = {
+      id: `seg_${stamp}`,
+      code: "",
+      remark: "",
+      sort: segments.length + 1,
+      enabled: true,
+    };
+    try {
+      await saveSegmentsByBatch([...segments, next]);
+      message.success("已新增分组，请填写 code");
+    } catch (e: any) {
+      message.error("新增分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    }
+  }
+
+  async function moveSegment(segId: string, dir: -1 | 1) {
+    const idx = segments.findIndex((s) => s.id === segId);
+    if (idx < 0) return;
+    const ni = idx + dir;
+    if (ni < 0 || ni >= segments.length) return;
+    const next = [...segments];
+    const [row] = next.splice(idx, 1);
+    next.splice(ni, 0, row);
+    try {
+      await saveSegmentsByBatch(next);
+    } catch (e: any) {
+      message.error("调整顺序失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    }
+  }
+
+  async function deleteSegment(segId: string) {
+    const target = segments.find((s) => s.id === segId);
+    if (!target) return;
+    const nextSegments = segments.filter((s) => s.id !== segId);
+    const nextGroups = rows.map((g) =>
+      g.segmentId === segId ? { ...g, segmentId: "" } : g
+    );
+    try {
+      await saveByBatch(nextGroups);
+      await saveSegmentsByBatch(nextSegments);
+      setRows(nextGroups);
+      setSelectedKeys((prev) => prev.filter((key) => nextGroups.some((g) => g.id === String(key))));
+      message.success(`已删除分组 ${target.code || segId}，并清空关联群分组`);
+    } catch (e: any) {
+      message.error("删除分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    }
+  }
+
+  async function applyBatchSegment() {
+    const ids = selectedKeys.map(String);
+    if (!ids.length) return message.warning("请先勾选群聊");
+    const targetSegment = String(batchSegmentId || "");
+    const next = rows.map((g) =>
+      ids.includes(g.id) ? { ...g, segmentId: targetSegment } : g
+    );
+    try {
+      await saveByBatch(next);
+      setRows(next);
+      message.success(`已批量设置 ${ids.length} 个群`);
+    } catch (e: any) {
+      message.error("批量设置分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+    }
+  }
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
@@ -181,11 +325,84 @@ export default function GroupsPage() {
           你可以粘贴邀请链接 → 解析 → 自动填充 群ID + 群名。
         </Typography.Paragraph>
 
+        <Card
+          size="small"
+          title="分组管理"
+          style={{ marginBottom: 12 }}
+          extra={
+            <Space>
+              <Button onClick={() => void loadSegments()} loading={segmentsLoading}>刷新分组</Button>
+              <Button type="primary" onClick={() => void addSegment()}>新建分组</Button>
+            </Space>
+          }
+        >
+          <Space direction="vertical" style={{ width: "100%" }}>
+            {segments.map((seg, idx) => (
+              <div
+                key={seg.id}
+                style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+              >
+                <Input
+                  value={seg.code}
+                  onChange={(e) => setSegments((prev) => prev.map((s) => (s.id === seg.id ? { ...s, code: e.target.value.toUpperCase() } : s)))}
+                  onBlur={() => void updateSegmentRow(seg.id, { code: seg.code })}
+                  placeholder="code（A/B/C/D）"
+                  style={{ width: 120 }}
+                  maxLength={8}
+                />
+                <Input
+                  value={seg.remark}
+                  onChange={(e) => setSegments((prev) => prev.map((s) => (s.id === seg.id ? { ...s, remark: e.target.value } : s)))}
+                  onBlur={() => void updateSegmentRow(seg.id, { remark: seg.remark })}
+                  placeholder="备注（美国群/印度群）"
+                  style={{ width: 240 }}
+                  maxLength={40}
+                />
+                <Switch
+                  checked={seg.enabled !== false}
+                  onChange={(v) => void updateSegmentRow(seg.id, { enabled: v })}
+                />
+                <Button size="small" onClick={() => void moveSegment(seg.id, -1)} disabled={idx === 0}>上移</Button>
+                <Button size="small" onClick={() => void moveSegment(seg.id, 1)} disabled={idx === segments.length - 1}>下移</Button>
+                <Popconfirm
+                  title="确认删除该分组？"
+                  description="删除后，该分组下群聊会自动清空分组归属。"
+                  okText="删除"
+                  cancelText="取消"
+                  onConfirm={() => void deleteSegment(seg.id)}
+                >
+                  <Button danger size="small">删除</Button>
+                </Popconfirm>
+              </div>
+            ))}
+            {!segments.length && <Typography.Text type="secondary">暂无分组，点击“新建分组”添加。</Typography.Text>}
+          </Space>
+        </Card>
+
+        <Space style={{ marginBottom: 10 }} wrap>
+          <Typography.Text type="secondary">已选 {selectedKeys.length} 个群</Typography.Text>
+          <Divider type="vertical" />
+          <Select
+            style={{ width: 280 }}
+            value={batchSegmentId}
+            options={segmentOptions}
+            onChange={(v) => setBatchSegmentId(String(v || ""))}
+            placeholder="选择要批量设置的分组"
+          />
+          <Button onClick={() => void applyBatchSegment()} disabled={!selectedKeys.length}>
+            批量设置分组
+          </Button>
+        </Space>
+
         <Table
           rowKey="id"
           columns={columns}
           dataSource={rows}
           loading={loading}
+          rowSelection={{
+            selectedRowKeys: selectedKeys,
+            onChange: (keys) => setSelectedKeys(keys),
+          }}
           size="small"
           pagination={{ pageSize: 12 }}
         />

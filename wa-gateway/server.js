@@ -516,6 +516,11 @@ function getWorkspaceGroupsFile(ws) {
   maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'groups.json'));
   return file;
 }
+function getWorkspaceGroupSegmentsFile(ws) {
+  const file = path.join(getWorkspaceConfigDir(ws), 'group_segments.json');
+  maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'group_segments.json'));
+  return file;
+}
 function getWorkspaceRolesFile(ws) {
   const file = path.join(getWorkspaceConfigDir(ws), 'roles.json');
   maybeMigrateLegacyFile(file, path.join(getLegacyWorkspaceDir(ws), 'roles.json'));
@@ -571,6 +576,8 @@ function ensureWorkspace(ws) {
   fs.mkdirSync(workDir, { recursive: true });
   const groupsFile = getWorkspaceGroupsFile(ws);
   if (!fs.existsSync(groupsFile)) writeJson(groupsFile, []);
+  const segmentsFile = getWorkspaceGroupSegmentsFile(ws);
+  if (!fs.existsSync(segmentsFile)) writeJson(segmentsFile, defaultGroupSegments());
   const rolesFile = getWorkspaceRolesFile(ws);
   if (!fs.existsSync(rolesFile)) writeJson(rolesFile, defaultRoles());
   const historyFile = getWorkspaceHistoryFile(ws);
@@ -580,14 +587,96 @@ function ensureWorkspace(ws) {
 function loadGroups(ws) {
   const file = getWorkspaceGroupsFile(ws);
   const data = readJson(file, []);
-  return Array.isArray(data) ? data : [];
+  if (!Array.isArray(data)) return [];
+  return data.map((item) => ({
+    ...item,
+    segmentId: normalizeSegmentId(item?.segmentId),
+  }));
 }
 
 function saveGroups(ws, list) {
   const file = getWorkspaceGroupsFile(ws);
   withFileLockSync(getWorkspaceConfigFileLock(file), () => {
-    writeJson(file, Array.isArray(list) ? list : []);
+    const rows = Array.isArray(list) ? list.map((item) => ({
+      ...item,
+      segmentId: normalizeSegmentId(item?.segmentId),
+    })) : [];
+    writeJson(file, rows);
   });
+}
+
+function normalizeSegmentId(v) {
+  if (v == null) return '';
+  return String(v).trim();
+}
+
+function defaultGroupSegments() {
+  return [
+    { id: 'seg_a', code: 'A', remark: '', sort: 1, enabled: true },
+    { id: 'seg_b', code: 'B', remark: '', sort: 2, enabled: true },
+    { id: 'seg_c', code: 'C', remark: '', sort: 3, enabled: true },
+    { id: 'seg_d', code: 'D', remark: '', sort: 4, enabled: true },
+  ];
+}
+
+function normalizeGroupSegmentRow(item, idx = 0) {
+  const id = String(item?.id || '').trim();
+  if (!id) return null;
+  const code = String(item?.code || '').trim().toUpperCase();
+  if (!code) return null;
+  const sortNum = Number(item?.sort);
+  return {
+    id,
+    code,
+    remark: item?.remark == null ? '' : String(item.remark).trim(),
+    sort: Number.isFinite(sortNum) ? sortNum : (idx + 1),
+    enabled: item?.enabled !== false,
+  };
+}
+
+function loadGroupSegments(ws) {
+  const file = getWorkspaceGroupSegmentsFile(ws);
+  const data = readJson(file, []);
+  if (!Array.isArray(data)) return defaultGroupSegments();
+  const rows = data
+    .map((item, idx) => normalizeGroupSegmentRow(item, idx))
+    .filter(Boolean);
+  if (!rows.length) return defaultGroupSegments();
+  return rows.sort((a, b) => a.sort - b.sort);
+}
+
+function saveGroupSegments(ws, list) {
+  const file = getWorkspaceGroupSegmentsFile(ws);
+  const rows = Array.isArray(list)
+    ? list.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean)
+    : [];
+  withFileLockSync(getWorkspaceConfigFileLock(file), () => {
+    writeJson(file, rows);
+  });
+  return rows;
+}
+
+function listEnabledGroupsBySegment(ws, segmentId) {
+  const sid = normalizeSegmentId(segmentId);
+  if (!sid) return [];
+  const groups = loadGroups(ws);
+  return groups.filter((g) => g && g.enabled !== false && normalizeSegmentId(g.segmentId) === sid);
+}
+
+function resolveEnabledSegmentTargets(ws, segmentId) {
+  const sid = normalizeSegmentId(segmentId);
+  if (!sid) throw new Error('segmentId required');
+  const segments = loadGroupSegments(ws);
+  const segment = segments.find((item) => item.id === sid);
+  if (!segment) throw new Error('segment not found');
+  if (segment.enabled === false) throw new Error('当前分组已禁用');
+  const groups = listEnabledGroupsBySegment(ws, sid);
+  const targetChatIds = groups.map((item) => String(item.id || '').trim()).filter(Boolean);
+  return {
+    segment,
+    targetChatIds,
+    targetChatCount: targetChatIds.length,
+  };
 }
 
 function defaultRoles() {
@@ -1616,6 +1705,57 @@ app.get('/api/groups', (req, res) => {
   }
 });
 
+app.get('/api/group-segments', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const rows = loadGroupSegments(ws);
+    return res.json({ ok: true, rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post('/api/group-segments/batch', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    if (!rows) return res.status(400).json({ ok: false, error: 'rows must be an array' });
+    const normalized = rows.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean);
+    if (!normalized.length) return res.status(400).json({ ok: false, error: 'rows empty' });
+    const seenId = new Set();
+    const seenCode = new Set();
+    for (const row of normalized) {
+      if (seenId.has(row.id)) return res.status(400).json({ ok: false, error: `duplicate segment id: ${row.id}` });
+      if (seenCode.has(row.code)) return res.status(400).json({ ok: false, error: `duplicate segment code: ${row.code}` });
+      seenId.add(row.id);
+      seenCode.add(row.code);
+    }
+    const saved = saveGroupSegments(ws, normalized);
+    return res.json({ ok: true, rows: saved });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get('/api/group-segments/:id/summary', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const segmentId = normalizeSegmentId(req.params.id);
+    if (!segmentId) return res.status(400).json({ ok: false, error: 'segment id required' });
+    const targets = listEnabledGroupsBySegment(ws, segmentId);
+    const preview = targets.slice(0, 5).map((g) => ({ id: g.id, name: g.name }));
+    return res.json({
+      ok: true,
+      data: { segmentId, count: targets.length, preview },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 app.post('/api/groups', (req, res) => {
   try {
     const ws = getWs(req);
@@ -1631,6 +1771,7 @@ app.post('/api/groups', (req, res) => {
       name,
       note: req.body?.note ? String(req.body.note).trim() || undefined : undefined,
       enabled: req.body?.enabled !== false,
+      segmentId: normalizeSegmentId(req.body?.segmentId),
       link: req.body?.link ? String(req.body.link).trim() || undefined : undefined,
     };
     let next = null;
@@ -1674,6 +1815,7 @@ app.put('/api/groups/:id', (req, res) => {
         name,
         note: req.body?.note == null ? list[idx]?.note : (String(req.body.note || '').trim() || undefined),
         enabled: req.body?.enabled == null ? Boolean(list[idx]?.enabled) : Boolean(req.body.enabled),
+        segmentId: req.body?.segmentId == null ? normalizeSegmentId(list[idx]?.segmentId) : normalizeSegmentId(req.body?.segmentId),
         link: req.body?.link == null ? list[idx]?.link : (String(req.body.link || '').trim() || undefined),
       };
       list[idx] = updated;
@@ -1713,6 +1855,7 @@ app.post('/api/groups/batch', (req, res) => {
         name,
         note: item?.note ? String(item.note).trim() || undefined : undefined,
         enabled: item?.enabled !== false,
+        segmentId: normalizeSegmentId(item?.segmentId),
         link: item?.link ? String(item.link).trim() || undefined : undefined,
       });
     }
@@ -2144,6 +2287,62 @@ async function deleteAccountHandler(req, res) {
 app.delete('/api/accounts/:slot', deleteAccountHandler);
 app.post('/api/accounts/:slot/delete', deleteAccountHandler);
 
+app.post('/api/send/segment', upload.array('files', 10), async (req, res) => {
+  const ws = getWs(req);
+  const slot = normalizeSlot(req.body?.slot);
+  if (!slot) return res.status(400).json({ ok: false, error: 'slot required' });
+  if (!ensureSlotOwned(res, slot)) return;
+
+  const segmentId = normalizeSegmentId(req.body?.segmentId);
+  const text = String(req.body?.text || '');
+  const files = req.files || [];
+  const hasContent = (text && text.trim().length > 0) || files.length > 0;
+  if (!hasContent) return res.status(400).json({ ok: false, error: 'content empty' });
+
+  try {
+    const { segment, targetChatIds, targetChatCount } = resolveEnabledSegmentTargets(ws, segmentId);
+    if (!targetChatCount) {
+      return res.status(400).json({ ok: false, error: '当前分组没有可发送群聊' });
+    }
+
+    const attachments = files.map((f) => ({
+      path: f.path,
+      name: f.originalname,
+      type: f.mimetype || 'application/octet-stream',
+    }));
+
+    const result = { total: targetChatCount, okCount: 0, failCount: 0, lastErr: null };
+    await runPool(targetChatIds, async (to) => {
+      try {
+        if (attachments.length) await sendMediaBySlot(ws, slot, to, text, attachments);
+        else await sendTextBySlot(ws, slot, to, text);
+        result.okCount += 1;
+      } catch (e) {
+        result.failCount += 1;
+        result.lastErr = String(e?.message || e);
+      }
+    }, 4);
+
+    return res.json({
+      ok: result.failCount === 0,
+      data: {
+        segmentId: segment.id,
+        segmentCode: segment.code,
+        segmentRemark: segment.remark || '',
+        targetChatCount,
+        targetChatIds,
+        result,
+      }
+    });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    for (const f of files) {
+      try { fs.unlinkSync(f.path); } catch {}
+    }
+  }
+});
+
 // 纯文本发送
 app.post('/api/accounts/:slot/send', async (req, res) => {
   const ws = getWs(req);
@@ -2235,28 +2434,41 @@ app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
   const mode = String(req.body?.mode || '').trim();
   const text = String(req.body?.text || '');
   const roleName = String(req.body?.roleName || '').trim();
+  const segmentIdRaw = normalizeSegmentId(req.body?.segmentId);
   const minutes = Number(req.body?.minutes || 0);
   const targetsRaw = req.body?.targets;
 
   if (!mode) return res.status(400).json({ ok: false, error: 'mode required' });
-  if (!targetsRaw) return res.status(400).json({ ok: false, error: 'targets required' });
   if (!['enabled_groups', 'single_group', 'single_contact'].includes(mode)) {
     return res.status(400).json({ ok: false, error: 'mode invalid' });
   }
 
   let targets = [];
-  try {
-    targets = JSON.parse(targetsRaw);
-  } catch {
-    return res.status(400).json({ ok: false, error: 'targets invalid' });
-  }
+  let segmentMeta = null;
+  if (mode === 'enabled_groups') {
+    try {
+      const resolved = resolveEnabledSegmentTargets(ws, segmentIdRaw);
+      if (!resolved.targetChatCount) return res.status(400).json({ ok: false, error: '当前分组没有可发送群聊' });
+      targets = resolved.targetChatIds;
+      segmentMeta = resolved.segment;
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: String(e?.message || e) });
+    }
+  } else {
+    if (!targetsRaw) return res.status(400).json({ ok: false, error: 'targets required' });
+    try {
+      targets = JSON.parse(targetsRaw);
+    } catch {
+      return res.status(400).json({ ok: false, error: 'targets invalid' });
+    }
 
-  if (!Array.isArray(targets) || targets.length === 0) {
-    return res.status(400).json({ ok: false, error: 'targets empty' });
-  }
-  targets = targets.map(item => String(item || '').trim()).filter(Boolean);
-  if (!targets.length) {
-    return res.status(400).json({ ok: false, error: 'targets empty' });
+    if (!Array.isArray(targets) || targets.length === 0) {
+      return res.status(400).json({ ok: false, error: 'targets empty' });
+    }
+    targets = targets.map(item => String(item || '').trim()).filter(Boolean);
+    if (!targets.length) {
+      return res.status(400).json({ ok: false, error: 'targets empty' });
+    }
   }
 
   const runAtValue = Number(req.body?.runAt);
@@ -2285,6 +2497,9 @@ app.post('/api/schedules', scheduleUpload.array('files', 10), (req, res) => {
     slot,
     mode,
     targets,
+    segmentId: mode === 'enabled_groups' ? segmentMeta?.id || segmentIdRaw : '',
+    segmentCode: mode === 'enabled_groups' ? segmentMeta?.code || '' : '',
+    segmentRemark: mode === 'enabled_groups' ? segmentMeta?.remark || '' : '',
     text,
     roleName,
     attachments,

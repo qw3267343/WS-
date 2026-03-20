@@ -11,6 +11,8 @@ import {
   Row,
   Select,
   Space,
+  Popover,
+  Tooltip,
   Tag,
   Typography,
   message
@@ -20,7 +22,7 @@ import { MoreOutlined, PlusOutlined, ReloadOutlined, DeleteOutlined, DragOutline
 import { http } from "../lib/api";
 import { getSocket } from "../lib/socket";
 import { getWsId } from "../lib/workspace";
-import type { GroupTarget, Role, WaAccountRow } from "../lib/types";
+import type { GroupSegment, GroupTarget, Role, WaAccountRow } from "../lib/types";
 import { uid } from "../lib/storage";
 import { isSlotEnabled } from "../utils/enabledSlots";
 
@@ -34,6 +36,9 @@ type HisItem = {
   roleRemark: string;
   roleName?: string;
   slot?: string;
+  segmentId?: string;
+  segmentCode?: string;
+  segmentRemark?: string;
 
   mode: "enabled_groups" | "single_group" | "single_contact";
 
@@ -53,6 +58,8 @@ type HisItem = {
   total?: number;
   okCount?: number;
   failCount?: number;
+  targetChatCount?: number;
+  targetChatIds?: string[];
 
   // ✅ 失败时显示一个简短原因（不展示群信息）
   lastErr?: string;
@@ -117,37 +124,15 @@ export default function TasksPage() {
   const PAGE_H = "calc(100vh - 64px - 32px)";
   const BASE_INPUT_AREA_H = 240;
   const MEDIA_INPUT_AREA_H = 340;
-  const SEND_CONCURRENCY = 4;
-
-  function sleep(ms: number) {
-    return new Promise<void>((resolve) => setTimeout(resolve, ms));
-  }
-
-  async function runPool<T>(
-    items: T[],
-    worker: (item: T, index: number) => Promise<boolean>,
-    concurrency: number
-  ) {
-    let idx = 0;
-    const results: boolean[] = new Array(items.length).fill(false);
-
-    const runners = Array.from({ length: Math.max(1, concurrency) }, async () => {
-      while (true) {
-        const i = idx++;
-        if (i >= items.length) break;
-        results[i] = await worker(items[i], i);
-      }
-    });
-
-    await Promise.all(runners);
-    return results;
-  }
 
   const [accounts, setAccounts] = useState<AccRow[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
   const [groups, setGroups] = useState<GroupTarget[]>([]);
+  const [segments, setSegments] = useState<GroupSegment[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
+  const [segmentsLoading, setSegmentsLoading] = useState(false);
   const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
+  const [activeSegmentId, setActiveSegmentId] = useState<string>("");
 
   const [mode, setMode] = useState<"enabled_groups" | "single_group" | "single_contact">("enabled_groups");
   const [singleTo, setSingleTo] = useState("");
@@ -158,7 +143,18 @@ export default function TasksPage() {
   const [runIdx, setRunIdx] = useState(0);
   const [, setBatchId] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
-  const enabledGroups = useMemo(() => groups.filter(g => g.enabled), [groups]);
+  const enabledSegments = useMemo(
+    () => [...segments].filter((s) => s.enabled !== false).sort((a, b) => Number(a.sort || 0) - Number(b.sort || 0)),
+    [segments]
+  );
+  const activeSegment = useMemo(
+    () => enabledSegments.find((s) => s.id === activeSegmentId) || null,
+    [enabledSegments, activeSegmentId]
+  );
+  const enabledGroups = useMemo(
+    () => groups.filter(g => g.enabled && String(g.segmentId || "") === activeSegmentId),
+    [groups, activeSegmentId]
+  );
   const nextGroup = enabledGroups[runIdx] || null;
 
   const [history, setHistory] = useState<HisItem[]>([]);
@@ -197,6 +193,12 @@ export default function TasksPage() {
 
   const filePickRef = useRef<HTMLInputElement>(null);
   const textAreaRef = useRef<any>(null);
+  const segmentDraftRef = useRef<Record<string, {
+    text: string;
+    singleTo: string;
+    mode: "enabled_groups" | "single_group" | "single_contact";
+    files: File[];
+  }>>({});
 
   useLayoutEffect(() => {
     setInputAreaH(files.length > 0 ? MEDIA_INPUT_AREA_H : BASE_INPUT_AREA_H);
@@ -218,6 +220,15 @@ export default function TasksPage() {
 
   const roleMap = useMemo(() => new Map(roles.map(r => [r.id, r])), [roles]);
   const activeRole = activeRoleId ? roleMap.get(activeRoleId) : null;
+
+  const segmentStats = useMemo(() => {
+    const map = new Map<string, { count: number; preview: GroupTarget[] }>();
+    for (const seg of enabledSegments) {
+      const list = groups.filter((g) => g.enabled && String(g.segmentId || "") === seg.id);
+      map.set(seg.id, { count: list.length, preview: list.slice(0, 5) });
+    }
+    return map;
+  }, [groups, enabledSegments]);
 
   const groupOptions = useMemo(() => {
     return groups.map(g => ({
@@ -302,6 +313,21 @@ export default function TasksPage() {
     }
   }
 
+  async function loadSegmentsRemote() {
+    setSegmentsLoading(true);
+    try {
+      const r = await http.get("/api/group-segments");
+      const rows = Array.isArray(r.data?.rows) ? (r.data.rows as GroupSegment[]) : [];
+      const sorted = rows.sort((a, b) => Number(a.sort || 0) - Number(b.sort || 0));
+      setSegments(sorted);
+    } catch (e: any) {
+      message.error("加载分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));
+      setSegments([]);
+    } finally {
+      setSegmentsLoading(false);
+    }
+  }
+
   async function refreshRoles() {
     const r = await http.get("/api/roles");
     const list = Array.isArray(r.data?.roles) ? (r.data.roles as Role[]) : [];
@@ -344,6 +370,7 @@ export default function TasksPage() {
 
   useEffect(() => {
     (async () => {
+      await loadSegmentsRemote();
       await loadGroupsRemote();
       await refreshRoles();
       await refreshAccounts();
@@ -374,6 +401,39 @@ export default function TasksPage() {
     s.on("wa:status", onStatus);
     return () => { s.off("wa:status", onStatus); };
   }, []);
+
+  useEffect(() => {
+    if (!enabledSegments.length) {
+      setActiveSegmentId("");
+      return;
+    }
+    setActiveSegmentId((prev) => {
+      if (prev && enabledSegments.some((seg) => seg.id === prev)) return prev;
+      return enabledSegments[0].id;
+    });
+  }, [enabledSegments]);
+
+  useEffect(() => {
+    if (!activeSegmentId) return;
+    const draft = segmentDraftRef.current[activeSegmentId];
+    if (draft) {
+      setText(draft.text);
+      setSingleTo(draft.singleTo);
+      setMode(draft.mode);
+      setFiles(draft.files);
+    } else {
+      setText("");
+      setSingleTo("");
+      setMode("enabled_groups");
+      setFiles([]);
+    }
+    setRunIdx(0);
+  }, [activeSegmentId]);
+
+  useEffect(() => {
+    if (!activeSegmentId) return;
+    segmentDraftRef.current[activeSegmentId] = { text, singleTo, mode, files };
+  }, [activeSegmentId, text, singleTo, mode, files]);
 
   useEffect(() => {
     if (activeRoleId && !roles.find(r => r.id === activeRoleId)) {
@@ -585,11 +645,16 @@ export default function TasksPage() {
       kind: "batch",
       roleRemark: (activeRole.remark || "").trim() || "未知角色", // ✅ 用备注：admin/老师...
       slot: activeRole.boundSlot,
+      segmentId: activeSegment?.id || "",
+      segmentCode: activeSegment?.code || "",
+      segmentRemark: activeSegment?.remark || "",
       mode: "enabled_groups",
       text,
       ok: false,
       running: true,
       total,
+      targetChatCount: total,
+      targetChatIds: enabledGroups.map((g) => g.id),
       okCount: 0,
       failCount: 0,
       media: mediaMeta.length ? mediaMeta : undefined
@@ -683,6 +748,9 @@ export default function TasksPage() {
         roleRemark: activeRole.remark,
         roleName: getRoleNameForHistory(activeRole),
         slot,
+        segmentId: activeSegment?.id || "",
+        segmentCode: activeSegment?.code || "",
+        segmentRemark: activeSegment?.remark || "",
         mode,
         to,
         text,
@@ -718,6 +786,9 @@ export default function TasksPage() {
         roleRemark: activeRole.remark,
         roleName: getRoleNameForHistory(activeRole),
         slot,
+        segmentId: activeSegment?.id || "",
+        segmentCode: activeSegment?.code || "",
+        segmentRemark: activeSegment?.remark || "",
         mode,
         to,
         text,
@@ -739,8 +810,16 @@ export default function TasksPage() {
       message.error("该角色未绑定账号，请先绑定账号");
       return;
     }
+    if (!activeSegmentId) {
+      message.error("请先选择发送分组");
+      return;
+    }
+    if (!activeSegment || activeSegment.enabled === false) {
+      message.error("当前分组已禁用");
+      return;
+    }
     if (!enabledGroups.length) {
-      message.error("没有启用的群");
+      message.error("当前分组没有可发送群聊");
       return;
     }
 
@@ -758,21 +837,32 @@ export default function TasksPage() {
     startBatchHistory(bid, enabledGroups.length);
 
     try {
-      const results = await runPool(
-        enabledGroups,
-        async (g) => {
-          await sleep(120);
-
-          const ok = await sendOne(g.id, { batchId: bid });
-
-          setRunIdx((n) => n + 1);
-          return ok;
-        },
-        SEND_CONCURRENCY
-      );
-
-      const allOk = results.every(Boolean);
-
+      const fd = new FormData();
+      fd.append("slot", activeRole.boundSlot);
+      fd.append("segmentId", activeSegmentId);
+      fd.append("text", text || "");
+      files.forEach(f => fd.append("files", f, f.name));
+      const r = await http.post("/api/send/segment", fd);
+      const data = r.data?.data || {};
+      const result = data.result || {};
+      const okCount = Number(result.okCount || 0);
+      const failCount = Number(result.failCount || 0);
+      const total = Number(data.targetChatCount || (okCount + failCount));
+      patchHistory(bid, (h) => ({
+        ...h,
+        segmentId: data.segmentId || activeSegmentId,
+        segmentCode: data.segmentCode || activeSegment?.code || "",
+        segmentRemark: data.segmentRemark || activeSegment?.remark || "",
+        targetChatCount: total,
+        targetChatIds: Array.isArray(data.targetChatIds) ? data.targetChatIds : undefined,
+        okCount,
+        failCount,
+        total,
+        lastErr: result.lastErr || h.lastErr,
+        lastTs: Date.now(),
+      }));
+      const allOk = failCount === 0 && okCount > 0;
+      setRunIdx(total);
       finalizeBatchHistory(bid);
 
       setBatchId(null);
@@ -784,6 +874,16 @@ export default function TasksPage() {
       }
 
       message[allOk ? "success" : "warning"](allOk ? "所有群发送成功" : "已发送完，但有失败（看历史 NO）");
+    } catch (e: any) {
+      patchHistory(bid, (h) => ({
+        ...h,
+        running: false,
+        ok: false,
+        failCount: h.total || enabledGroups.length,
+        lastErr: e?.response?.data?.error || e?.message || "unknown error",
+        lastTs: Date.now(),
+      }));
+      message.error(e?.response?.data?.error || e?.message || "发送失败");
     } finally {
       setSending(false);
     }
@@ -921,11 +1021,17 @@ export default function TasksPage() {
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
     if (sending) return false;
     if (!activeRole) return false;
+    if (!activeSegmentId) return false;
+    if (!activeSegment || activeSegment.enabled === false) return false;
     if (!hasContent) return false;
     if (mode === "enabled_groups") return enabledGroups.length > 0;
     return singleTo.trim().length > 0;
-  }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo, sending]);
+  }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo, sending, activeSegmentId, activeSegment]);
   const showHint = !text.trim() && files.length === 0;
+  const scopedHistory = useMemo(
+    () => history.filter((h) => String(h.segmentId || "") === activeSegmentId),
+    [history, activeSegmentId]
+  );
 
   function formatCountdown(ms: number) {
     const total = Math.max(0, Math.floor(ms / 1000));
@@ -952,6 +1058,8 @@ export default function TasksPage() {
   async function createScheduledJob() {
     if (!activeRole) return message.error("请先选择一个角色");
     if (!activeRole.boundSlot) return message.error("该角色未绑定账号，请先绑定账号");
+    if (!activeSegmentId) return message.error("请先选择发送分组");
+    if (!activeSegment || activeSegment.enabled === false) return message.error("当前分组已禁用");
 
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
     if (!hasContent) return message.error("内容或附件至少要有一个");
@@ -967,6 +1075,7 @@ export default function TasksPage() {
     const fd = new FormData();
     fd.append("slot", activeRole.boundSlot);
     fd.append("mode", mode);
+    fd.append("segmentId", activeSegmentId);
     fd.append("minutes", String(minutes));
     fd.append("targets", JSON.stringify(targets));
     fd.append("text", text || "");
@@ -996,10 +1105,15 @@ export default function TasksPage() {
           roleRemark: activeRole.remark,
           roleName: getRoleNameForHistory(activeRole),
           slot: activeRole.boundSlot,
+          segmentId: activeSegment?.id || "",
+          segmentCode: activeSegment?.code || "",
+          segmentRemark: activeSegment?.remark || "",
           mode,
           text: textPreview,
           ok: false,
           total: targets.length,
+          targetChatCount: targets.length,
+          targetChatIds: targets,
           okCount: 0,
           jobId: created.id,
           status: "WAITING",
@@ -1026,6 +1140,8 @@ export default function TasksPage() {
 
   async function doSendNow() {
     if (!activeRole) return message.error("请先选择一个角色");
+    if (!activeSegmentId) return message.error("请先选择发送分组");
+    if (!activeSegment || activeSegment.enabled === false) return message.error("当前分组已禁用");
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
     if (!hasContent) return message.error("内容或附件至少要有一个");
 
@@ -1311,6 +1427,59 @@ export default function TasksPage() {
                 />
               </div>
 
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+                <div style={{ width: 90, color: "#666", fontSize: 12, lineHeight: "30px", flex: "0 0 auto" }}>发送分组：</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, flex: 1 }}>
+                  {enabledSegments.map((seg) => {
+                    const stat = segmentStats.get(seg.id);
+                    const isActive = activeSegmentId === seg.id;
+                    return (
+                      <Popover
+                        key={seg.id}
+                        trigger="hover"
+                        content={
+                          <div style={{ maxWidth: 320 }}>
+                            <div><b>code：</b>{seg.code}</div>
+                            <div><b>remark：</b>{seg.remark || "-"}</div>
+                            <div><b>群数量：</b>{stat?.count || 0}</div>
+                            <div style={{ marginTop: 6 }}>
+                              <b>群聊预览：</b>
+                              <div style={{ marginTop: 4 }}>
+                                {(stat?.preview || []).length
+                                  ? (stat?.preview || []).map((g) => <div key={g.id}>{g.name}</div>)
+                                  : <span style={{ color: "#999" }}>暂无</span>}
+                              </div>
+                            </div>
+                          </div>
+                        }
+                      >
+                        <Button
+                          size="small"
+                          type={isActive ? "primary" : "default"}
+                          onClick={() => setActiveSegmentId(seg.id)}
+                          style={
+                            isActive
+                              ? { borderColor: "#1677ff", background: "#1677ff" }
+                              : { background: "#f5f7fa", borderColor: "#e5e7eb", color: "#333" }
+                          }
+                        >
+                          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                            <span style={{ fontWeight: 700 }}>{seg.code}</span>
+                            <span style={{ fontSize: 11, opacity: 0.85 }}>{seg.remark || "未备注"}</span>
+                          </div>
+                        </Button>
+                      </Popover>
+                    );
+                  })}
+                  {!enabledSegments.length && (
+                    <Tag color="warning">暂无可用分组，请先到群页启用分组</Tag>
+                  )}
+                  <Button size="small" loading={segmentsLoading} onClick={() => void loadSegmentsRemote()}>
+                    刷新分组
+                  </Button>
+                </div>
+              </div>
+
               {mode === "single_group" && (
                 <AutoComplete
                   style={{ width: "100%" }}
@@ -1339,6 +1508,7 @@ export default function TasksPage() {
                   <Tag color="blue">启用群：{enabledGroups.length} 个</Tag>
                   <Tag>进度：{Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}</Tag>
                   {nextGroup && <Tag color="geekblue">下一群：{nextGroup.name}</Tag>}
+                  {!enabledGroups.length && <Tag color="warning">当前分组没有可发送群聊</Tag>}
                   <Button size="small" loading={groupsLoading} onClick={() => void loadGroupsRemote()}>刷新群列表</Button>
                 </div>
               )}
@@ -1360,7 +1530,7 @@ export default function TasksPage() {
                 bodyStyle={{ flex: 1, overflowY: "auto" }}
               >
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {history.map((h) => {
+                  {scopedHistory.map((h) => {
                     const isScheduled = h.kind === "scheduled";
                     const st = isScheduled
                       ? getScheduledStatus(h)
@@ -1634,20 +1804,44 @@ export default function TasksPage() {
                       gap: 12
                     }}
                   >
-                    <Typography.Text style={{ fontWeight: 600 }}>
-                      当前角色：{activeRole?.remark || "-"}
-                    </Typography.Text>
-
-                    <Button
-                      type="primary"
-                      block
-                      size="middle"
-                      disabled={!canSend}
-                      onClick={() => void doSendNow()}
-                      style={{ height: 40, fontSize: 14 }}
+                    <div
+                      title={`角色：${activeRole?.remark || "-"} ｜ 群：${activeSegment?.code || "-"} · ${activeSegment?.remark || "-"}`}
+                      style={{
+                        fontWeight: 600,
+                        fontSize: 13,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        border: "1px solid #f0f0f0",
+                        borderRadius: 8,
+                        padding: "6px 10px",
+                        background: "#fafafa",
+                      }}
                     >
-                      立即发送
-                    </Button>
+                      角色：{activeRole?.remark || "-"} ｜ 群：{activeSegment?.code || "-"} · {activeSegment?.remark || "-"}
+                    </div>
+
+                    <Tooltip
+                      title={`当前目标：角色 ${activeRole?.remark || "-"} ｜ 分组 ${activeSegment?.code || "-"} · ${activeSegment?.remark || "-"}`}
+                    >
+                      <Button
+                        type="primary"
+                        block
+                        size="middle"
+                        disabled={!canSend}
+                        onClick={() => void doSendNow()}
+                        style={{ height: 40, fontSize: 14 }}
+                      >
+                        立即发送
+                      </Button>
+                    </Tooltip>
+                    <Typography.Text
+                      type="secondary"
+                      style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                      title={`当前目标：角色 ${activeRole?.remark || "-"} ｜ 分组 ${activeSegment?.code || "-"} · ${activeSegment?.remark || "-"} ｜ 群数 ${enabledGroups.length}`}
+                    >
+                      目标：{activeSegment?.code || "-"} · {activeSegment?.remark || "-"}（{enabledGroups.length}群）
+                    </Typography.Text>
 
                     <Row gutter={8}>
                       <Col span={12}>
