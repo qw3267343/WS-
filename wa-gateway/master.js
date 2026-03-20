@@ -151,6 +151,65 @@ function accountsFile(ws) { return path.join(wsDir(ws), 'accounts.json'); }
 function accountsLockFile(ws) { return `${accountsFile(ws)}.lock`; }
 function groupsFile(ws) { return path.join(wsDir(ws), 'groups.json'); }
 function rolesFile(ws) { return path.join(wsDir(ws), 'roles.json'); }
+function groupSegmentsFile(ws) { return path.join(wsDir(ws), 'group_segments.json'); }
+
+function normalizeSegmentId(v) {
+  if (v == null) return '';
+  return String(v).trim();
+}
+function defaultGroupSegments() {
+  return [
+    { id: 'seg_a', code: 'A', remark: '', sort: 1, enabled: true },
+    { id: 'seg_b', code: 'B', remark: '', sort: 2, enabled: true },
+    { id: 'seg_c', code: 'C', remark: '', sort: 3, enabled: true },
+    { id: 'seg_d', code: 'D', remark: '', sort: 4, enabled: true },
+  ];
+}
+function normalizeGroupSegmentRow(item, idx = 0) {
+  const id = String(item?.id || '').trim();
+  if (!id) return null;
+  const code = String(item?.code || '').trim().toUpperCase();
+  if (!code) return null;
+  const sortNum = Number(item?.sort);
+  return {
+    id,
+    code,
+    remark: item?.remark == null ? '' : String(item.remark).trim(),
+    sort: Number.isFinite(sortNum) ? sortNum : (idx + 1),
+    enabled: item?.enabled !== false,
+  };
+}
+function loadGroupSegments(ws) {
+  const rows = readJson(groupSegmentsFile(ws), []);
+  if (!Array.isArray(rows)) return defaultGroupSegments();
+  const normalized = rows.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean);
+  if (!normalized.length) return defaultGroupSegments();
+  return normalized.sort((a, b) => Number(a.sort || 0) - Number(b.sort || 0));
+}
+function saveGroupSegments(ws, list) {
+  const rows = Array.isArray(list)
+    ? list.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean)
+    : [];
+  writeJson(groupSegmentsFile(ws), rows);
+  return rows;
+}
+function clearGroupSegmentRefs(ws, deletedSegmentIds = []) {
+  const deleted = new Set((deletedSegmentIds || []).map((v) => normalizeSegmentId(v)).filter(Boolean));
+  if (!deleted.size) return readJson(groupsFile(ws), []);
+  const groups = readJson(groupsFile(ws), []);
+  if (!Array.isArray(groups) || !groups.length) return [];
+  let changed = false;
+  const nextGroups = groups.map((row) => {
+    const sid = normalizeSegmentId(row?.segmentId);
+    if (sid && deleted.has(sid)) {
+      changed = true;
+      return { ...row, segmentId: '' };
+    }
+    return row;
+  });
+  if (changed) writeJson(groupsFile(ws), nextGroups);
+  return nextGroups;
+}
 
 function listEnabledSlots(ws) {
   const accounts = readJson(accountsFile(ws), []);
@@ -762,6 +821,59 @@ app.get('/api/groups', (req, res) => {
   const running = ensureProjectRunning(ws);
   if (!running.ok) return res.status(409).json({ ok: false, error: running.reason });
   return res.json({ ok: true, rows: readJson(path.join(wsDir(ws), 'groups.json'), []) });
+});
+app.get('/api/group-segments', (req, res) => {
+  try {
+    const ws = getWsFromReq(req);
+    ensureDir(wsDir(ws));
+    if (!fs.existsSync(groupSegmentsFile(ws))) writeJson(groupSegmentsFile(ws), defaultGroupSegments());
+    return res.json({ ok: true, rows: loadGroupSegments(ws) });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+app.post('/api/group-segments/batch', (req, res) => {
+  try {
+    const ws = getWsFromReq(req);
+    ensureDir(wsDir(ws));
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const normalized = rows.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean);
+    const seenId = new Set();
+    const seenCode = new Set();
+    for (const row of normalized) {
+      if (seenId.has(row.id)) return res.status(400).json({ ok: false, error: `duplicate segment id: ${row.id}` });
+      if (seenCode.has(row.code)) return res.status(400).json({ ok: false, error: `duplicate segment code: ${row.code}` });
+      seenId.add(row.id);
+      seenCode.add(row.code);
+    }
+
+    const prevRows = loadGroupSegments(ws);
+    const savedRows = saveGroupSegments(ws, normalized);
+    const prevIds = new Set(prevRows.map((row) => row.id));
+    const nextIds = new Set(savedRows.map((row) => row.id));
+    const deletedIds = Array.from(prevIds).filter((id) => !nextIds.has(id));
+    clearGroupSegmentRefs(ws, deletedIds);
+
+    return res.json({ ok: true, rows: savedRows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+app.delete('/api/group-segments/:id', (req, res) => {
+  try {
+    const ws = getWsFromReq(req);
+    const segmentId = normalizeSegmentId(req.params.id);
+    if (!segmentId) return res.status(400).json({ ok: false, error: 'segment id required' });
+    ensureDir(wsDir(ws));
+    const current = loadGroupSegments(ws);
+    const next = current.filter((item) => item.id !== segmentId);
+    if (next.length === current.length) return res.status(404).json({ ok: false, error: 'segment not found' });
+    const savedRows = saveGroupSegments(ws, next);
+    clearGroupSegmentRefs(ws, [segmentId]);
+    return res.json({ ok: true, rows: savedRows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 app.get('/api/projects', (_req, res) => {
