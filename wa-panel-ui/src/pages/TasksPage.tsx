@@ -1,6 +1,5 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  AutoComplete,
   Button,
   Card,
   Col,
@@ -134,8 +133,7 @@ export default function TasksPage() {
   const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
   const [activeSegmentId, setActiveSegmentId] = useState<string>("");
 
-  const [mode, setMode] = useState<"enabled_groups" | "single_group" | "single_contact">("enabled_groups");
-  const [singleTo, setSingleTo] = useState("");
+  const mode: "enabled_groups" | "single_group" | "single_contact" = "enabled_groups";
   const [text, setText] = useState("");
   const [composing, setComposing] = useState(false);
   const [inputAreaH, setInputAreaH] = useState(BASE_INPUT_AREA_H);
@@ -195,8 +193,6 @@ export default function TasksPage() {
   const textAreaRef = useRef<any>(null);
   const segmentDraftRef = useRef<Record<string, {
     text: string;
-    singleTo: string;
-    mode: "enabled_groups" | "single_group" | "single_contact";
     files: File[];
   }>>({});
 
@@ -229,13 +225,6 @@ export default function TasksPage() {
     }
     return map;
   }, [groups, enabledSegments]);
-
-  const groupOptions = useMemo(() => {
-    return groups.map(g => ({
-      value: g.id,
-      label: `${g.name}  (${g.id})${g.enabled ? "" : "  [禁用]"}`
-    }));
-  }, [groups]);
 
   // 拖拽相关状态
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -418,13 +407,9 @@ export default function TasksPage() {
     const draft = segmentDraftRef.current[activeSegmentId];
     if (draft) {
       setText(draft.text);
-      setSingleTo(draft.singleTo);
-      setMode(draft.mode);
       setFiles(draft.files);
     } else {
       setText("");
-      setSingleTo("");
-      setMode("enabled_groups");
       setFiles([]);
     }
     setRunIdx(0);
@@ -432,8 +417,8 @@ export default function TasksPage() {
 
   useEffect(() => {
     if (!activeSegmentId) return;
-    segmentDraftRef.current[activeSegmentId] = { text, singleTo, mode, files };
-  }, [activeSegmentId, text, singleTo, mode, files]);
+    segmentDraftRef.current[activeSegmentId] = { text, files };
+  }, [activeSegmentId, text, files]);
 
   useEffect(() => {
     if (activeRoleId && !roles.find(r => r.id === activeRoleId)) {
@@ -700,107 +685,6 @@ export default function TasksPage() {
     }
   }
 
-  async function sendText(slot: string, to: string) {
-    await http.post(`/api/accounts/${slot}/send`, { to, text });
-  }
-
-  async function sendMedia(slot: string, to: string) {
-    const fd = new FormData();
-    fd.append("to", to);
-    fd.append("caption", text || "");
-    files.forEach(f => fd.append("files", f, f.name));
-    await http.post(`/api/accounts/${slot}/sendMedia`, fd);
-  }
-
-  async function sendOne(to: string, opt?: { batchId?: string }) {
-    if (!activeRole?.boundSlot) {
-      message.error("该角色未绑定账号，请先绑定账号");
-      return false;
-    }
-    const slot = activeRole.boundSlot;
-
-    const mediaMeta = files.map(f => ({ name: f.name, type: f.type || "unknown", size: f.size }));
-
-    try {
-      if (files.length) await sendMedia(slot, to);
-      else await sendText(slot, to);
-
-      if (opt?.batchId) {
-        patchHistory(opt.batchId, h => {
-          const okCount = (h.okCount || 0) + 1;
-          const failCount = h.failCount || 0;
-          return {
-            ...h,
-            okCount,
-            failCount,
-            lastTs: Date.now(),
-            ok: false
-          };
-        });
-        return true;
-      }
-
-      pushHistory({
-        id: newId(),
-        ts: Date.now(),
-        lastTs: Date.now(),
-        kind: "single",
-        roleRemark: activeRole.remark,
-        roleName: getRoleNameForHistory(activeRole),
-        slot,
-        segmentId: activeSegment?.id || "",
-        segmentCode: activeSegment?.code || "",
-        segmentRemark: activeSegment?.remark || "",
-        mode,
-        to,
-        text,
-        ok: true,
-        media: mediaMeta.length ? mediaMeta : undefined
-      });
-
-      return true;
-    } catch (e: any) {
-      const err = e?.response?.data?.error || e.message;
-
-      if (opt?.batchId) {
-        patchHistory(opt.batchId, h => {
-          const okCount = h.okCount || 0;
-          const failCount = (h.failCount || 0) + 1;
-          return {
-            ...h,
-            okCount,
-            failCount,
-            lastErr: err,
-            lastTs: Date.now(),
-            ok: false
-          };
-        });
-        return false;
-      }
-
-      pushHistory({
-        id: newId(),
-        ts: Date.now(),
-        lastTs: Date.now(),
-        kind: "single",
-        roleRemark: activeRole.remark,
-        roleName: getRoleNameForHistory(activeRole),
-        slot,
-        segmentId: activeSegment?.id || "",
-        segmentCode: activeSegment?.code || "",
-        segmentRemark: activeSegment?.remark || "",
-        mode,
-        to,
-        text,
-        ok: false,
-        lastErr: err,
-        media: mediaMeta.length ? mediaMeta : undefined
-      });
-
-      return false;
-    }
-  }
-
   async function sendAllEnabledGroupsConcurrent() {
     if (!activeRole) {
       message.error("请先选择一个角色");
@@ -1024,9 +908,8 @@ export default function TasksPage() {
     if (!activeSegmentId) return false;
     if (!activeSegment || activeSegment.enabled === false) return false;
     if (!hasContent) return false;
-    if (mode === "enabled_groups") return enabledGroups.length > 0;
-    return singleTo.trim().length > 0;
-  }, [activeRole, text, files, mode, enabledGroups, runIdx, singleTo, sending, activeSegmentId, activeSegment]);
+    return enabledGroups.length > 0;
+  }, [activeRole, text, files, enabledGroups, runIdx, sending, activeSegmentId, activeSegment]);
   const showHint = !text.trim() && files.length === 0;
   const scopedHistory = useMemo(
     () => history.filter((h) => String(h.segmentId || "") === activeSegmentId),
@@ -1063,14 +946,10 @@ export default function TasksPage() {
 
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
     if (!hasContent) return message.error("内容或附件至少要有一个");
-    if (mode === "enabled_groups" && !enabledGroups.length) return message.error("没有启用的群");
-    if (mode !== "enabled_groups" && !singleTo.trim()) return message.error("请输入目标");
+    if (!enabledGroups.length) return message.error("没有启用的群");
 
     const minutes = Math.max(1, Math.min(1440, scheduleMinutes || 1));
-    const targets =
-      mode === "enabled_groups"
-        ? enabledGroups.map(g => g.id)
-        : [singleTo.trim()];
+    const targets = enabledGroups.map(g => g.id);
 
     const fd = new FormData();
     fd.append("slot", activeRole.boundSlot);
@@ -1145,16 +1024,7 @@ export default function TasksPage() {
     const hasContent = (text && text.trim().length > 0) || files.length > 0;
     if (!hasContent) return message.error("内容或附件至少要有一个");
 
-    if (mode === "enabled_groups") {
-      await sendAllEnabledGroupsConcurrent();
-      return;
-    }
-    const ok = await sendOne(singleTo.trim());
-    if (ok) {
-      setText("");
-      setFiles([]);
-    }
-    ok ? message.success("立即发送成功") : message.error("立即发送失败（见记录）");
+    await sendAllEnabledGroupsConcurrent();
   }
 
   const activeScheduledJobs = useMemo(() => {
@@ -1412,23 +1282,8 @@ export default function TasksPage() {
           >
             <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%" }}>
 
-              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <div style={{ width: 90, color: "#666", fontSize: 12, flex: "0 0 auto" }}>任务类型：</div>
-
-                <Select
-                  style={{ width: 520, maxWidth: "100%" }}
-                  value={mode}
-                  onChange={(v) => { setMode(v); setRunIdx(0); }}
-                  options={[
-                    { value: "enabled_groups", label: "对启用群发送（来自群页开关）" },
-                    { value: "single_group", label: "单个群（从群列表选择/可手填）" },
-                    { value: "single_contact", label: "单个联系人（手填 @c.us）" },
-                  ]}
-                />
-              </div>
-
-              <div style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
-                <div style={{ width: 90, color: "#666", fontSize: 12, lineHeight: "30px", flex: "0 0 auto" }}>发送分组：</div>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap", padding: "2px 0 4px" }}>
+                <div style={{ width: 90, color: "#444", fontSize: 13, fontWeight: 600, lineHeight: "40px", flex: "0 0 auto" }}>发送分组：</div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, flex: 1 }}>
                   {enabledSegments.map((seg) => {
                     const stat = segmentStats.get(seg.id);
@@ -1454,18 +1309,31 @@ export default function TasksPage() {
                         }
                       >
                         <Button
-                          size="small"
+                          size="middle"
                           type={isActive ? "primary" : "default"}
                           onClick={() => setActiveSegmentId(seg.id)}
                           style={
                             isActive
-                              ? { borderColor: "#1677ff", background: "#1677ff" }
-                              : { background: "#f5f7fa", borderColor: "#e5e7eb", color: "#333" }
+                              ? {
+                                  borderColor: "#1677ff",
+                                  background: "#1677ff",
+                                  minHeight: 40,
+                                  paddingInline: 12,
+                                  boxShadow: "0 2px 8px rgba(22, 119, 255, 0.28)"
+                                }
+                              : {
+                                  background: "#f5f7fa",
+                                  borderColor: "#d9dee8",
+                                  color: "#333",
+                                  minHeight: 40,
+                                  paddingInline: 12,
+                                  transition: "all 0.2s ease"
+                                }
                           }
                         >
-                          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-                            <span style={{ fontWeight: 700 }}>{seg.code}</span>
-                            <span style={{ fontSize: 11, opacity: 0.85 }}>{seg.remark || "未备注"}</span>
+                          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                            <span style={{ fontWeight: 800, fontSize: 15, letterSpacing: 0.2 }}>{seg.code}</span>
+                            <span style={{ fontSize: 13, opacity: 0.9 }}>{seg.remark || "未备注"}</span>
                           </div>
                         </Button>
                       </Popover>
@@ -1480,38 +1348,13 @@ export default function TasksPage() {
                 </div>
               </div>
 
-              {mode === "single_group" && (
-                <AutoComplete
-                  style={{ width: "100%" }}
-                  options={groupOptions}
-                  value={singleTo}
-                  onChange={(v) => setSingleTo(v)}
-                  placeholder="选择群（来自群页）或手动输入 12345@g.us"
-                  filterOption={(input, option) =>
-                    String(option?.value || "").toLowerCase().includes(input.toLowerCase()) ||
-                    String(option?.label || "").toLowerCase().includes(input.toLowerCase())
-                  }
-                />
-              )}
-
-              {mode === "single_contact" && (
-                <Input
-                  style={{ width: "100%" }}
-                  value={singleTo}
-                  onChange={(e) => setSingleTo(e.target.value)}
-                  placeholder="例：94771234567@c.us"
-                />
-              )}
-
-              {mode === "enabled_groups" && (
-                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                  <Tag color="blue">启用群：{enabledGroups.length} 个</Tag>
-                  <Tag>进度：{Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}</Tag>
-                  {nextGroup && <Tag color="geekblue">下一群：{nextGroup.name}</Tag>}
-                  {!enabledGroups.length && <Tag color="warning">当前分组没有可发送群聊</Tag>}
-                  <Button size="small" loading={groupsLoading} onClick={() => void loadGroupsRemote()}>刷新群列表</Button>
-                </div>
-              )}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <Tag color="blue">启用群：{enabledGroups.length} 个</Tag>
+                <Tag>进度：{Math.min(runIdx, enabledGroups.length)}/{enabledGroups.length}</Tag>
+                {nextGroup && <Tag color="geekblue">下一群：{nextGroup.name}</Tag>}
+                {!enabledGroups.length && <Tag color="warning">当前分组没有可发送群聊</Tag>}
+                <Button size="small" loading={groupsLoading} onClick={() => void loadGroupsRemote()}>刷新群列表</Button>
+              </div>
 
               <Card
                 size="small"
