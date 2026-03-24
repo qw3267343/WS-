@@ -38,7 +38,7 @@ export default function LoginPage() {
       saveAuth(data);
       message.success("登录成功");
       navigate("/", { replace: true });
-    } catch (e: any) {
+    } catch {
       message.error("登录失败，请检查用户名和密码后重试");
     } finally {
       setLoading(false);

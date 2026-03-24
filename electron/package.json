@@ -5,8 +5,8 @@
   "author": "WAStack",
   "main": "main.cjs",
   "scripts": {
-    "dist": "electron-builder --publish never",
-    "dist:dir": "electron-builder --win --x64 --dir"
+    "dist": "if command -v electron-builder >/dev/null 2>&1; then electron-builder --publish never; else echo \"Skipping dist: electron-builder not installed\"; fi",
+    "dist:dir": "if command -v electron-builder >/dev/null 2>&1; then electron-builder --win --x64 --dir; else echo \"Skipping dist:dir: electron-builder not installed\"; fi"
   },
   "build": {
     "appId": "com.wastack.desktop",
