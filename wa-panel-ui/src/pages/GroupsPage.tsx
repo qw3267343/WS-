@@ -269,14 +269,12 @@ export default function GroupsPage() {
     const target = segments.find((s) => s.id === segId);
     if (!target) return;
     const nextSegments = segments.filter((s) => s.id !== segId);
-    const nextGroups = rows.map((g) =>
-      g.segmentId === segId ? { ...g, segmentId: "" } : g
-    );
     try {
-      await saveByBatch(nextGroups);
       await saveSegmentsByBatch(nextSegments);
-      setRows(nextGroups);
-      setSelectedKeys((prev) => prev.filter((key) => nextGroups.some((g) => g.id === String(key))));
+      const refreshed = await http.get("/api/groups");
+      const latestGroups = Array.isArray(refreshed.data?.rows) ? refreshed.data.rows : [];
+      setRows(latestGroups);
+      setSelectedKeys((prev) => prev.filter((key) => latestGroups.some((g: GroupTarget) => g.id === String(key))));
       message.success(`已删除分组 ${target.code || segId}，并清空关联群分组`);
     } catch (e: any) {
       message.error("删除分组失败：" + (e?.response?.data?.error || e?.message || "unknown error"));

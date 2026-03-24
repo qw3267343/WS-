@@ -836,7 +836,9 @@ app.post('/api/group-segments/batch', (req, res) => {
   try {
     const ws = getWsFromReq(req);
     ensureDir(wsDir(ws));
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const rows = Array.isArray(req.body?.rows)
+      ? req.body.rows
+      : (Array.isArray(req.body?.segments) ? req.body.segments : []);
     const normalized = rows.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean);
     const seenId = new Set();
     const seenCode = new Set();

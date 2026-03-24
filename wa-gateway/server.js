@@ -656,6 +656,24 @@ function saveGroupSegments(ws, list) {
   return rows;
 }
 
+function clearGroupSegmentRefs(ws, deletedSegmentIds = []) {
+  const deleted = new Set((deletedSegmentIds || []).map((v) => normalizeSegmentId(v)).filter(Boolean));
+  if (!deleted.size) return loadGroups(ws);
+  const groups = loadGroups(ws);
+  if (!Array.isArray(groups) || !groups.length) return [];
+  let changed = false;
+  const nextGroups = groups.map((row) => {
+    const sid = normalizeSegmentId(row?.segmentId);
+    if (sid && deleted.has(sid)) {
+      changed = true;
+      return { ...row, segmentId: '' };
+    }
+    return row;
+  });
+  if (changed) saveGroups(ws, nextGroups);
+  return nextGroups;
+}
+
 function listEnabledGroupsBySegment(ws, segmentId) {
   const sid = normalizeSegmentId(segmentId);
   if (!sid) return [];
@@ -1720,7 +1738,9 @@ app.post('/api/group-segments/batch', (req, res) => {
   try {
     const ws = getWs(req);
     ensureWorkspace(ws);
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+    const rows = Array.isArray(req.body?.rows)
+      ? req.body.rows
+      : (Array.isArray(req.body?.segments) ? req.body.segments : null);
     if (!rows) return res.status(400).json({ ok: false, error: 'rows must be an array' });
     const normalized = rows.map((item, idx) => normalizeGroupSegmentRow(item, idx)).filter(Boolean);
     if (!normalized.length) return res.status(400).json({ ok: false, error: 'rows empty' });
@@ -1732,8 +1752,30 @@ app.post('/api/group-segments/batch', (req, res) => {
       seenId.add(row.id);
       seenCode.add(row.code);
     }
+    const prevRows = loadGroupSegments(ws);
     const saved = saveGroupSegments(ws, normalized);
+    const prevIds = new Set(prevRows.map((row) => row.id));
+    const nextIds = new Set(saved.map((row) => row.id));
+    const deletedIds = Array.from(prevIds).filter((id) => !nextIds.has(id));
+    clearGroupSegmentRefs(ws, deletedIds);
     return res.json({ ok: true, rows: saved });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.delete('/api/group-segments/:id', (req, res) => {
+  try {
+    const ws = getWs(req);
+    ensureWorkspace(ws);
+    const segmentId = normalizeSegmentId(req.params.id);
+    if (!segmentId) return res.status(400).json({ ok: false, error: 'segment id required' });
+    const current = loadGroupSegments(ws);
+    const next = current.filter((item) => item.id !== segmentId);
+    if (next.length === current.length) return res.status(404).json({ ok: false, error: 'segment not found' });
+    const savedRows = saveGroupSegments(ws, next);
+    clearGroupSegmentRefs(ws, [segmentId]);
+    return res.json({ ok: true, rows: savedRows });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
